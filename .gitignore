@@ -1,0 +1,34 @@
+
+# Composer stuff
+/vendor
+vendor/*
+composer.lock
+.cache
+
+#dev tools
+.php-cs-fixer.cache
+.phpunit.cache
+.phpunit.result.cache
+build
+
+# cache directories
+Thumbs.db
+.DS_Store
+*.empty
+
+#phpstorm project files
+.idea
+
+#netbeans project files
+nbproject
+
+#eclipse, zend studio, aptana or other eclipse like project files
+.buildpath
+.project
+.settings
+atlassian-ide-plugin.xml
+
+
+# mac deployment helpers
+switch
+index
