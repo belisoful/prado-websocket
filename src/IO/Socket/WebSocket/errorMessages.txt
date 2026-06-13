@@ -1,0 +1,11 @@
+
+websocket_control_frame_too_long		= WebSocket control frame payload of {0} bytes exceeds the 125-byte limit.
+websocket_control_frame_fragmented		= WebSocket control frame (opcode {0}) must not be fragmented.
+websocket_frame_length_invalid			= WebSocket frame length exceeds the supported range.
+websocket_frame_incomplete				= WebSocket frame truncated: expected {0} bytes, read {1}.
+websocket_handshake_too_large			= WebSocket handshake exceeds the {0}-byte limit.
+websocket_handshake_incomplete			= WebSocket handshake ended before the header was complete.
+websocket_handshake_not_upgrade			= WebSocket handshake request is not a valid upgrade.
+websocket_handshake_rejected			= WebSocket server rejected the handshake (status {0}).
+websocket_http2_library_missing			= Unable to load libnghttp2 for HTTP/2 support. Tried: {0}
+websocket_http2_session_failed			= nghttp2 session error: {0}
