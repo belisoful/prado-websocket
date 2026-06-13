@@ -39,7 +39,7 @@
 			"options": {
 				"symlink": true,
 				"versions": {
-					"pradosoft/prado-http2": "1.0.0"
+					"belisoful/prado-http2": "1.0.0"
 				}
 			}
 		}
@@ -50,13 +50,13 @@
 	"suggest": {
 		"ext-openssl": "TLS with ALPN for wss:// and HTTP/2 over TLS (h2).",
 		"ext-sockets": "Faster socket primitives for the standalone server.",
-		"lib-nghttp2": "The system libnghttp2 shared library, used by pradosoft/prado-http2 for HTTP/2.",
-		"ext-ffi": "Required by pradosoft/prado-http2 to bind libnghttp2 for HTTP/2.",
-		"pradosoft/prado-http2": "HTTP/2 (RFC 8441) WebSocket multiplexing; without it the server serves HTTP/1.1 only."
+		"lib-nghttp2": "The system libnghttp2 shared library, used by belisoful/prado-http2 for HTTP/2.",
+		"ext-ffi": "Required by belisoful/prado-http2 to bind libnghttp2 for HTTP/2.",
+		"belisoful/prado-http2": "HTTP/2 (RFC 8441) WebSocket multiplexing; without it the server serves HTTP/1.1 only."
 	},
 	"require-dev" : {
 		"pradosoft/prado" : "^4.4",
-		"pradosoft/prado-http2" : "^1.0",
+		"belisoful/prado-http2" : "^1.0",
 		"phpunit/phpunit" : "^10",
 		"phpdocumentor/shim": "^3",
 		"friendsofphp/php-cs-fixer": "^3.94",
