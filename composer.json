@@ -1,5 +1,5 @@
 {
-	"name": "pradosoft/prado-websockets",
+	"name": "belisoful/prado-websockets",
 	"type": "prado4-extension",
 	"description": "WebSocket server and client for the PRADO PHP framework: RFC 6455 over HTTP/1.1, with HTTP/2 (RFC 8441) via nghttp2.",
 	"keywords": [ "prado", "framework", "websocket", "rfc6455", "rfc8441", "http2", "nghttp2", "extension"],
