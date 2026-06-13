@@ -1,0 +1,71 @@
+name: PRADO WebSockets Extension
+on: [push, pull_request]
+jobs:
+  composerext:
+    name: PRADO WebSockets Extension
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: ['8.1', '8.2', '8.3']
+
+    defaults:
+      run:
+        working-directory: prado-websockets
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v4
+        with:
+          path: prado-websockets
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v4
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado
+
+      - name: Checkout PRADO HTTP/2 extension
+        uses: actions/checkout@v4
+        with:
+          repository: pradosoft/prado-http2
+          ref: master
+          path: prado-http2
+
+      - name: Install libnghttp2
+        run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
+          tools: php-cs-fixer, phpstan, cs2pr
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict
+
+      - name: Validate code syntax using php-cs-fixer
+        run: php-cs-fixer fix -vvv --dry-run --using-cache=no --format=checkstyle | cs2pr
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Validate code using phpstan
+        run: phpstan analyse --error-format=checkstyle | cs2pr
+
+      - name: Run Unit Tests
+        run: composer unittest
