@@ -2,7 +2,7 @@ name: PRADO WebSockets Extension
 on: [push, pull_request]
 jobs:
   composerext:
-    name: PRADO WebSockets Extension
+    name: WebSockets
     runs-on: ubuntu-latest
 
     strategy:
@@ -27,10 +27,10 @@ jobs:
           ref: master
           path: prado
 
-      - name: Checkout PRADO HTTP/2 extension
+      - name: Checkout Belisoful HTTP/2 extension
         uses: actions/checkout@v4
         with:
-          repository: pradosoft/prado-http2
+          repository: belisoful/prado-http2
           ref: master
           path: prado-http2
 
