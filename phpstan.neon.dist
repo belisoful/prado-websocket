@@ -1,0 +1,37 @@
+parameters:
+    phpVersion: 80300 # PHP 8.3
+    level: 2
+    bootstrapFiles:
+        - tests/test_tools/phpstan-bootstrap.php
+    paths:
+        - src
+
+services:
+    -
+        class: Prado\PHPStan\DynamicMethodsClassReflectionExtension
+        tags:
+            - phpstan.broker.methodsClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentPropertiesReflectionExtension
+        tags:
+            - phpstan.broker.propertiesClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentHasMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanGetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanSetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentIsaTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\PradoMethodVisibleStaticMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.staticMethodTypeSpecifyingExtension
