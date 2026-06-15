@@ -15,6 +15,7 @@ use Prado\IO\Http2\TH2Stream;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketStream;
 use Prado\Prado;
+use Prado\TComponent;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -33,11 +34,16 @@ use Psr\Http\Message\StreamInterface;
  * a per-connection blocking loop.  {@see receive()} and {@see send()} move bytes to and from the
  * transport, so an event-loop server pumps the one socket while many WebSockets run on it.
  *
+ * Events ('on' prefix), raised per multiplexed WebSocket so several observers can react (e.g. an
+ * event-loop server and a cluster coordinator):
+ *  - onConnection: after a stream's Extended CONNECT is accepted, with its {@see TWebSocketConnection}.
+ *  - onClose: as a stream's {@see TWebSocketConnection} closes.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc8441.html
  */
-class THttp2WebSocketProtocol implements IWebSocketProtocol
+class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 {
 	/** @var IWebSocketHandler The handler each WebSocket stream is run through. */
 	private IWebSocketHandler $_handler;
@@ -51,9 +57,6 @@ class THttp2WebSocketProtocol implements IWebSocketProtocol
 	/** @var ?callable The per-stream notification callback set during {@see serve()}. */
 	private $_onStream;
 
-	/** @var ?callable A per-connection notification, called with each ready {@see TWebSocketConnection}. */
-	private $_onConnection;
-
 	/**
 	 * @param IWebSocketHandler $handler The handler each WebSocket stream is run through.
 	 * @throws \Prado\IO\Http2\THttp2Exception When libnghttp2 is unavailable.
@@ -66,6 +69,7 @@ class THttp2WebSocketProtocol implements IWebSocketProtocol
 		$this->_session->attachEventHandler('onRequest', fn ($session, $stream) => $this->acceptStream($stream));
 		$this->_session->attachEventHandler('onData', fn ($session, $stream) => $this->pumpStream($stream));
 		$this->_session->attachEventHandler('onClose', fn ($session, $stream) => $this->closeStream($stream));
+		parent::__construct();
 	}
 
 	/** @return TH2Session The underlying HTTP/2 server session. */
@@ -75,13 +79,32 @@ class THttp2WebSocketProtocol implements IWebSocketProtocol
 	}
 
 	/**
-	 * Sets a callback notified with each ready {@see TWebSocketConnection} (e.g. an event-loop
-	 * server's onConnection), since HTTP/2 surfaces connections per stream, not per transport.
-	 * @param ?callable $value The connection notification callback.
+	 * Raised after a multiplexed stream's Extended CONNECT is accepted, since HTTP/2 surfaces
+	 * connections per stream rather than per transport.
+	 * @param mixed $param The accepted {@see TWebSocketConnection}.
 	 */
-	public function setOnConnection(?callable $value): void
+	public function onConnection(mixed $param): void
 	{
-		$this->_onConnection = $value;
+		$this->raiseEvent('onConnection', $this, $param);
+	}
+
+	/**
+	 * Raised as a multiplexed stream's connection closes, the per-stream counterpart to
+	 * {@see onConnection}.
+	 * @param mixed $param The closing {@see TWebSocketConnection}.
+	 */
+	public function onClose(mixed $param): void
+	{
+		$this->raiseEvent('onClose', $this, $param);
+	}
+
+	/**
+	 * Returns the live WebSocket connections multiplexed on this session.
+	 * @return TWebSocketConnection[] The live connections.
+	 */
+	public function getConnections(): array
+	{
+		return array_values($this->_connections);
 	}
 
 	/**
@@ -145,9 +168,7 @@ class THttp2WebSocketProtocol implements IWebSocketProtocol
 		if ($this->_onStream !== null) {
 			($this->_onStream)($stream);
 		}
-		if ($this->_onConnection !== null) {
-			($this->_onConnection)($connection);
-		}
+		$this->onConnection($connection);
 		$this->_handler->onOpen($connection);
 	}
 
@@ -188,5 +209,6 @@ class THttp2WebSocketProtocol implements IWebSocketProtocol
 		}
 		unset($this->_connections[$stream->getStreamId()]);
 		$this->_handler->onClose($connection);
+		$this->onClose($connection);
 	}
 }

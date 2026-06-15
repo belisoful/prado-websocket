@@ -9,8 +9,8 @@ use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 
 /**
  * Verifies that WebSocket-over-HTTP/2 streams join and leave the cluster per stream, using the
- * protocol's {@see THttp2WebSocketProtocol::setOnConnection()}/{@see THttp2WebSocketProtocol::setOnClose()}
- * seams the server wires to the cluster.  Skipped when libnghttp2 is unavailable.
+ * protocol's {@see THttp2WebSocketProtocol::onConnection}/{@see THttp2WebSocketProtocol::onClose}
+ * events the server wires to the cluster.  Skipped when libnghttp2 is unavailable.
  */
 class TWebSocketHttp2ClusterTest extends PHPUnit\Framework\TestCase
 {
@@ -25,8 +25,8 @@ class TWebSocketHttp2ClusterTest extends PHPUnit\Framework\TestCase
 	{
 		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
 		$cluster = new TWebSocketCluster('h2', new TNullBackplane());
-		$protocol->setOnConnection(fn ($connection) => $cluster->register($connection));
-		$protocol->setOnClose(fn ($connection) => $cluster->unregister($connection));
+		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $cluster->register($connection));
+		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $cluster->unregister($connection));
 
 		$client = new TH2Session(false);
 		$client->submitSettings([]);
