@@ -13,6 +13,8 @@ namespace Prado\IO\Socket\WebSocket;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
 use Psr\Http\Message\StreamInterface;
 
@@ -55,6 +57,9 @@ class TWebSocketServer extends TSocketServer
 
 	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol}> Live sessions, keyed by transport object id. */
 	private array $_sessions = [];
+
+	/** @var ?TWebSocketCluster The cluster coordinator, when the server is a cluster node. */
+	private ?TWebSocketCluster $_cluster = null;
 
 	/** @var int The maximum bytes read from a ready connection per pump. */
 	public const READ_CHUNK = 65536;
@@ -102,6 +107,26 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the cluster coordinator the server registers its connections with.
+	 * @return ?TWebSocketCluster The cluster, or null when the server is standalone.
+	 */
+	public function getCluster(): ?TWebSocketCluster
+	{
+		return $this->_cluster;
+	}
+
+	/**
+	 * Sets the cluster coordinator.  When set, {@see serveOnce()} folds the cluster's sources into
+	 * the select set and pumps it each loop, and every connection registers its presence: HTTP/1.1
+	 * connections and an HTTP/2 session's multiplexed streams alike, each unregistering as it closes.
+	 * @param ?TWebSocketCluster $value The cluster, or null for standalone operation.
+	 */
+	public function setCluster(?TWebSocketCluster $value): void
+	{
+		$this->_cluster = $value;
+	}
+
+	/**
 	 * Runs the concurrent event loop until the server closes, pumping with {@see serveOnce()}.
 	 * @param ?int $seconds Per-pump select timeout in seconds; null blocks until activity.
 	 */
@@ -121,19 +146,19 @@ class TWebSocketServer extends TSocketServer
 	 */
 	public function serveOnce(?int $seconds = null, int $microseconds = 0): void
 	{
-		$read = array_merge([$this], array_column($this->_sessions, 'transport'));
+		$read = array_merge([$this], array_column($this->_sessions, 'transport'), $this->_cluster?->getSources() ?? []);
 		$write = null;
 		$except = null;
-		if (TSocketServer::select($read, $write, $except, $seconds, $microseconds) === false) {
-			return;
-		}
-		foreach ($read as $ready) {
-			if ($ready === $this) {
-				$this->acceptSession();
-			} else {
-				$this->pumpSession($ready);
+		if (TSocketServer::select($read, $write, $except, $seconds, $microseconds) !== false) {
+			foreach ($read as $ready) {
+				if ($ready === $this) {
+					$this->acceptSession();
+				} elseif (isset($this->_sessions[spl_object_id($ready)])) {
+					$this->pumpSession($ready);
+				}
 			}
 		}
+		$this->_cluster?->tick();
 	}
 
 	/**
@@ -191,16 +216,44 @@ class TWebSocketServer extends TSocketServer
 	protected function acceptHttp1Session(TSocketStream $transport): void
 	{
 		try {
-			TWebSocketHandshake::acceptConnection($transport);
+			$request = TWebSocketHandshake::receiveRequest($transport);
 		} catch (TWebSocketException $e) {
 			$transport->close();
 			return;
 		}
+		$mesh = $this->meshFor($request['target']);
+		if ($mesh !== null && !$mesh->authenticate($request['headers'])) {
+			$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse the peer before upgrading
+			$transport->close();
+			return;
+		}
+		$transport->write(TWebSocketHandshake::buildServerResponse($request['headers']['sec-websocket-key']));
 		$transport->setBlocking(false);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
+		if ($mesh !== null) {
+			$mesh->addPeer($connection, $transport);   // a cluster peer link, not a client session
+			return;
+		}
 		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
+		$this->_cluster?->register($connection);
 		$this->onConnection($connection);
 		$this->getHandler()?->onOpen($connection);
+	}
+
+	/**
+	 * Returns the mesh backplane an upgrade should join as a peer, or null for a client request.
+	 * A request whose target is the cluster's {@see TMeshBackplane::getPath() mesh path} is an
+	 * inbound peer link rather than a client.
+	 * @param ?string $target The request target (path).
+	 * @return ?TMeshBackplane The mesh to add the peer to, or null when the request is a client.
+	 */
+	protected function meshFor(?string $target): ?TMeshBackplane
+	{
+		$backplane = $this->_cluster?->getBackplane();
+		if ($backplane instanceof TMeshBackplane && $target !== null && $target === $backplane->getPath()) {
+			return $backplane;
+		}
+		return null;
 	}
 
 	/**
@@ -216,7 +269,11 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$protocol = Prado::createComponent(THttp2WebSocketProtocol::class, $handler);
-		$protocol->setOnConnection(fn ($connection) => $this->onConnection($connection));
+		$protocol->setOnConnection(function ($connection): void {
+			$this->_cluster?->register($connection);
+			$this->onConnection($connection);
+		});
+		$protocol->setOnClose(fn ($connection) => $this->_cluster?->unregister($connection));
 		$transport->setBlocking(false);
 		$initial = $protocol->send();
 		if ($initial !== '') {
@@ -239,6 +296,7 @@ class TWebSocketServer extends TSocketServer
 		$transport->setBlocking(false);
 		$this->addConnection($transport);
 		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
+		$this->_cluster?->register($connection);
 		$this->onConnection($connection);
 		$this->getHandler()?->onOpen($connection);
 	}
@@ -261,6 +319,24 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Reads a chunk from a ready transport, treating a clean end of stream and an abrupt disconnect
+	 * alike.  A peer that resets the connection surfaces as a read failure ({@see \Prado\IO\TStream::read()}
+	 * throws when the underlying read returns false); both that and an end of stream return null, so a
+	 * disconnect ends the session instead of crashing the loop.
+	 * @param TSocketStream $transport The ready transport.
+	 * @return ?string The bytes read, or null at end of stream or on a read failure.
+	 */
+	protected function readTransport(TSocketStream $transport): ?string
+	{
+		try {
+			$bytes = $transport->read(self::READ_CHUNK);
+		} catch (\RuntimeException $e) {
+			return null;
+		}
+		return ($bytes === '' && $transport->eof()) ? null : $bytes;
+	}
+
+	/**
 	 * Reads a single-WebSocket connection, dispatches its messages, and ends the session on a
 	 * Close frame, a protocol error, or end of stream.
 	 * @param TSocketStream $transport The ready transport.
@@ -268,8 +344,8 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function pumpHttp1Session(TSocketStream $transport, TWebSocketConnection $connection): void
 	{
-		$bytes = $transport->read(self::READ_CHUNK);
-		if ($bytes === '' && $transport->eof()) {
+		$bytes = $this->readTransport($transport);
+		if ($bytes === null) {
 			$this->endHttp1Session($transport, $connection);
 			return;
 		}
@@ -297,8 +373,8 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function pumpHttp2Session(TSocketStream $transport, THttp2WebSocketProtocol $protocol): void
 	{
-		$bytes = $transport->read(self::READ_CHUNK);
-		if ($bytes === '' && $transport->eof()) {
+		$bytes = $this->readTransport($transport);
+		if ($bytes === null) {
 			$this->endHttp2Session($transport);
 			return;
 		}
@@ -325,17 +401,25 @@ class TWebSocketServer extends TSocketServer
 	{
 		unset($this->_sessions[spl_object_id($transport)]);
 		$this->getHandler()?->onClose($connection);
+		$this->_cluster?->unregister($connection);
 		$transport->close();
 	}
 
 	/**
-	 * Ends an HTTP/2 session: closes the transport and forgets it.  Per-stream closes are raised
-	 * by the protocol as the streams end.
+	 * Ends an HTTP/2 session: unregisters any cluster presence for streams still open, closes the
+	 * transport, and forgets it.  Graceful per-stream closes unregister as they happen; this clears
+	 * what remains when the whole transport drops.
 	 * @param TSocketStream $transport The session transport.
 	 */
 	protected function endHttp2Session(TSocketStream $transport): void
 	{
+		$session = $this->_sessions[spl_object_id($transport)] ?? null;
 		unset($this->_sessions[spl_object_id($transport)]);
+		if ($this->_cluster !== null && isset($session['protocol'])) {
+			foreach ($session['protocol']->getConnections() as $connection) {
+				$this->_cluster->unregister($connection);
+			}
+		}
 		$transport->close();
 	}
 
@@ -384,5 +468,6 @@ class TWebSocketServer extends TSocketServer
 	{
 		parent::_getZappableSleepProps($exprops);
 		$exprops[] = "\0" . __CLASS__ . "\0_sessions";
+		$exprops[] = "\0" . __CLASS__ . "\0_cluster";
 	}
 }
