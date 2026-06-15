@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -109,10 +110,10 @@ class TWebSocketHandshake
 	 */
 	public static function isUpgradeRequest(array $headers): bool
 	{
-		$connection = array_map('trim', explode(',', strtolower($headers['connection'] ?? '')));
+		$connection = array_map('trim', explode(',', strtolower($headers[strtolower(THttpHeaderName::Connection)] ?? '')));
 		return in_array('upgrade', $connection, true)
-			&& strtolower($headers['upgrade'] ?? '') === 'websocket'
-			&& isset($headers['sec-websocket-key']);
+			&& strtolower($headers[strtolower(THttpHeaderName::Upgrade)] ?? '') === 'websocket'
+			&& isset($headers[strtolower(THttpHeaderName::SecWebSocketKey)]);
 	}
 
 	/**
@@ -124,9 +125,9 @@ class TWebSocketHandshake
 	public static function buildServerResponse(string $key, array $extraHeaders = []): string
 	{
 		$headers = [
-			'Upgrade' => 'websocket',
-			'Connection' => 'Upgrade',
-			'Sec-WebSocket-Accept' => self::acceptKey($key),
+			THttpHeaderName::Upgrade => 'websocket',
+			THttpHeaderName::Connection => 'Upgrade',
+			THttpHeaderName::SecWebSocketAccept => self::acceptKey($key),
 		] + $extraHeaders;
 		$response = "HTTP/1.1 101 Switching Protocols\r\n";
 		foreach ($headers as $name => $value) {
@@ -146,11 +147,11 @@ class TWebSocketHandshake
 	public static function buildClientRequest(string $host, string $path, string $key, array $extraHeaders = []): string
 	{
 		$headers = [
-			'Host' => $host,
-			'Upgrade' => 'websocket',
-			'Connection' => 'Upgrade',
-			'Sec-WebSocket-Key' => $key,
-			'Sec-WebSocket-Version' => (string) self::VERSION,
+			THttpHeaderName::Host => $host,
+			THttpHeaderName::Upgrade => 'websocket',
+			THttpHeaderName::Connection => 'Upgrade',
+			THttpHeaderName::SecWebSocketKey => $key,
+			THttpHeaderName::SecWebSocketVersion => (string) self::VERSION,
 		] + $extraHeaders;
 		$request = 'GET ' . ($path === '' ? '/' : $path) . " HTTP/1.1\r\n";
 		foreach ($headers as $name => $value) {
@@ -168,7 +169,7 @@ class TWebSocketHandshake
 	public static function verifyServerResponse(array $response, string $sentKey): bool
 	{
 		return ($response['statusCode'] ?? 0) === 101
-			&& ($response['headers']['sec-websocket-accept'] ?? '') === self::acceptKey($sentKey);
+			&& ($response['headers'][strtolower(THttpHeaderName::SecWebSocketAccept)] ?? '') === self::acceptKey($sentKey);
 	}
 
 	/**
@@ -204,7 +205,7 @@ class TWebSocketHandshake
 	public static function acceptConnection(StreamInterface $stream, array $extraHeaders = []): array
 	{
 		$request = self::receiveRequest($stream);
-		$stream->write(self::buildServerResponse($request['headers']['sec-websocket-key'], $extraHeaders));
+		$stream->write(self::buildServerResponse($request['headers'][strtolower(THttpHeaderName::SecWebSocketKey)], $extraHeaders));
 		return $request;
 	}
 
