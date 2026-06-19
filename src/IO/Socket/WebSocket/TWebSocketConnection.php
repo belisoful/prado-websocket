@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\IO\TResource;
 use Prado\Prado;
 use Prado\TComponent;
 use Psr\Http\Message\StreamInterface;
@@ -64,6 +65,24 @@ class TWebSocketConnection extends TComponent
 	/** @var string Reassembly buffer for a fragmented message across {@see feed()} calls. */
 	private string $_messageBuffer = '';
 
+	/** @var ?int The opcode (Text or Binary) of the message being reassembled, or null when none is. */
+	private ?int $_fragmentOpcode = null;
+
+	/** @var int The reserved bits of the first frame of the message being reassembled. */
+	private int $_fragmentRsv = 0;
+
+	/** @var bool Whether to enforce the RFC 6455 mask rule on received frames. */
+	private bool $_validateMasking = true;
+
+	/** @var int The maximum reassembled message size in bytes, or 0 for unlimited. */
+	private int $_maxMessageSize = 0;
+
+	/** @var ?string The negotiated subprotocol, or null when none was selected. */
+	private ?string $_subprotocol = null;
+
+	/** @var IWebSocketExtension[] The negotiated extensions, applied in order on send and reverse on receive. */
+	private array $_extensions = [];
+
 	/**
 	 * @param StreamInterface $stream The transport stream.
 	 * @param bool $isClient Whether this is the client side. Default false (server).
@@ -76,29 +95,64 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Accepts a server connection: runs the server handshake on the stream, then wraps it.
+	 * Accepts a server connection: runs the server handshake on the stream, then wraps it with the
+	 * negotiated subprotocol and extension applied.
 	 * @param StreamInterface $stream The accepted transport stream.
-	 * @param array<string, string> $extraHeaders Extra response headers.
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], headers?: array<string, string>} $options
+	 *   The handshake negotiation options, including the allowed `origins`.
 	 * @return self The server-side connection.
 	 */
-	public static function accept(StreamInterface $stream, array $extraHeaders = []): self
+	public static function accept(StreamInterface $stream, array $options = []): self
 	{
-		TWebSocketHandshake::acceptConnection($stream, $extraHeaders);
-		return Prado::createComponent(self::class, $stream, false);
+		$result = TWebSocketHandshake::acceptConnection($stream, $options);
+		return self::wrapNegotiated($stream, false, $result);
 	}
 
 	/**
-	 * Opens a client connection: runs the client handshake on the stream, then wraps it.
+	 * Opens a client connection: runs the client handshake on the stream, then wraps it with the
+	 * selected subprotocol and extension applied.
 	 * @param StreamInterface $stream The connected transport stream.
 	 * @param string $host The Host header value.
 	 * @param string $path The request target. Default '/'.
-	 * @param array<string, string> $extraHeaders Extra request headers.
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>} $options
+	 *   The handshake negotiation options.
 	 * @return self The client-side connection.
 	 */
-	public static function connect(StreamInterface $stream, string $host, string $path = '/', array $extraHeaders = []): self
+	public static function connect(StreamInterface $stream, string $host, string $path = '/', array $options = []): self
 	{
-		TWebSocketHandshake::openConnection($stream, $host, $path, $extraHeaders);
-		return Prado::createComponent(self::class, $stream, true);
+		$result = TWebSocketHandshake::openConnection($stream, $host, $path, $options);
+		return self::wrapNegotiated($stream, true, $result);
+	}
+
+	/**
+	 * Opens a client connection from a `ws://`/`wss://` URL: parses the host and request target with
+	 * {@see TWebSocketHandshake::parseUrl()} and runs the client handshake on the given transport.
+	 * The transport must already match the URL's scheme (a TLS stream for `wss://`).
+	 * @param StreamInterface $stream The connected transport stream.
+	 * @param string $url The `ws://` or `wss://` URL.
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>} $options
+	 *   The handshake negotiation options.
+	 * @return self The client-side connection.
+	 */
+	public static function connectUrl(StreamInterface $stream, string $url, array $options = []): self
+	{
+		$parts = TWebSocketHandshake::parseUrl($url);
+		return self::connect($stream, $parts['hostHeader'], $parts['path'], $options);
+	}
+
+	/**
+	 * Builds a connection from a handshake result, applying the negotiated subprotocol.
+	 * @param StreamInterface $stream The transport stream.
+	 * @param bool $isClient Whether this is the client side.
+	 * @param array{subprotocol?: ?string} $result The handshake result.
+	 * @return self The configured connection.
+	 */
+	private static function wrapNegotiated(StreamInterface $stream, bool $isClient, array $result): self
+	{
+		$connection = Prado::createComponent(self::class, $stream, $isClient);
+		$connection->setSubprotocol($result['subprotocol'] ?? null);
+		$connection->setExtensions($result['extensions'] ?? []);
+		return $connection;
 	}
 
 	/** @return StreamInterface The transport stream. */
@@ -142,16 +196,51 @@ class TWebSocketConnection extends TComponent
 		return $this->_stream->write(TWebSocketFrameCodec::encode($frame, $maskKey));
 	}
 
-	/** Sends a Text message. @param string $text The UTF-8 text. @return int Bytes written. */
+	/**
+	 * Sends a Text message.  A no-op once a Close has been sent, as a data frame must not follow it.
+	 * @param string $text The UTF-8 text.
+	 * @return int The bytes written, or 0 when the connection is closing.
+	 */
 	public function send(string $text): int
 	{
-		return $this->sendFrame(TWebSocketFrame::text($text));
+		return $this->sendDataMessage(TWebSocketOpcode::Text, $text);
 	}
 
-	/** Sends a Binary message. @param string $data The bytes. @return int Bytes written. */
+	/**
+	 * Sends a Binary message.  A no-op once a Close has been sent, as a data frame must not follow it.
+	 * @param string $data The bytes.
+	 * @return int The bytes written, or 0 when the connection is closing.
+	 */
 	public function sendBinary(string $data): int
 	{
-		return $this->sendFrame(TWebSocketFrame::binary($data));
+		return $this->sendDataMessage(TWebSocketOpcode::Binary, $data);
+	}
+
+	/**
+	 * Sends a data message as a single frame, folding the extension pipeline over the payload in
+	 * order and setting the reserved bits the extensions report.  A no-op once a Close has been sent.
+	 * @param int $opcode The data opcode (Text or Binary).
+	 * @param string $payload The message payload.
+	 * @return int The bytes written, or 0 when the connection is closing.
+	 */
+	private function sendDataMessage(int $opcode, string $payload): int
+	{
+		if ($this->_closing) {
+			return 0;
+		}
+		$rsv = 0;
+		foreach ($this->_extensions as $extension) {
+			[$payload, $bits] = $extension->encodeMessage($payload);
+			$rsv |= $bits;
+		}
+		return $this->sendFrame(new TWebSocketFrame(
+			$opcode,
+			$payload,
+			true,
+			($rsv & IWebSocketExtension::RSV1) !== 0,
+			($rsv & IWebSocketExtension::RSV2) !== 0,
+			($rsv & IWebSocketExtension::RSV3) !== 0,
+		));
 	}
 
 	/** Sends a Ping. @param string $data The application data (<=125 bytes). @return int Bytes written. */
@@ -181,6 +270,35 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
+	 * Completes the close handshake on a blocking connection: sends a Close (when not already closing),
+	 * then reads and discards frames until the peer's Close arrives or the stream ends.  When the
+	 * transport supports it, a read timeout bounds the wait so a peer that never answers cannot block
+	 * the caller forever.
+	 * @param int $code A {@see TWebSocketCloseCode} value. Default Normal.
+	 * @param string $reason A reason phrase. Default ''.
+	 * @param ?float $timeout The seconds to wait for the peer's Close, or null for an unbounded wait.
+	 * @return bool Whether the connection closed (the peer's Close or end of stream) before the timeout.
+	 */
+	public function drainClose(int $code = TWebSocketCloseCode::Normal, string $reason = '', ?float $timeout = 1.0): bool
+	{
+		try {
+			$this->close($code, $reason);
+			if ($timeout !== null && $this->_stream instanceof TResource) {
+				$seconds = (int) $timeout;
+				$this->_stream->setTimeout($seconds, (int) (($timeout - $seconds) * 1000000));
+			}
+			while (!$this->_closed && $this->receiveFrame() !== null) {
+				// receiveFrame() handles the peer's Close inline, marking the connection closed.
+			}
+		} catch (\Throwable $e) {
+			// The peer is gone or unresponsive (a broken pipe, a read timeout, a protocol error);
+			// the drain ends and the connection is considered closed regardless.
+			$this->_closed = true;
+		}
+		return $this->_closed;
+	}
+
+	/**
 	 * Reads and returns the next single frame, handling control frames inline (auto-Pong,
 	 * close handshake).  Useful for an event loop that pumps one frame at a time; the
 	 * message-level {@see receive()} builds on it.
@@ -188,15 +306,14 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function receiveFrame(): ?TWebSocketFrame
 	{
-		$frame = TWebSocketFrameCodec::decode($this->_stream);
+		$frame = TWebSocketFrameCodec::decode($this->_stream, $this->expectedMask());
 		if ($frame === null) {
 			$this->_closed = true;
 			return null;
 		}
+		$this->validateFrame($frame);
 		if ($frame->getIsControl()) {
 			$this->handleControlFrame($frame);
-		} elseif ($frame->getOpcode() !== TWebSocketOpcode::Continuation) {
-			$this->_lastOpcode = $frame->getOpcode();
 		}
 		return $frame;
 	}
@@ -208,7 +325,6 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function receive(): ?string
 	{
-		$message = '';
 		while (!$this->_closed) {
 			$frame = $this->receiveFrame();
 			if ($frame === null || $frame->getOpcode() === TWebSocketOpcode::Close) {
@@ -217,8 +333,8 @@ class TWebSocketConnection extends TComponent
 			if ($frame->getIsControl()) {
 				continue;
 			}
-			$message .= $frame->getPayload();
-			if ($frame->getFin()) {
+			$message = $this->ingestDataFrame($frame);
+			if ($message !== null) {
 				return $message;
 			}
 		}
@@ -242,20 +358,17 @@ class TWebSocketConnection extends TComponent
 	{
 		$this->_readBuffer .= $bytes;
 		$messages = [];
-		while (!$this->_closed && ($decoded = TWebSocketFrameCodec::tryDecode($this->_readBuffer)) !== null) {
+		while (!$this->_closed && ($decoded = TWebSocketFrameCodec::tryDecode($this->_readBuffer, $this->expectedMask())) !== null) {
 			$this->_readBuffer = substr($this->_readBuffer, $decoded['length']);
 			$frame = $decoded['frame'];
+			$this->validateFrame($frame);
 			if ($frame->getIsControl()) {
 				$this->handleControlFrame($frame);
 				continue;
 			}
-			if ($frame->getOpcode() !== TWebSocketOpcode::Continuation) {
-				$this->_lastOpcode = $frame->getOpcode();
-			}
-			$this->_messageBuffer .= $frame->getPayload();
-			if ($frame->getFin()) {
-				$messages[] = $this->_messageBuffer;
-				$this->_messageBuffer = '';
+			$message = $this->ingestDataFrame($frame);
+			if ($message !== null) {
+				$messages[] = $message;
 			}
 		}
 		return $messages;
@@ -277,6 +390,7 @@ class TWebSocketConnection extends TComponent
 				$this->onPong($frame->getPayload());
 				break;
 			case TWebSocketOpcode::Close:
+				$this->validateCloseFrame($frame);
 				$this->onClose($frame);
 				if (!$this->_closing) {
 					$this->_closing = true;
@@ -287,6 +401,231 @@ class TWebSocketConnection extends TComponent
 				$this->_closed = true;
 				break;
 		}
+	}
+
+	/**
+	 * Returns the mask state received frames must have, or null when masking is not enforced.  A
+	 * server requires masked frames and a client requires unmasked frames (RFC 6455 section 5.1).
+	 * @return ?bool True to require masked, false to require unmasked, or null to skip the check.
+	 */
+	private function expectedMask(): ?bool
+	{
+		return $this->_validateMasking ? !$this->_isClient : null;
+	}
+
+	/**
+	 * Validates a frame's stateless structure: a reserved bit no negotiated extension owns, or an
+	 * undefined opcode, is a protocol error.  A reserved bit is allowed only on a data message's
+	 * first frame, and only when an extension reserves it.
+	 * @param TWebSocketFrame $frame The decoded frame.
+	 * @throws TWebSocketException When an unowned reserved bit is set or the opcode is undefined.
+	 */
+	private function validateFrame(TWebSocketFrame $frame): void
+	{
+		$allowed = (!$frame->getIsControl() && $frame->getOpcode() !== TWebSocketOpcode::Continuation)
+			? $this->reservedRsv()
+			: 0;
+		if ((self::frameRsv($frame) & ~$allowed) !== 0) {
+			throw new TWebSocketException('websocket_rsv_not_negotiated');
+		}
+		if (!TWebSocketOpcode::isDefined($frame->getOpcode())) {
+			throw new TWebSocketException('websocket_opcode_unknown', $frame->getOpcode());
+		}
+	}
+
+	/**
+	 * Returns the reserved bits owned by the negotiated extensions, the union of their masks.
+	 * @return int The reserved-bit mask owned by extensions.
+	 */
+	private function reservedRsv(): int
+	{
+		$reserved = 0;
+		foreach ($this->_extensions as $extension) {
+			$reserved |= $extension->getReservedRsv();
+		}
+		return $reserved;
+	}
+
+	/**
+	 * Returns a frame's reserved bits as an {@see IWebSocketExtension} RSV mask.
+	 * @param TWebSocketFrame $frame The frame.
+	 * @return int The reserved-bit mask.
+	 */
+	private static function frameRsv(TWebSocketFrame $frame): int
+	{
+		return ($frame->getRsv1() ? IWebSocketExtension::RSV1 : 0)
+			| ($frame->getRsv2() ? IWebSocketExtension::RSV2 : 0)
+			| ($frame->getRsv3() ? IWebSocketExtension::RSV3 : 0);
+	}
+
+	/**
+	 * Reassembles a data frame into a message, enforcing the fragmentation rules: a continuation
+	 * with no message in progress, or a new Text/Binary frame while one is unfinished, is a protocol
+	 * error.  On the final frame it enforces the size limit and validates UTF-8 for a Text message.
+	 * @param TWebSocketFrame $frame The data frame (Text, Binary, or Continuation).
+	 * @throws TWebSocketException On a fragmentation error, an oversized message, or invalid UTF-8.
+	 * @return ?string The completed message, or null while the message is still being reassembled.
+	 */
+	private function ingestDataFrame(TWebSocketFrame $frame): ?string
+	{
+		$opcode = $frame->getOpcode();
+		if ($opcode === TWebSocketOpcode::Continuation) {
+			if ($this->_fragmentOpcode === null) {
+				throw new TWebSocketException('websocket_continuation_unexpected');
+			}
+		} else {
+			if ($this->_fragmentOpcode !== null) {
+				throw new TWebSocketException('websocket_fragment_incomplete');
+			}
+			$this->_fragmentOpcode = $opcode;
+			$this->_fragmentRsv = self::frameRsv($frame);
+			$this->_lastOpcode = $opcode;
+		}
+		$this->_messageBuffer .= $frame->getPayload();
+		if ($this->_maxMessageSize > 0 && strlen($this->_messageBuffer) > $this->_maxMessageSize) {
+			$this->resetMessage();
+			throw (new TWebSocketException('websocket_message_too_big', $this->_maxMessageSize))
+				->setCloseCode(TWebSocketCloseCode::MessageTooBig);
+		}
+		if (!$frame->getFin()) {
+			return null;
+		}
+		$message = $this->_messageBuffer;
+		$isText = $this->_fragmentOpcode === TWebSocketOpcode::Text;
+		$rsv = $this->_fragmentRsv;
+		$this->resetMessage();
+		foreach (array_reverse($this->_extensions) as $extension) {
+			$message = $extension->decodeMessage($message, $rsv);
+		}
+		if ($this->_maxMessageSize > 0 && strlen($message) > $this->_maxMessageSize) {
+			throw (new TWebSocketException('websocket_message_too_big', $this->_maxMessageSize))
+				->setCloseCode(TWebSocketCloseCode::MessageTooBig);
+		}
+		if ($isText && !self::isValidUtf8($message)) {
+			throw (new TWebSocketException('websocket_text_not_utf8'))
+				->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);
+		}
+		return $message;
+	}
+
+	/**
+	 * Validates a received Close frame's payload: a one-byte payload is malformed, the close code
+	 * must be valid to receive, and any reason phrase must be valid UTF-8.  An empty payload (no
+	 * code) is valid.
+	 * @param TWebSocketFrame $frame The Close frame.
+	 * @throws TWebSocketException When the payload, close code, or reason is invalid.
+	 */
+	private function validateCloseFrame(TWebSocketFrame $frame): void
+	{
+		$length = strlen($frame->getPayload());
+		if ($length === 0) {
+			return;
+		}
+		if ($length === 1) {
+			throw new TWebSocketException('websocket_close_frame_invalid');
+		}
+		$code = $frame->getCloseCode();
+		if ($code === null || !TWebSocketCloseCode::isValidIncoming($code)) {
+			throw new TWebSocketException('websocket_close_code_invalid', (int) $code);
+		}
+		if (!self::isValidUtf8($frame->getCloseReason())) {
+			throw (new TWebSocketException('websocket_close_reason_not_utf8'))
+				->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);
+		}
+	}
+
+	/**
+	 * Clears the message reassembly state after a message completes or fails.
+	 */
+	private function resetMessage(): void
+	{
+		$this->_messageBuffer = '';
+		$this->_fragmentOpcode = null;
+		$this->_fragmentRsv = 0;
+	}
+
+	/**
+	 * Indicates whether a string is valid UTF-8.
+	 * @param string $value The bytes to test.
+	 * @return bool Whether the bytes are valid UTF-8.
+	 */
+	private static function isValidUtf8(string $value): bool
+	{
+		return $value === '' || preg_match('//u', $value) === 1;
+	}
+
+	/** @return ?string The negotiated subprotocol, or null when none was selected. */
+	public function getSubprotocol(): ?string
+	{
+		return $this->_subprotocol;
+	}
+
+	/**
+	 * Sets the negotiated subprotocol.
+	 * @param ?string $value The subprotocol, or null for none.
+	 */
+	public function setSubprotocol(?string $value): void
+	{
+		$this->_subprotocol = $value;
+	}
+
+	/** @return IWebSocketExtension[] The negotiated extensions, in pipeline order. */
+	public function getExtensions(): array
+	{
+		return $this->_extensions;
+	}
+
+	/**
+	 * Sets the negotiated extensions applied per message, in pipeline order (encoded in order,
+	 * decoded in reverse).  Two extensions must not reserve the same RSV bit.
+	 * @param IWebSocketExtension[] $value The extensions.
+	 * @throws TWebSocketException When an entry is not an extension or two reserve the same RSV bit.
+	 */
+	public function setExtensions(array $value): void
+	{
+		$reserved = 0;
+		foreach ($value as $extension) {
+			if (!$extension instanceof IWebSocketExtension) {
+				throw new TWebSocketException('websocket_extension_invalid');
+			}
+			if (($reserved & $extension->getReservedRsv()) !== 0) {
+				throw new TWebSocketException('websocket_extension_rsv_conflict', $extension->getName());
+			}
+			$reserved |= $extension->getReservedRsv();
+		}
+		$this->_extensions = array_values($value);
+	}
+
+	/** @return bool Whether the RFC 6455 mask rule is enforced on received frames. */
+	public function getValidateMasking(): bool
+	{
+		return $this->_validateMasking;
+	}
+
+	/**
+	 * Sets whether to enforce the RFC 6455 mask rule on received frames.  A standalone server keeps
+	 * this enabled; the HTTP/2 transport disables it, since RFC 8441 carries its own framing.
+	 * @param bool $value Whether to enforce the mask rule.
+	 */
+	public function setValidateMasking(bool $value): void
+	{
+		$this->_validateMasking = $value;
+	}
+
+	/** @return int The maximum reassembled message size in bytes, or 0 for unlimited. */
+	public function getMaxMessageSize(): int
+	{
+		return $this->_maxMessageSize;
+	}
+
+	/**
+	 * Sets the maximum reassembled message size.  A message that exceeds it fails the connection
+	 * with {@see TWebSocketCloseCode::MessageTooBig}.
+	 * @param int $value The maximum size in bytes, or 0 for unlimited.
+	 */
+	public function setMaxMessageSize(int $value): void
+	{
+		$this->_maxMessageSize = max(0, $value);
 	}
 
 	/**

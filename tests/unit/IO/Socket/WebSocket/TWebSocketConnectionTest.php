@@ -2,7 +2,9 @@
 
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
+use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\TStream;
 
@@ -143,6 +145,48 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		self::assertTrue($server->getIsClosed(), 'A fed Close marks the connection closed.');
 		$a->close();
 		$b->close();
+	}
+
+	public function testConnectUrlDerivesHostAndTargetFromUrl()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		try {
+			TWebSocketConnection::connectUrl($a, 'wss://example.com:8443/chat?room=1');
+		} catch (TWebSocketException $e) {
+			// No server answers, so verification fails after the request is written.
+		}
+		$request = $b->read(65536);
+		self::assertStringContainsString('GET /chat?room=1 HTTP/1.1', $request, 'The request target comes from the URL.');
+		self::assertStringContainsString('Host: example.com:8443', $request, 'The Host header carries the non-default port.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testDrainCloseCompletesWhenPeerAnswers()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$client = new TWebSocketConnection($a, true);
+		$closed = false;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed = true;
+		});
+		$b->write(TWebSocketFrameCodec::encode(TWebSocketFrame::close(1000)));   // the peer's Close, queued unmasked
+		self::assertTrue($client->drainClose(1000), 'drainClose returns true once the connection closes.');
+		self::assertTrue($client->getIsClosed());
+		self::assertTrue($closed, 'The peer Close raised onClose during the drain.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testDrainCloseReturnsWhenPeerIsGone()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$client = new TWebSocketConnection($a, true);
+		$b->close();                                  // the peer vanished without a Close
+		self::assertTrue($client->drainClose(1000, '', 0.2), 'drainClose returns at end of stream rather than hanging.');
+		self::assertTrue($client->getIsClosed());
+		$a->close();
 	}
 
 	public function testAcceptRunsServerHandshake()

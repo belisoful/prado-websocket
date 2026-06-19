@@ -16,6 +16,7 @@ use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
+use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -54,6 +55,18 @@ class TWebSocketServer extends TSocketServer
 
 	/** @var ?IWebSocketHandler The handler each ready connection is run through. */
 	private ?IWebSocketHandler $_handler = null;
+
+	/** @var string[] The subprotocols the server supports, offered for negotiation in preference order. */
+	private array $_subprotocols = [];
+
+	/** @var string[] The origins allowed to upgrade, empty to allow any. */
+	private array $_origins = [];
+
+	/** @var string[] The Host authorities allowed to upgrade, empty to allow any. */
+	private array $_allowedHosts = [];
+
+	/** @var IWebSocketExtensionNegotiator[] The extension negotiators offered during the handshake. */
+	private array $_extensions = [];
 
 	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol}> Live sessions, keyed by transport object id. */
 	private array $_sessions = [];
@@ -104,6 +117,89 @@ class TWebSocketServer extends TSocketServer
 	public function setHandler(?IWebSocketHandler $value): void
 	{
 		$this->_handler = $value;
+	}
+
+	/**
+	 * Returns the subprotocols the server supports.
+	 * @return string[] The supported subprotocols, in preference order.
+	 */
+	public function getSubprotocols(): array
+	{
+		return $this->_subprotocols;
+	}
+
+	/**
+	 * Sets the subprotocols the server supports, offered for handshake negotiation.
+	 * @param string|string[] $value The subprotocols, as an array or a comma-separated string.
+	 */
+	public function setSubprotocols($value): void
+	{
+		$value = is_array($value) ? $value : array_map('trim', explode(',', (string) $value));
+		$this->_subprotocols = array_values(array_filter($value, fn ($p) => $p !== ''));
+	}
+
+	/**
+	 * Returns the origins allowed to upgrade.
+	 * @return string[] The allowed origins, empty to allow any.
+	 */
+	public function getOrigins(): array
+	{
+		return $this->_origins;
+	}
+
+	/**
+	 * Sets the origins allowed to upgrade.  An empty list allows any origin; otherwise an upgrade
+	 * whose `Origin` is not listed is refused with a `403`.
+	 * @param string|string[] $value The allowed origins, as an array or a comma-separated string.
+	 */
+	public function setOrigins($value): void
+	{
+		$value = is_array($value) ? $value : array_map('trim', explode(',', (string) $value));
+		$this->_origins = array_values(array_filter($value, fn ($o) => $o !== ''));
+	}
+
+	/**
+	 * Returns the Host authorities allowed to upgrade.
+	 * @return string[] The allowed hosts, empty to allow any.
+	 */
+	public function getAllowedHosts(): array
+	{
+		return $this->_allowedHosts;
+	}
+
+	/**
+	 * Sets the Host authorities allowed to upgrade.  An empty list allows any host; otherwise an
+	 * upgrade whose `Host` is not listed is refused with a `400`.
+	 * @param string|string[] $value The allowed hosts, as an array or a comma-separated string.
+	 */
+	public function setAllowedHosts($value): void
+	{
+		$value = is_array($value) ? $value : array_map('trim', explode(',', (string) $value));
+		$this->_allowedHosts = array_values(array_filter($value, fn ($h) => $h !== ''));
+	}
+
+	/**
+	 * Returns the extension negotiators offered during the handshake.
+	 * @return IWebSocketExtensionNegotiator[] The extension negotiators, in preference order.
+	 */
+	public function getExtensions(): array
+	{
+		return $this->_extensions;
+	}
+
+	/**
+	 * Sets the extension negotiators offered during the handshake, in preference order.
+	 * @param IWebSocketExtensionNegotiator[] $value The extension negotiators.
+	 * @throws TWebSocketException When a value does not implement {@see IWebSocketExtensionNegotiator}.
+	 */
+	public function setExtensions(array $value): void
+	{
+		foreach ($value as $negotiator) {
+			if (!$negotiator instanceof IWebSocketExtensionNegotiator) {
+				throw new TWebSocketException('websocket_extension_negotiator_invalid');
+			}
+		}
+		$this->_extensions = array_values($value);
 	}
 
 	/**
@@ -221,19 +317,45 @@ class TWebSocketServer extends TSocketServer
 			$transport->close();
 			return;
 		}
+		$key = $request['headers'][strtolower(THttpHeaderName::SecWebSocketKey)];
 		$mesh = $this->meshFor($request['target']);
-		if ($mesh !== null && !$mesh->authenticate($request['headers'])) {
-			$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse the peer before upgrading
+		if ($mesh !== null) {
+			if (!$mesh->authenticate($request['headers'])) {
+				$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse the peer before upgrading
+				$transport->close();
+				return;
+			}
+			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // a peer link does not negotiate
+			$transport->setBlocking(false);
+			$mesh->addPeer(Prado::createComponent(TWebSocketConnection::class, $transport, false), $transport);
+			return;
+		}
+
+		if (!TWebSocketHandshake::isOriginAllowed($request['headers'], $this->_origins ?: null)) {
+			$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse a disallowed origin before upgrading
 			$transport->close();
 			return;
 		}
-		$transport->write(TWebSocketHandshake::buildServerResponse($request['headers']['sec-websocket-key']));
-		$transport->setBlocking(false);
-		$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
-		if ($mesh !== null) {
-			$mesh->addPeer($connection, $transport);   // a cluster peer link, not a client session
+		if (!TWebSocketHandshake::isHostAllowed($request['headers'], $this->_allowedHosts ?: null)) {
+			$transport->write(TWebSocketHandshake::buildRejection(400, 'Bad Request'));   // refuse a disallowed Host
+			$transport->close();
 			return;
 		}
+
+		$subprotocol = TWebSocketHandshake::negotiateSubprotocol($request['headers'], $this->_subprotocols);
+		$negotiated = TWebSocketHandshake::negotiateExtensions($request['headers'], $this->_extensions);
+		$responseHeaders = [];
+		if ($subprotocol !== null) {
+			$responseHeaders[THttpHeaderName::SecWebSocketProtocol] = $subprotocol;
+		}
+		if ($negotiated['header'] !== '') {
+			$responseHeaders[THttpHeaderName::SecWebSocketExtensions] = $negotiated['header'];
+		}
+		$transport->write(TWebSocketHandshake::buildServerResponse($key, $responseHeaders));
+		$transport->setBlocking(false);
+		$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
+		$connection->setSubprotocol($subprotocol);
+		$connection->setExtensions($negotiated['extensions']);
 		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
 		$this->_cluster?->register($connection);
 		$this->onConnection($connection);
@@ -269,11 +391,11 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$protocol = Prado::createComponent(THttp2WebSocketProtocol::class, $handler);
-		$protocol->setOnConnection(function ($connection): void {
-			$this->_cluster?->register($connection);
-			$this->onConnection($connection);
-		});
-		$protocol->setOnClose(fn ($connection) => $this->_cluster?->unregister($connection));
+		$protocol->setOrigins($this->_origins);
+		$protocol->setAllowedHosts($this->_allowedHosts);
+		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
+		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
+		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
 		$transport->setBlocking(false);
 		$initial = $protocol->send();
 		if ($initial !== '') {

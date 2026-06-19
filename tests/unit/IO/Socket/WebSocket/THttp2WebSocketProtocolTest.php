@@ -70,4 +70,92 @@ class THttp2WebSocketProtocolTest extends PHPUnit\Framework\TestCase
 		$protocol->getSession()->close();
 		$client->close();
 	}
+
+	/** Submits an Extended CONNECT with the given origin and returns [protocol, opened-count, status]. */
+	private function connectWithOrigin(array $origins, ?string $origin): array
+	{
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$protocol->setOrigins($origins);
+
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$headers = [
+			':method' => 'CONNECT',
+			':protocol' => 'websocket',
+			':scheme' => 'https',
+			':path' => '/chat',
+			':authority' => 'example.com',
+			'sec-websocket-version' => '13',
+		];
+		if ($origin !== null) {
+			$headers['origin'] = $origin;
+		}
+		$client->request($headers);
+		$status = null;
+		$client->attachEventHandler('onResponse', function ($session, $s) use (&$status) {
+			$status = $s->getHeader(':status');
+		});
+
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		$result = [$opened, $status];
+		$protocol->getSession()->close();
+		$client->close();
+		return $result;
+	}
+
+	public function testForeignOriginIsRejectedOverHttp2()
+	{
+		[$opened, $status] = $this->connectWithOrigin(['https://app.example.com'], 'https://evil.example.com');
+		self::assertSame(0, $opened, 'A foreign origin does not open a WebSocket over HTTP/2.');
+		self::assertSame('403', $status, 'A foreign origin Extended CONNECT is refused with 403.');
+	}
+
+	public function testAllowedOriginOpensOverHttp2()
+	{
+		[$opened, $status] = $this->connectWithOrigin(['https://app.example.com'], 'https://app.example.com');
+		self::assertSame(1, $opened, 'An allowlisted origin opens the WebSocket over HTTP/2.');
+		self::assertSame('200', $status);
+	}
+
+	public function testForeignAuthorityIsRejectedOverHttp2()
+	{
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$protocol->setAllowedHosts(['app.example.com']);
+
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->request([
+			':method' => 'CONNECT',
+			':protocol' => 'websocket',
+			':scheme' => 'https',
+			':path' => '/chat',
+			':authority' => 'evil.example.com',
+			'sec-websocket-version' => '13',
+		]);
+		$status = null;
+		$client->attachEventHandler('onResponse', function ($session, $s) use (&$status) {
+			$status = $s->getHeader(':status');
+		});
+
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		self::assertSame(0, $opened, 'A disallowed :authority does not open a WebSocket over HTTP/2.');
+		self::assertSame('400', $status, 'A disallowed :authority Extended CONNECT is refused with 400.');
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
 }

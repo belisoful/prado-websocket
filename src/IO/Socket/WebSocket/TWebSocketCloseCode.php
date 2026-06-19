@@ -68,4 +68,16 @@ class TWebSocketCloseCode extends TEnumerable
 		}
 		return ($code >= 1000 && $code <= 1011) || ($code >= 3000 && $code <= 4999);
 	}
+
+	/**
+	 * Indicates whether a close code is valid in a received Close frame.  The status-only codes
+	 * (1004, 1005, 1006, 1015), codes below 1000, and the unassigned 1012-2999 range are rejected;
+	 * the protocol codes 1000-1003 / 1007-1011 and the application range 3000-4999 are accepted.
+	 * @param int $code The close code from a received Close frame.
+	 * @return bool Whether the code is valid to receive.
+	 */
+	public static function isValidIncoming(int $code): bool
+	{
+		return ($code >= 1000 && $code <= 1003) || ($code >= 1007 && $code <= 1011) || ($code >= 3000 && $code <= 4999);
+	}
 }

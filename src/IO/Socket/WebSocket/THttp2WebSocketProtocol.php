@@ -54,6 +54,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var array<int, TWebSocketConnection> The WebSocket connections, keyed by HTTP/2 stream id. */
 	private array $_connections = [];
 
+	/** @var string[] The origins allowed to open a stream, empty to allow any. */
+	private array $_origins = [];
+
+	/** @var string[] The `:authority` hosts allowed to open a stream, empty to allow any. */
+	private array $_allowedHosts = [];
+
 	/** @var ?callable The per-stream notification callback set during {@see serve()}. */
 	private $_onStream;
 
@@ -76,6 +82,44 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	public function getSession(): TH2Session
 	{
 		return $this->_session;
+	}
+
+	/**
+	 * Returns the origins allowed to open a WebSocket stream.
+	 * @return string[] The allowed origins, empty to allow any.
+	 */
+	public function getOrigins(): array
+	{
+		return $this->_origins;
+	}
+
+	/**
+	 * Sets the origins allowed to open a WebSocket stream.  An empty list allows any origin; otherwise
+	 * an Extended CONNECT whose `origin` is not listed is refused with a `403`.
+	 * @param string[] $value The allowed origins.
+	 */
+	public function setOrigins(array $value): void
+	{
+		$this->_origins = array_values($value);
+	}
+
+	/**
+	 * Returns the `:authority` hosts allowed to open a WebSocket stream.
+	 * @return string[] The allowed hosts, empty to allow any.
+	 */
+	public function getAllowedHosts(): array
+	{
+		return $this->_allowedHosts;
+	}
+
+	/**
+	 * Sets the `:authority` hosts allowed to open a WebSocket stream.  An empty list allows any host;
+	 * otherwise an Extended CONNECT whose `:authority` is not listed is refused with a `400`.
+	 * @param string[] $value The allowed hosts.
+	 */
+	public function setAllowedHosts(array $value): void
+	{
+		$this->_allowedHosts = array_values($value);
 	}
 
 	/**
@@ -162,8 +206,19 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			$this->_session->respond($stream, [':status' => '400']);
 			return;
 		}
+		$origin = $stream->getHeader('origin');
+		if (!TWebSocketHandshake::isOriginAllowed($origin === null ? [] : ['origin' => $origin], $this->_origins ?: null)) {
+			$this->_session->respond($stream, [':status' => '403']);   // refuse a disallowed origin before upgrading
+			return;
+		}
+		$authority = $stream->getHeader(':authority');
+		if (!TWebSocketHandshake::isHostAllowed($authority === null ? [] : ['host' => $authority], $this->_allowedHosts ?: null)) {
+			$this->_session->respond($stream, [':status' => '400']);   // refuse a disallowed :authority
+			return;
+		}
 		$this->_session->respond($stream, [':status' => '200']);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
+		$connection->setValidateMasking(false);   // RFC 8441 carries WebSocket DATA without RFC 6455 masking
 		$this->_connections[$stream->getStreamId()] = $connection;
 		if ($this->_onStream !== null) {
 			($this->_onStream)($stream);

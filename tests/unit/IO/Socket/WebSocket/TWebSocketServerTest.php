@@ -6,6 +6,7 @@ use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketProtocol;
 use Prado\IO\Socket\WebSocket\THttp1WebSocketProtocol;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
@@ -88,6 +89,78 @@ class TWebSocketServerTest extends PHPUnit\Framework\TestCase
 		$client->close();
 	}
 
+	public function testOriginConfigurationParsesStringAndArray()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setOrigins('https://a.example.com, https://b.example.com');
+		self::assertSame(['https://a.example.com', 'https://b.example.com'], $server->getOrigins());
+		$server->setOrigins(['https://c.example.com']);
+		self::assertSame(['https://c.example.com'], $server->getOrigins());
+		$server->close();
+	}
+
+	public function testSetExtensionsRejectsNonNegotiator()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		try {
+			$this->expectException(TWebSocketException::class);
+			$server->setExtensions([new stdClass()]);
+		} finally {
+			$server->close();
+		}
+	}
+
+	public function testForeignOriginIsRejectedByServer()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$server->setHandler($handler);
+		$server->setOrigins(['https://app.example.com']);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey(), ['Origin' => 'https://evil.example.com']));
+
+		for ($i = 0; $i < 10 && $opened === 0; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		$response = $client->read(4096);
+
+		self::assertSame(0, $opened, 'A foreign origin does not open a connection.');
+		self::assertStringContainsString('403', $response, 'The server answers a foreign origin with 403.');
+		self::assertSame(0, $server->getConnectionCount(), 'A rejected upgrade leaves no session.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testForeignHostIsRejectedByServer()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$server->setHandler($handler);
+		$server->setAllowedHosts(['app.example.com']);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('evil.example.com', '/', TWebSocketHandshake::generateKey()));
+
+		for ($i = 0; $i < 10 && $opened === 0; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		$response = $client->read(4096);
+
+		self::assertSame(0, $opened, 'A disallowed Host does not open a connection.');
+		self::assertStringContainsString('400', $response, 'The server answers a disallowed Host with 400.');
+		$client->close();
+		$server->close();
+	}
+
 	public function testServeOnceEventLoopDispatchesLifecycle()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
@@ -164,7 +237,7 @@ class TWebSocketServerTest extends PHPUnit\Framework\TestCase
 	public function testProtocolStackIsTheSeam()
 	{
 		// A stack that yields two logical streams over one transport exercises the multiplex seam.
-		$stack = new class implements IWebSocketProtocol {
+		$stack = new class () implements IWebSocketProtocol {
 			public function serve(TSocketStream $connection, callable $onStream): void
 			{
 				[$x1, $y1] = TSocketStream::pair();

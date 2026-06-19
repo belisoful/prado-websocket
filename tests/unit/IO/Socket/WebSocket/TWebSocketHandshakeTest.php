@@ -41,10 +41,11 @@ class TWebSocketHandshakeTest extends PHPUnit\Framework\TestCase
 
 	public function testIsUpgradeRequest()
 	{
-		$ok = ['connection' => 'keep-alive, Upgrade', 'upgrade' => 'websocket', 'sec-websocket-key' => 'k'];
+		$ok = ['connection' => 'keep-alive, Upgrade', 'upgrade' => 'websocket', 'sec-websocket-key' => self::SAMPLE_KEY];
 		self::assertTrue(TWebSocketHandshake::isUpgradeRequest($ok));
 		self::assertFalse(TWebSocketHandshake::isUpgradeRequest(['connection' => 'Upgrade', 'upgrade' => 'websocket']), 'missing key');
-		self::assertFalse(TWebSocketHandshake::isUpgradeRequest(['connection' => 'close', 'upgrade' => 'websocket', 'sec-websocket-key' => 'k']), 'no upgrade in connection');
+		self::assertFalse(TWebSocketHandshake::isUpgradeRequest(['connection' => 'close', 'upgrade' => 'websocket', 'sec-websocket-key' => self::SAMPLE_KEY]), 'no upgrade in connection');
+		self::assertFalse(TWebSocketHandshake::isUpgradeRequest(['connection' => 'Upgrade', 'upgrade' => 'websocket', 'sec-websocket-key' => 'k']), 'key not 16 bytes');
 	}
 
 	public function testBuildServerResponse()

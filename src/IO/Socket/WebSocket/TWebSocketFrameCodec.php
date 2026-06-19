@@ -100,11 +100,13 @@ class TWebSocketFrameCodec
 	/**
 	 * Decodes one frame from a stream.
 	 * @param StreamInterface $stream The stream positioned at a frame boundary.
-	 * @throws TWebSocketException When a frame is truncated, a control frame is malformed, or a 64-bit
-	 *   length exceeds the signed integer range.
+	 * @param ?bool $requireMask The expected mask state: true requires a masked frame (server reading
+	 *   a client), false requires an unmasked frame (client reading a server), null skips the check.
+	 * @throws TWebSocketException When a frame is truncated, a control frame is malformed, the mask
+	 *   state is wrong, or a 64-bit length exceeds the signed integer range.
 	 * @return ?TWebSocketFrame The frame, or null at a clean end of stream before any frame byte.
 	 */
-	public static function decode(StreamInterface $stream): ?TWebSocketFrame
+	public static function decode(StreamInterface $stream, ?bool $requireMask = null): ?TWebSocketFrame
 	{
 		$head = self::readOrNull($stream, 2);
 		if ($head === null) {
@@ -115,6 +117,7 @@ class TWebSocketFrameCodec
 		$fin = ($byte0 & self::FIN) !== 0;
 		$opcode = $byte0 & self::OPCODE_MASK;
 		$masked = ($byte1 & self::MASK) !== 0;
+		self::assertMask($masked, $requireMask);
 		$length = $byte1 & self::LENGTH_MASK;
 		if ($length === 126) {
 			$length = unpack('n', self::readExact($stream, 2))[1];
@@ -157,10 +160,13 @@ class TWebSocketFrameCodec
 	 * (a malformed control frame, an out-of-range 64-bit length) throw as in {@see decode()}.
 	 *
 	 * @param string $buffer The accumulated bytes, positioned at a frame boundary.
-	 * @throws TWebSocketException When a control frame is malformed or a 64-bit length is out of range.
+	 * @param ?bool $requireMask The expected mask state: true requires a masked frame (server reading
+	 *   a client), false requires an unmasked frame (client reading a server), null skips the check.
+	 * @throws TWebSocketException When a control frame is malformed, the mask state is wrong, or a
+	 *   64-bit length is out of range.
 	 * @return ?array{frame: TWebSocketFrame, length: int} The frame and its byte length, or null when incomplete.
 	 */
-	public static function tryDecode(string $buffer): ?array
+	public static function tryDecode(string $buffer, ?bool $requireMask = null): ?array
 	{
 		$available = strlen($buffer);
 		if ($available < 2) {
@@ -171,6 +177,7 @@ class TWebSocketFrameCodec
 		$fin = ($byte0 & self::FIN) !== 0;
 		$opcode = $byte0 & self::OPCODE_MASK;
 		$masked = ($byte1 & self::MASK) !== 0;
+		self::assertMask($masked, $requireMask);
 		$length = $byte1 & self::LENGTH_MASK;
 		$offset = 2;
 		if ($length === 126) {
@@ -223,6 +230,22 @@ class TWebSocketFrameCodec
 			($byte0 & self::RSV3) !== 0,
 		);
 		return ['frame' => $frame, 'length' => $offset];
+	}
+
+	/**
+	 * Asserts a frame's mask state matches what the reading role requires.  A server MUST receive
+	 * masked frames and a client MUST receive unmasked frames (RFC 6455 section 5.1); a mismatch
+	 * is a protocol error.
+	 * @param bool $masked Whether the frame carried the MASK bit.
+	 * @param ?bool $requireMask The required state (true masked, false unmasked), or null to skip.
+	 * @throws TWebSocketException When the mask state does not match the requirement.
+	 */
+	private static function assertMask(bool $masked, ?bool $requireMask): void
+	{
+		if ($requireMask === null || $masked === $requireMask) {
+			return;
+		}
+		throw new TWebSocketException($requireMask ? 'websocket_frame_not_masked' : 'websocket_frame_masked');
 	}
 
 	/**

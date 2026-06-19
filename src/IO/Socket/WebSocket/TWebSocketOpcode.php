@@ -52,4 +52,16 @@ class TWebSocketOpcode extends TEnumerable
 	{
 		return ($opcode & 0x8) !== 0;
 	}
+
+	/**
+	 * Indicates whether an opcode is one RFC 6455 defines.  The reserved data opcodes (0x3-0x7)
+	 * and reserved control opcodes (0xB-0xF) are undefined, and a frame using one is a protocol
+	 * error absent a negotiated extension.
+	 * @param int $opcode The opcode.
+	 * @return bool Whether the opcode is a defined opcode.
+	 */
+	public static function isDefined(int $opcode): bool
+	{
+		return in_array($opcode, [self::Continuation, self::Text, self::Binary, self::Close, self::Ping, self::Pong], true);
+	}
 }
