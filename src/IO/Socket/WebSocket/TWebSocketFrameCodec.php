@@ -102,11 +102,13 @@ class TWebSocketFrameCodec
 	 * @param StreamInterface $stream The stream positioned at a frame boundary.
 	 * @param ?bool $requireMask The expected mask state: true requires a masked frame (server reading
 	 *   a client), false requires an unmasked frame (client reading a server), null skips the check.
+	 * @param int $maxPayloadLength The maximum data-frame payload length to accept, or 0 for unlimited.
 	 * @throws TWebSocketException When a frame is truncated, a control frame is malformed, the mask
-	 *   state is wrong, or a 64-bit length exceeds the signed integer range.
+	 *   state is wrong, the declared length exceeds the maximum, or a 64-bit length exceeds the signed
+	 *   integer range.
 	 * @return ?TWebSocketFrame The frame, or null at a clean end of stream before any frame byte.
 	 */
-	public static function decode(StreamInterface $stream, ?bool $requireMask = null): ?TWebSocketFrame
+	public static function decode(StreamInterface $stream, ?bool $requireMask = null, int $maxPayloadLength = 0): ?TWebSocketFrame
 	{
 		$head = self::readOrNull($stream, 2);
 		if ($head === null) {
@@ -135,6 +137,7 @@ class TWebSocketFrameCodec
 				throw new TWebSocketException('websocket_control_frame_fragmented', $opcode);
 			}
 		}
+		self::assertPayloadLength($length, $maxPayloadLength);
 		$maskKey = $masked ? self::readExact($stream, 4) : null;
 		$payload = $length > 0 ? self::readExact($stream, $length) : '';
 		if ($maskKey !== null && $payload !== '') {
@@ -162,11 +165,13 @@ class TWebSocketFrameCodec
 	 * @param string $buffer The accumulated bytes, positioned at a frame boundary.
 	 * @param ?bool $requireMask The expected mask state: true requires a masked frame (server reading
 	 *   a client), false requires an unmasked frame (client reading a server), null skips the check.
-	 * @throws TWebSocketException When a control frame is malformed, the mask state is wrong, or a
-	 *   64-bit length is out of range.
+	 * @param int $maxPayloadLength The maximum data-frame payload length to accept, or 0 for unlimited.
+	 *   Checked from the header alone, so an oversized frame is rejected before its payload is buffered.
+	 * @throws TWebSocketException When a control frame is malformed, the mask state is wrong, the
+	 *   declared length exceeds the maximum, or a 64-bit length is out of range.
 	 * @return ?array{frame: TWebSocketFrame, length: int} The frame and its byte length, or null when incomplete.
 	 */
-	public static function tryDecode(string $buffer, ?bool $requireMask = null): ?array
+	public static function tryDecode(string $buffer, ?bool $requireMask = null, int $maxPayloadLength = 0): ?array
 	{
 		$available = strlen($buffer);
 		if ($available < 2) {
@@ -204,6 +209,7 @@ class TWebSocketFrameCodec
 				throw new TWebSocketException('websocket_control_frame_fragmented', $opcode);
 			}
 		}
+		self::assertPayloadLength($length, $maxPayloadLength);
 		$maskKey = null;
 		if ($masked) {
 			if ($available < $offset + 4) {
@@ -246,6 +252,22 @@ class TWebSocketFrameCodec
 			return;
 		}
 		throw new TWebSocketException($requireMask ? 'websocket_frame_not_masked' : 'websocket_frame_masked');
+	}
+
+	/**
+	 * Asserts a frame's declared payload length is within the configured maximum.  This runs from the
+	 * frame header alone, before the payload is read, so an attacker-declared 64-bit length cannot be
+	 * buffered into memory.  A zero maximum is unlimited; control frames are already bounded to 125.
+	 * @param int $length The declared payload length.
+	 * @param int $maxPayloadLength The maximum payload length, or 0 for unlimited.
+	 * @throws TWebSocketException When the declared length exceeds the maximum.
+	 */
+	private static function assertPayloadLength(int $length, int $maxPayloadLength): void
+	{
+		if ($maxPayloadLength > 0 && $length > $maxPayloadLength) {
+			throw (new TWebSocketException('websocket_message_too_big', $maxPayloadLength))
+				->setCloseCode(TWebSocketCloseCode::MessageTooBig);
+		}
 	}
 
 	/**

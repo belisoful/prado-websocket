@@ -1,4 +1,5 @@
 <?php
+
 /**
  * Common settings for all unit tests of the PRADO WebSockets extension.
  *

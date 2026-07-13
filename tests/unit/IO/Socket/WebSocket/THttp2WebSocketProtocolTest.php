@@ -158,4 +158,67 @@ class THttp2WebSocketProtocolTest extends PHPUnit\Framework\TestCase
 		$protocol->getSession()->close();
 		$client->close();
 	}
+
+	/** Establishes one WebSocket stream and returns [protocol, handler] with the connection live. */
+	private function establish(TWebSocketHandler $handler): array
+	{
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$stream = $client->request([
+			':method' => 'CONNECT',
+			':protocol' => 'websocket',
+			':scheme' => 'https',
+			':path' => '/chat',
+			':authority' => 'example.com',
+			'sec-websocket-version' => '13',
+		]);
+		return [$protocol, $client, $stream];
+	}
+
+	public function testProtocolErrorClosesStreamAndFiresOnCloseWithoutLeaking()
+	{
+		$handler = new TWebSocketHandler();
+		$errored = 0;
+		$closed = 0;
+		$handler->attachEventHandler('onError', function () use (&$errored) {
+			$errored++;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		[$protocol, $client, $stream] = $this->establish($handler);
+
+		// An unmasked frame with an undefined opcode (0x3) is a protocol error over HTTP/2.
+		$stream->write(TWebSocketFrameCodec::encode(new TWebSocketFrame(0x3, 'x')));
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		self::assertSame(1, $errored, 'A protocol error raises onError.');
+		self::assertSame(1, $closed, 'A protocol error fires onClose exactly once.');
+		self::assertCount(0, $protocol->getConnections(), 'The errored stream leaves no connection entry behind.');
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
+
+	public function testShutdownFiresOnCloseForLiveConnections()
+	{
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		[$protocol, $client] = $this->establish($handler);
+		$protocol->receive($client->send());   // establish the stream (onOpen)
+		$client->receive($protocol->send());
+
+		self::assertCount(1, $protocol->getConnections(), 'The stream is live before shutdown.');
+		$protocol->shutdown();
+		self::assertSame(1, $closed, 'shutdown fires onClose for the still-live connection.');
+		self::assertCount(0, $protocol->getConnections(), 'shutdown clears the connection registry.');
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
 }

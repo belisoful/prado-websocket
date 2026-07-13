@@ -1,4 +1,5 @@
 <?php
+
 /**
  * A few common settings for all unit tests.
  *

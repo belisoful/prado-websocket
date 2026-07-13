@@ -22,6 +22,45 @@ class TPermessageDeflateTest extends PHPUnit\Framework\TestCase
 		self::assertSame(IWebSocketExtension::RSV1, $ext->getReservedRsv());
 	}
 
+	public function testDecompressionBombIsBoundedByMaxOutputLength()
+	{
+		$compressed = (new TPermessageDeflateExtension())->encodeMessage(str_repeat('A', 200000));   // ~200 KB of one byte -> tiny compressed
+		self::assertLessThan(1024, strlen($compressed[0]), 'the bomb payload compresses far below the output cap');
+
+		$decoder = new TPermessageDeflateExtension();
+		$decoder->setMaxOutputLength(4096);   // 4 KiB decompressed cap
+		try {
+			$decoder->decodeMessage($compressed[0], IWebSocketExtension::RSV1);
+			self::fail('An inflate that exceeds the output cap is aborted.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode(), 'The bomb fails with 1009 before the full message is materialized.');
+		}
+	}
+
+	public function testBoundedDecodeStillPassesMessagesUnderTheLimit()
+	{
+		$encoder = new TPermessageDeflateExtension();
+		$decoder = new TPermessageDeflateExtension();
+		$decoder->setMaxOutputLength(65536);
+		[$compressed, $rsv] = $encoder->encodeMessage(str_repeat('B', 10000));   // 10 KB < 64 KiB cap
+		self::assertSame(str_repeat('B', 10000), $decoder->decodeMessage($compressed, $rsv), 'A message under the cap decodes normally.');
+	}
+
+	public function testConnectionPropagatesMaxMessageSizeToTheDeflateExtension()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$connection = new TWebSocketConnection($a, false);
+		$extension = new TPermessageDeflateExtension();
+		$connection->setMaxMessageSize(4096);
+		$connection->setExtensions([$extension]);
+		self::assertSame(4096, $extension->getMaxOutputLength(), 'setExtensions propagates the current limit.');
+
+		$connection->setMaxMessageSize(8192);
+		self::assertSame(8192, $extension->getMaxOutputLength(), 'setMaxMessageSize re-propagates the limit.');
+		$a->close();
+		$b->close();
+	}
+
 	public function testWindowBitsAreClampedToTheRawDeflateRange()
 	{
 		self::assertSame(9, (new TPermessageDeflateExtension(8))->getDeflateWindowBits(), 'Raw DEFLATE has no 8-bit window.');

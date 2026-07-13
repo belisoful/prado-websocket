@@ -44,11 +44,17 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	/** The maximum envelopes drained from the inbox per {@see tick()}. */
 	public const DRAIN_LIMIT = 1000;
 
+	/** The seconds between reconnect attempts after the Redis connection drops. */
+	public const RECONNECT_INTERVAL = 5.0;
+
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
 	/** @var ?\Redis The Redis connection, while open. */
 	private ?\Redis $_redis = null;
+
+	/** @var float The earliest {@see microtime()} a reconnect may be attempted after a drop. */
+	private float $_reconnectAt = 0.0;
 
 	/** @var string The Redis host. */
 	private string $_host = '127.0.0.1';
@@ -107,6 +113,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			if (!$redis->connect($this->_host, $this->_port, $this->_timeout)) {
 				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
+			$redis->setOption(\Redis::OPT_READ_TIMEOUT, $this->_timeout > 0 ? $this->_timeout : self::RECONNECT_INTERVAL);   // a stalled Redis must not block the serve loop forever
 			if ($this->_password !== null && $this->_password !== '') {
 				$redis->auth($this->_password);
 			}
@@ -150,22 +157,80 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	public function tick(): void
 	{
-		if ($this->_redis === null || $this->_cluster === null) {
+		if ($this->_cluster === null) {
 			return;
 		}
-		$inbox = $this->_prefix . 'inbox:' . $this->nodeId();
-		for ($i = 0; $i < self::DRAIN_LIMIT; $i++) {
-			$line = $this->_redis->lPop($inbox);
-			if (!is_string($line)) {
-				break;
-			}
-			$envelope = TWebSocketEnvelope::decode($line);
-			if ($envelope !== null) {
-				$this->_cluster->receiveEnvelope($envelope);
+		if ($this->_redis === null) {
+			$this->reconnect();   // the connection dropped; retry (throttled) before draining
+			if ($this->_redis === null) {
+				return;
 			}
 		}
-		$this->heartbeat(false);
-		$this->prune();
+		$this->guard(function (): void {
+			$inbox = $this->_prefix . 'inbox:' . $this->nodeId();
+			for ($i = 0; $i < self::DRAIN_LIMIT; $i++) {
+				$line = $this->_redis->lPop($inbox);
+				if (!is_string($line)) {
+					break;
+				}
+				$envelope = TWebSocketEnvelope::decode($line);
+				if ($envelope !== null) {
+					$this->_cluster->receiveEnvelope($envelope);
+				}
+			}
+			$this->heartbeat(false);
+			$this->prune();
+		});
+	}
+
+	/**
+	 * Runs a Redis operation, degrading to a disconnected state on any Redis fault rather than letting
+	 * the exception propagate into the serve loop.  A dropped connection is retried from {@see tick()}.
+	 * @param callable $op The Redis operation.
+	 */
+	private function guard(callable $op): void
+	{
+		if ($this->_redis === null) {
+			return;
+		}
+		try {
+			$op();
+		} catch (\Throwable $e) {
+			$this->disconnect();
+		}
+	}
+
+	/**
+	 * Marks the backplane disconnected and schedules the next reconnect attempt.
+	 */
+	private function disconnect(): void
+	{
+		if ($this->_redis !== null) {
+			try {
+				$this->_redis->close();
+			} catch (\Throwable $e) {
+				// The connection is already gone; nothing to close.
+			}
+			$this->_redis = null;
+		}
+		$this->_reconnectAt = microtime(true) + self::RECONNECT_INTERVAL;
+	}
+
+	/**
+	 * Attempts to re-open the Redis connection, throttled to at most one attempt per
+	 * {@see RECONNECT_INTERVAL}.  A failed attempt leaves the backplane disconnected for the next try.
+	 */
+	private function reconnect(): void
+	{
+		if (microtime(true) < $this->_reconnectAt) {
+			return;
+		}
+		$this->_reconnectAt = microtime(true) + self::RECONNECT_INTERVAL;
+		try {
+			$this->open();
+		} catch (\Throwable $e) {
+			$this->disconnect();
+		}
 	}
 
 	/**
@@ -188,24 +253,23 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	public function publish(TWebSocketEnvelope $envelope): void
 	{
-		if ($this->_redis === null) {
-			return;
-		}
-		switch ($envelope->getType()) {
-			case TWebSocketEnvelope::PUBLISH:
-				if (($channel = $envelope->getChannel()) !== null) {
-					$this->deliver($this->interestedNodes($channel), $envelope);
-				}
-				break;
-			case TWebSocketEnvelope::BROADCAST:
-				$this->deliver($this->peerNodes(), $envelope);
-				break;
-			case TWebSocketEnvelope::DIRECT:
-				if (($node = $this->nodeOf($envelope->getClientId())) !== null) {
-					$this->deliver([$node], $envelope);
-				}
-				break;
-		}
+		$this->guard(function () use ($envelope): void {
+			switch ($envelope->getType()) {
+				case TWebSocketEnvelope::PUBLISH:
+					if (($channel = $envelope->getChannel()) !== null) {
+						$this->deliver($this->interestedNodes($channel), $envelope);
+					}
+					break;
+				case TWebSocketEnvelope::BROADCAST:
+					$this->deliver($this->peerNodes(), $envelope);
+					break;
+				case TWebSocketEnvelope::DIRECT:
+					if (($node = $this->nodeOf($envelope->getClientId())) !== null) {
+						$this->deliver([$node], $envelope);
+					}
+					break;
+			}
+		});
 	}
 
 	/**
@@ -215,7 +279,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	public function subscribe(string $channel): void
 	{
 		$this->_channels[$channel] = true;
-		$this->_redis?->sAdd($this->_prefix . 'ch:' . $channel, $this->nodeId());
+		$this->guard(fn () => $this->_redis->sAdd($this->_prefix . 'ch:' . $channel, $this->nodeId()));
 	}
 
 	/**
@@ -225,7 +289,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	public function unsubscribe(string $channel): void
 	{
 		unset($this->_channels[$channel]);
-		$this->_redis?->sRem($this->_prefix . 'ch:' . $channel, $this->nodeId());
+		$this->guard(fn () => $this->_redis->sRem($this->_prefix . 'ch:' . $channel, $this->nodeId()));
 	}
 
 	/**
@@ -235,11 +299,10 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	public function putPresence(string $clientId, array $meta): void
 	{
-		if ($this->_redis === null) {
-			return;
-		}
-		$this->_redis->hSet($this->_prefix . 'presence', $clientId, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-		$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
+		$this->guard(function () use ($clientId, $meta): void {
+			$this->_redis->hSet($this->_prefix . 'presence', $clientId, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
+		});
 	}
 
 	/**
@@ -248,11 +311,10 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	public function dropPresence(string $clientId): void
 	{
-		if ($this->_redis === null) {
-			return;
-		}
-		$this->_redis->hDel($this->_prefix . 'presence', $clientId);
-		$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $this->nodeId(), '', null, $clientId));
+		$this->guard(function () use ($clientId): void {
+			$this->_redis->hDel($this->_prefix . 'presence', $clientId);
+			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $this->nodeId(), '', null, $clientId));
+		});
 	}
 
 	// =========================================================================

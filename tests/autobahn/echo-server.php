@@ -31,6 +31,7 @@ $host = getenv('AUTOBAHN_HOST') ?: '127.0.0.1';
 $port = (int) (getenv('AUTOBAHN_PORT') ?: 9001);
 
 $server = TWebSocketServer::bind("tcp://{$host}:{$port}");
+$server->setMaxMessageSize(0);   // the conformance fuzzer sends large frames; run unbounded (not a production default)
 $server->setExtensions([new TPermessageDeflateNegotiator()]);
 
 $server->setHandler(new class () extends TWebSocketHandler {

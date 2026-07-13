@@ -55,6 +55,9 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 	/** The single empty non-final block that represents an empty compressed message. */
 	private const EMPTY_BLOCK = "\x00";
 
+	/** The compressed-input chunk fed to inflate per step, bounding the output produced before each size check. */
+	private const INFLATE_CHUNK = 8192;
+
 	/** @var int The send-side LZ77 window, in bits (9-15). */
 	private int $_deflateWindowBits;
 
@@ -66,6 +69,9 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 
 	/** @var int The DEFLATE compression level (-1 for the zlib default, 0-9 otherwise). */
 	private int $_level;
+
+	/** @var int The maximum decompressed message size in bytes, or 0 for unlimited. */
+	private int $_maxOutputLength = 0;
 
 	/** @var ?\DeflateContext The send-side context, created on first use. */
 	private ?\DeflateContext $_deflate = null;
@@ -129,10 +135,13 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 
 	/**
 	 * Decompresses a received message when its first frame set {@see IWebSocketExtension::RSV1}; an
-	 * uncompressed message passes through.  The sync-flush trailer is restored before inflating.
+	 * uncompressed message passes through.  The sync-flush trailer is restored before inflating.  The
+	 * compressed input is fed in bounded chunks so a decompression bomb is aborted as soon as the
+	 * running output exceeds {@see getMaxOutputLength() the limit}, rather than after a small frame has
+	 * inflated to gigabytes.
 	 * @param string $payload The message payload.
 	 * @param int $rsv The reserved bits set on the message's first frame.
-	 * @throws TWebSocketException When the compressed data cannot be inflated.
+	 * @throws TWebSocketException When the compressed data cannot be inflated or its output exceeds the limit.
 	 * @return string The decompressed payload.
 	 */
 	public function decodeMessage(string $payload, int $rsv): string
@@ -140,15 +149,45 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 		if (($rsv & IWebSocketExtension::RSV1) === 0) {
 			return $payload;
 		}
-		$out = @inflate_add($this->inflateContext(), $payload . self::FLUSH_TRAILER, ZLIB_SYNC_FLUSH);   // a data error returns false
-		if ($out === false) {
-			throw (new TWebSocketException('websocket_permessage_deflate_inflate_failed'))
-				->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);
+		$context = $this->inflateContext();
+		$input = $payload . self::FLUSH_TRAILER;
+		$length = strlen($input);
+		$out = '';
+		for ($offset = 0; $offset < $length; $offset += self::INFLATE_CHUNK) {
+			$chunk = @inflate_add($context, substr($input, $offset, self::INFLATE_CHUNK), ZLIB_SYNC_FLUSH);   // a data error returns false
+			if ($chunk === false) {
+				throw (new TWebSocketException('websocket_permessage_deflate_inflate_failed'))
+					->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);
+			}
+			$out .= $chunk;
+			if ($this->_maxOutputLength > 0 && strlen($out) > $this->_maxOutputLength) {
+				throw (new TWebSocketException('websocket_message_too_big', $this->_maxOutputLength))
+					->setCloseCode(TWebSocketCloseCode::MessageTooBig);
+			}
 		}
 		if ($this->_inflateNoContextTakeover) {
 			$this->_inflate = null;
 		}
 		return $out;
+	}
+
+	/**
+	 * Returns the maximum decompressed message size.
+	 * @return int The maximum decompressed size in bytes, or 0 for unlimited.
+	 */
+	public function getMaxOutputLength(): int
+	{
+		return $this->_maxOutputLength;
+	}
+
+	/**
+	 * Sets the maximum decompressed message size.  A {@see TWebSocketConnection} propagates its own
+	 * message-size limit here so the inflate is bounded to the same value.
+	 * @param int $value The maximum decompressed size in bytes, or 0 for unlimited.
+	 */
+	public function setMaxOutputLength(int $value): void
+	{
+		$this->_maxOutputLength = max(0, $value);
 	}
 
 	/**

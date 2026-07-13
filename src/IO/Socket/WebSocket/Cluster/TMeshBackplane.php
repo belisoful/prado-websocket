@@ -269,7 +269,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 */
 	public function matchesTarget(?string $target): bool
 	{
-		return $target !== null && $target === $this->_path;
+		return $this->_secret !== '' && $target !== null && $target === $this->_path;   // the endpoint is exposed only when a secret enables the mesh
 	}
 
 	/**
@@ -292,8 +292,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 */
 	public function connectPeer(string $uri): void
 	{
-		if (isset($this->_connectedUris[$uri])) {
-			return;   // already linked to this peer
+		if ($this->_secret === '' || isset($this->_connectedUris[$uri])) {
+			return;   // the mesh is disabled without a secret, or already linked to this peer
+		}
+		if (!preg_match('#^(tcp|tls|ssl)://#i', $uri)) {
+			return;   // only dial stream sockets; refuse gossiped non-socket URIs (SSRF hardening)
 		}
 		$this->_knownUris[$uri] = true;
 		$transport = TSocketStream::connect($uri, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT);
@@ -311,15 +314,15 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	/**
 	 * Verifies an inbound peer handshake against the shared secret.  The proof is an HMAC of the
 	 * connection's `Sec-WebSocket-Key` keyed by the secret, so the secret never crosses the wire and
-	 * a captured proof cannot authenticate a different connection (each handshake key is fresh).  An
-	 * unset secret leaves the mesh open, which suits only a trusted network.
+	 * a captured proof cannot authenticate a different connection (each handshake key is fresh).  The
+	 * mesh is disabled without a secret, so an unauthenticated peer can never join.
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @return bool Whether the peer is authorized to join.
 	 */
 	public function authenticate(array $headers): bool
 	{
 		if ($this->_secret === '') {
-			return true;
+			return false;   // the mesh requires a shared secret; an empty one leaves it disabled, never open
 		}
 		$key = $headers['sec-websocket-key'] ?? '';
 		$provided = $headers[strtolower(self::AUTH_HEADER)] ?? '';

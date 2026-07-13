@@ -53,6 +53,31 @@ class TWebSocketProtocolValidationTest extends PHPUnit\Framework\TestCase
 		$this->assertFails($wire, TWebSocketCloseCode::ProtocolError, 'An unmasked client frame is a protocol error.');
 	}
 
+	public function testOversizedFrameIsRejectedFromHeaderBeforeBuffering()
+	{
+		[$server, $a, $b] = $this->server();
+		$server->setMaxMessageSize(1024);
+		// A masked binary frame header declaring 100000 bytes; only the header + mask key are fed, no payload.
+		$header = "\x82\xFF" . pack('J', 100000) . "\x00\x00\x00\x00";
+		try {
+			$server->feed($header);
+			self::fail('An oversized declared frame is rejected before its payload is buffered.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode(), 'An oversized frame fails with 1009.');
+		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testDefaultMaxMessageSizeIsBounded()
+	{
+		[$server, $a, $b] = $this->server();
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE, $server->getMaxMessageSize(), 'A connection bounds message size by default.');
+		self::assertGreaterThan(0, TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE);
+		$a->close();
+		$b->close();
+	}
+
 	public function testClientRejectsMaskedServerFrame()
 	{
 		[$a, $b] = TSocketStream::pair();

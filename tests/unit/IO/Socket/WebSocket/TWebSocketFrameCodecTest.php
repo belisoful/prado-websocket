@@ -2,6 +2,7 @@
 
 use Prado\Exceptions\TIOException;
 use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
@@ -15,6 +16,38 @@ class TWebSocketFrameCodecTest extends PHPUnit\Framework\TestCase
 		$decoded = TWebSocketFrameCodec::decode(TStream::fromString($bytes));
 		self::assertNotNull($decoded);
 		return $decoded;
+	}
+
+	public function testDecodeRejectsDeclaredLengthOverTheMaximum()
+	{
+		// An unmasked binary frame declaring a 70000-byte payload (127 extended length), no payload bytes.
+		$header = "\x82\x7F" . pack('J', 70000);
+		try {
+			TWebSocketFrameCodec::decode(TStream::fromString($header), null, 65536);
+			self::fail('An oversized declared length is rejected.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode());
+		}
+	}
+
+	public function testTryDecodeRejectsOversizedFrameFromHeaderAloneBeforeBuffering()
+	{
+		// A masked binary frame header declaring 100000 bytes, but only the 10-byte length header present.
+		$header = "\x82\xFF" . pack('J', 100000);
+		self::assertSame(10, strlen($header), 'only the frame header, no payload or mask key, is buffered');
+		try {
+			TWebSocketFrameCodec::tryDecode($header, true, 65536);
+			self::fail('An oversized declared length is rejected from the header before the payload arrives.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode());
+		}
+	}
+
+	public function testZeroMaximumIsUnlimited()
+	{
+		$decoded = TWebSocketFrameCodec::tryDecode(TWebSocketFrameCodec::encode(TWebSocketFrame::binary(str_repeat('Z', 200))), null, 0);
+		self::assertNotNull($decoded);
+		self::assertSame(200, strlen($decoded['frame']->getPayload()), 'A zero maximum imposes no cap.');
 	}
 
 	public function testTextFrameRoundTrip()

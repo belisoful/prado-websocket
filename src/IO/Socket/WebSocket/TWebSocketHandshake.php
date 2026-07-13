@@ -455,17 +455,23 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Reads the HTTP handshake head (through the blank line) from a stream.
+	 * Reads the HTTP handshake head (through the blank line) from a stream.  A total read deadline
+	 * bounds how long a slow or dribbling peer can hold the read, so it cannot stall a serve loop.
 	 * @param StreamInterface $stream The transport stream.
-	 * @throws TWebSocketException When the head exceeds the limit or the stream ends first.
+	 * @param ?float $timeout The total seconds to read the head, or null for no deadline.
+	 * @throws TWebSocketException When the head exceeds the limit, the deadline passes, or the stream ends first.
 	 * @return string The handshake head, including the terminating blank line.
 	 */
-	public static function readHandshake(StreamInterface $stream): string
+	public static function readHandshake(StreamInterface $stream, ?float $timeout = null): string
 	{
+		$deadline = ($timeout !== null && $timeout > 0) ? microtime(true) + $timeout : null;
 		$data = '';
 		while (!str_contains($data, "\r\n\r\n")) {
 			if (strlen($data) >= self::MAX_HANDSHAKE_BYTES) {
 				throw new TWebSocketException('websocket_handshake_too_large', self::MAX_HANDSHAKE_BYTES);
+			}
+			if ($deadline !== null && microtime(true) >= $deadline) {
+				throw new TWebSocketException('websocket_handshake_incomplete');   // a slow/dribbling peer past the deadline
 			}
 			$byte = $stream->eof() ? '' : $stream->read(1);
 			if ($byte === '') {
@@ -521,13 +527,14 @@ class TWebSocketHandshake
 	 * completing the handshake.  Pair with {@see buildServerResponse()} to accept or
 	 * {@see buildRejection()} / {@see upgradeError()} to refuse.
 	 * @param StreamInterface $stream The accepted transport stream.
+	 * @param ?float $timeout The total seconds to read the request head, or null for no deadline.
 	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade.
 	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string}
 	 *   The parsed request.
 	 */
-	public static function receiveRequest(StreamInterface $stream): array
+	public static function receiveRequest(StreamInterface $stream, ?float $timeout = null): array
 	{
-		$request = self::parseHttpMessage(self::readHandshake($stream));
+		$request = self::parseHttpMessage(self::readHandshake($stream, $timeout));
 		if (self::upgradeError($request) !== null) {
 			throw new TWebSocketException('websocket_handshake_not_upgrade');
 		}

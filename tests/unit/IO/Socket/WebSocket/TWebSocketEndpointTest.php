@@ -112,7 +112,9 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 		$server->setCluster(new TWebSocketCluster('n1', $mesh));
 
 		self::assertContains($mesh, $server->getEndpoints(), 'The mesh backplane is an internal endpoint.');
-		self::assertTrue($mesh->matchesTarget('/cluster'), 'The mesh claims its peer path.');
+		self::assertFalse($mesh->matchesTarget('/cluster'), 'Without a secret the mesh is disabled and claims no path.');
+		$mesh->setSecret('shh');
+		self::assertTrue($mesh->matchesTarget('/cluster'), 'With a secret the mesh claims its peer path.');
 		self::assertFalse($mesh->matchesTarget('/elsewhere'));
 	}
 

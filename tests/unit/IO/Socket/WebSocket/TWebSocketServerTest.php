@@ -321,4 +321,49 @@ class TWebSocketServerTest extends PHPUnit\Framework\TestCase
 		$socket->close();
 		$server->close();
 	}
+
+	public function testHttp2OutOfBandSendReachesTheClientWithoutAnInboundFrame()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$serverConnection = null;
+		$handler->attachEventHandler('onOpen', function ($connection) use (&$serverConnection) {
+			$serverConnection = $connection;   // the sender is the accepted connection
+		});
+		$server->setHandler($handler);
+
+		$socket = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$stream = $client->request([
+			':method' => 'CONNECT',
+			':protocol' => 'websocket',
+			':scheme' => 'https',
+			':path' => '/',
+			':authority' => 'h',
+			'sec-websocket-version' => '13',
+		]);
+		$clientWs = new TWebSocketConnection($stream, true);
+		$socket->write($client->send());                       // preface + SETTINGS + CONNECT, no DATA
+
+		for ($i = 0; $i < 20 && $serverConnection === null; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		self::assertNotNull($serverConnection, 'The HTTP/2 WebSocket stream opened.');
+		$client->receive($socket->read(65536));                // drain SETTINGS + 200
+
+		// A server-initiated send with NO inbound frame from the client: only the post-tick H2 flush
+		// pass can put it on the wire this loop.
+		$serverConnection->send('push');
+		$server->serveOnce(0, 50000);
+
+		$client->receive($socket->read(65536));
+		self::assertSame(['push'], $clientWs->feed($stream->getContents()), 'An out-of-band HTTP/2 send reaches the client without an inbound frame.');
+
+		$socket->close();
+		$server->close();
+	}
 }

@@ -147,6 +147,8 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 	 * Simulates a remote peer connecting and announcing itself ($remoteUri), then gossiping further
 	 * node URIs, all over one fresh link, and pumps the mesh.
 	 * @param string[] $gossiped The third-party URIs the remote gossips after its self-announce.
+	 * @param TMeshBackplane $mesh
+	 * @param string $remoteUri
 	 */
 	private function feedGossip(TMeshBackplane $mesh, string $remoteUri, array $gossiped = []): void
 	{
@@ -216,7 +218,7 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 	public function testAuthenticateRequiresAValidProofWhenASecretIsSet()
 	{
 		$mesh = new TMeshBackplane();
-		self::assertTrue($mesh->authenticate([]), 'An open mesh (no secret) accepts any peer.');
+		self::assertFalse($mesh->authenticate([]), 'A mesh without a secret is disabled and accepts no peer.');
 
 		$mesh->setSecret('s3cr3t');
 		$key = 'dGhlIHNhbXBsZSBub25jZQ==';

@@ -1,6 +1,7 @@
 <?php
 
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
@@ -196,6 +197,53 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 			$handler->seen,
 			'Each message dispatches under its own opcode, not the batch last opcode.',
 		);
+		$a->close();
+		$b->close();
+	}
+
+	public function testSendQueuesWithoutBlockingAndDrainsAsThePeerReads()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		$sender = new TWebSocketConnection($a, false);
+		$sender->setMaxSendBufferBytes(0);   // unlimited: queue rather than drop, so we can observe the backlog
+
+		$sender->sendBinary(str_repeat('y', 16 * 1024 * 1024));   // far larger than any socket send buffer
+		self::assertTrue($sender->hasPendingOutbound(), 'A non-draining peer leaves bytes queued instead of blocking.');
+		self::assertGreaterThan(0, $sender->getPendingOutboundLength());
+
+		for ($i = 0; $i < 5000 && $sender->hasPendingOutbound(); $i++) {
+			$b->read(65536);              // the peer drains, freeing the send buffer
+			$sender->flushOutbound();     // the event loop flushes on writability
+		}
+		self::assertFalse($sender->hasPendingOutbound(), 'flushOutbound drains the queue as the socket becomes writable.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testSlowReaderOverflowingTheSendBufferIsDropped()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		$sender = new TWebSocketConnection($a, false);
+		$sender->setMaxSendBufferBytes(4096);   // a slow reader may not back up more than this
+
+		try {
+			$sender->sendBinary(str_repeat('x', 16 * 1024 * 1024));   // the peer never reads
+			self::fail('A backlog past the send-buffer limit fails the connection.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::GoingAway, $e->getCloseCode(), 'An overflowing slow reader is dropped with 1001.');
+		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testDefaultSendBufferLimitIsBounded()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$c = new TWebSocketConnection($a, false);
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER, $c->getMaxSendBufferBytes());
+		self::assertGreaterThan(0, $c->getMaxSendBufferBytes());
 		$a->close();
 		$b->close();
 	}

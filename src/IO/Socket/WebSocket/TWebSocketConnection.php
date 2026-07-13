@@ -44,6 +44,12 @@ use Psr\Http\Message\StreamInterface;
  */
 class TWebSocketConnection extends TComponent
 {
+	/** The default maximum reassembled message size in bytes (10 MiB); bounds memory by default. */
+	public const DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+
+	/** The default maximum queued outbound bytes before a slow reader is dropped (16 MiB). */
+	public const DEFAULT_MAX_SEND_BUFFER = 16 * 1024 * 1024;
+
 	/** @var StreamInterface The transport stream. */
 	private StreamInterface $_stream;
 
@@ -75,7 +81,13 @@ class TWebSocketConnection extends TComponent
 	private bool $_validateMasking = true;
 
 	/** @var int The maximum reassembled message size in bytes, or 0 for unlimited. */
-	private int $_maxMessageSize = 0;
+	private int $_maxMessageSize = self::DEFAULT_MAX_MESSAGE_SIZE;
+
+	/** @var string Bytes queued for the wire that a non-blocking socket has not yet accepted. */
+	private string $_outbound = '';
+
+	/** @var int The maximum queued outbound bytes before a slow reader is dropped, or 0 for unlimited. */
+	private int $_maxSendBufferBytes = self::DEFAULT_MAX_SEND_BUFFER;
 
 	/** @var ?string The negotiated subprotocol, or null when none was selected. */
 	private ?string $_subprotocol = null;
@@ -192,10 +204,9 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Encodes and writes a frame, masking it on the client side.  The whole frame is drained, so a
-	 * large frame is not truncated when a non-blocking socket's send buffer fills mid-write.
+	 * Encodes a frame, masking it on the client side, and queues it for the wire.
 	 * @param TWebSocketFrame $frame The frame to send.
-	 * @return int The number of bytes written.
+	 * @return int The number of bytes queued.
 	 */
 	public function sendFrame(TWebSocketFrame $frame): int
 	{
@@ -204,40 +215,67 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Writes the full buffer to the stream.  A single {@see \Prado\IO\TStream::write()} can accept
-	 * only part of a large frame on a non-blocking socket; this resumes from the unwritten tail,
-	 * waiting for the socket to drain, so the frame reaches the wire whole.
-	 * @param string $data The bytes to write.
-	 * @return int The number of bytes written (the full length).
+	 * Queues bytes for the wire and drains what the socket accepts now, without blocking.  On a
+	 * non-blocking socket whose send buffer is full, the unwritten tail stays queued for the event
+	 * loop to flush once the socket is {@see hasPendingOutbound() writable}; on a blocking socket the
+	 * write completes here.  A reader too slow to drain the queue past {@see getMaxSendBufferBytes()}
+	 * is dropped rather than allowed to grow the buffer without bound.
+	 * @param string $data The bytes to queue.
+	 * @throws TWebSocketException When the queued backlog exceeds the send-buffer limit, or the write fails.
+	 * @return int The number of bytes queued.
 	 */
 	private function writeAll(string $data): int
 	{
-		$length = strlen($data);
-		$sent = 0;
-		while ($sent < $length) {
-			$wrote = $this->_stream->write($sent === 0 ? $data : substr($data, $sent));
-			$sent += $wrote;
-			if ($wrote === 0 && $sent < $length) {
-				$this->awaitWritable();   // the send buffer is full; let it drain before resuming
-			}
+		$this->_outbound .= $data;
+		$this->flushOutbound();
+		if ($this->_maxSendBufferBytes > 0 && strlen($this->_outbound) > $this->_maxSendBufferBytes) {
+			throw (new TWebSocketException('websocket_send_buffer_overflow', $this->_maxSendBufferBytes))
+				->setCloseCode(TWebSocketCloseCode::GoingAway);
 		}
-		return $sent;
+		return strlen($data);
 	}
 
 	/**
-	 * Waits until the underlying socket can accept more output, so {@see writeAll()} does not spin on
-	 * a full send buffer.  Falls back to a brief sleep when the stream exposes no selectable resource.
+	 * Drains the queued outbound bytes to the socket without blocking, keeping any tail the socket
+	 * could not accept.  The event loop calls this when the transport becomes writable; a blocking
+	 * socket drains fully in one call.
+	 * @throws TWebSocketException When the underlying write fails (a broken pipe).
+	 * @return int The number of bytes flushed on this call.
 	 */
-	private function awaitWritable(): void
+	public function flushOutbound(): int
 	{
-		$resource = ($this->_stream instanceof TResource) ? $this->_stream->getResource() : null;
-		if (is_resource($resource)) {
-			$write = [$resource];
-			$read = $except = null;
-			@stream_select($read, $write, $except, 5);
-		} else {
-			usleep(1000);
+		if ($this->_outbound === '') {
+			return 0;
 		}
+		$length = strlen($this->_outbound);
+		$sent = 0;
+		try {
+			while ($sent < $length) {
+				$wrote = $this->_stream->write($sent === 0 ? $this->_outbound : substr($this->_outbound, $sent));
+				if ($wrote <= 0) {
+					break;   // the non-blocking send buffer is full; keep the tail for the next writable event
+				}
+				$sent += $wrote;
+			}
+		} catch (\RuntimeException $e) {
+			$this->_outbound = '';
+			$this->_closed = true;
+			throw (new TWebSocketException('websocket_write_failed'))->setCloseCode(TWebSocketCloseCode::GoingAway);
+		}
+		$this->_outbound = $sent >= $length ? '' : substr($this->_outbound, $sent);
+		return $sent;
+	}
+
+	/** @return bool Whether bytes are queued for the wire awaiting a writable socket. */
+	public function hasPendingOutbound(): bool
+	{
+		return $this->_outbound !== '';
+	}
+
+	/** @return int The number of bytes queued for the wire. */
+	public function getPendingOutboundLength(): int
+	{
+		return strlen($this->_outbound);
 	}
 
 	/**
@@ -350,7 +388,7 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function receiveFrame(): ?TWebSocketFrame
 	{
-		$frame = TWebSocketFrameCodec::decode($this->_stream, $this->expectedMask());
+		$frame = TWebSocketFrameCodec::decode($this->_stream, $this->expectedMask(), $this->_maxMessageSize);
 		if ($frame === null) {
 			$this->_closed = true;
 			return null;
@@ -407,7 +445,7 @@ class TWebSocketConnection extends TComponent
 	{
 		$this->_readBuffer .= $bytes;
 		$messages = [];
-		while (!$this->_closed && ($decoded = TWebSocketFrameCodec::tryDecode($this->_readBuffer, $this->expectedMask())) !== null) {
+		while (!$this->_closed && ($decoded = TWebSocketFrameCodec::tryDecode($this->_readBuffer, $this->expectedMask(), $this->_maxMessageSize)) !== null) {
 			$this->_readBuffer = substr($this->_readBuffer, $decoded['length']);
 			$frame = $decoded['frame'];
 			$this->validateFrame($frame);
@@ -658,6 +696,21 @@ class TWebSocketConnection extends TComponent
 			$reserved |= $extension->getReservedRsv();
 		}
 		$this->_extensions = array_values($value);
+		$this->applyDecodeLimitToExtensions();
+	}
+
+	/**
+	 * Propagates the message-size limit to any extension that bounds its decoded output (currently
+	 * {@see TPermessageDeflateExtension}), so a decompression bomb is stopped mid-inflate rather than
+	 * only after the fully expanded message has been allocated.
+	 */
+	private function applyDecodeLimitToExtensions(): void
+	{
+		foreach ($this->_extensions as $extension) {
+			if ($extension instanceof TPermessageDeflateExtension) {
+				$extension->setMaxOutputLength($this->_maxMessageSize);
+			}
+		}
 	}
 
 	/** @return bool Whether the RFC 6455 mask rule is enforced on received frames. */
@@ -683,13 +736,33 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Sets the maximum reassembled message size.  A message that exceeds it fails the connection
-	 * with {@see TWebSocketCloseCode::MessageTooBig}.
+	 * Sets the maximum reassembled message size.  It bounds the read buffer (an oversized frame is
+	 * rejected from its header before its payload is buffered), the reassembled message, and any
+	 * extension's decoded output; a message that exceeds it fails the connection with
+	 * {@see TWebSocketCloseCode::MessageTooBig}.
 	 * @param int $value The maximum size in bytes, or 0 for unlimited.
 	 */
 	public function setMaxMessageSize(int $value): void
 	{
 		$this->_maxMessageSize = max(0, $value);
+		$this->applyDecodeLimitToExtensions();
+	}
+
+	/** @return int The maximum queued outbound bytes before the connection is dropped, or 0 for unlimited. */
+	public function getMaxSendBufferBytes(): int
+	{
+		return $this->_maxSendBufferBytes;
+	}
+
+	/**
+	 * Sets the maximum queued outbound bytes tolerated for a slow reader before the connection is
+	 * dropped.  It bounds the memory one non-draining peer can hold, replacing an unbounded (or
+	 * blocking) wait; 0 is unlimited.
+	 * @param int $value The maximum queued outbound bytes.
+	 */
+	public function setMaxSendBufferBytes(int $value): void
+	{
+		$this->_maxSendBufferBytes = max(0, $value);
 	}
 
 	/**

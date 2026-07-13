@@ -60,6 +60,7 @@ class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$mesh = new TMeshBackplane();
+		$mesh->setSecret('shh');
 		$cluster = new TWebSocketCluster('srv', $mesh);
 		$server->setCluster($cluster);
 		$server->setHandler(new TWebSocketHandler());
@@ -71,7 +72,8 @@ class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
 
 		$peer = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
-		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key));
+		$proof = base64_encode(hash_hmac('sha256', $key, sha1('shh'), true));
+		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
 		$server->serveOnce(0, 300000);
 
 		self::assertSame(1, $mesh->getPeerCount(), 'A /cluster upgrade joins the mesh as a peer.');
@@ -143,10 +145,12 @@ class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$serverMesh = new TMeshBackplane();
+		$serverMesh->setSecret('shh');
 		$server->setCluster(new TWebSocketCluster('srv', $serverMesh));
 		$server->setHandler(new TWebSocketHandler());
 
 		$dialer = new TMeshBackplane();
+		$dialer->setSecret('shh');   // the mesh is enabled only with a shared secret
 		new TWebSocketCluster('dialer', $dialer);   // binds the mesh to a coordinator
 		$dialer->connectPeer('tcp://127.0.0.1:' . $server->getPort());
 		self::assertSame(0, $dialer->getPeerCount(), 'The dial returns immediately without blocking.');

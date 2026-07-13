@@ -185,8 +185,13 @@ class TWebSocketEnvelope extends TComponent
 	public static function decode(string $json): ?self
 	{
 		$data = json_decode($json, true);
-		if (!is_array($data) || !isset($data['t'], $data['o'])) {
+		if (!is_array($data) || !isset($data['t'], $data['o']) || !is_scalar($data['t']) || !is_scalar($data['o'])) {
 			return null;
+		}
+		foreach (['p', 'c', 'k', 'i'] as $field) {
+			if (isset($data[$field]) && !is_scalar($data[$field])) {
+				return null;   // a non-scalar field would fatal on the string cast; reject the forged envelope instead
+			}
 		}
 		return new self(
 			(string) $data['t'],

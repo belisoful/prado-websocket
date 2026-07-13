@@ -67,10 +67,16 @@ class TWebSocketServer extends TSocketServer
 	/** @var IWebSocketExtensionNegotiator[] The extension negotiators offered during the handshake. */
 	private array $_extensions = [];
 
+	/** @var int The maximum message size in bytes applied to accepted connections, or 0 for unlimited. */
+	private int $_maxMessageSize = TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE;
+
+	/** @var float The seconds a peer has to complete the opening handshake before the accept is dropped. */
+	private float $_handshakeTimeout = 10.0;
+
 	/** @var IWebSocketEndpoint[] The internal endpoints matched before normal client handling. */
 	private array $_endpoints = [];
 
-	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol}> Live sessions, keyed by transport object id. */
+	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string}> Live sessions, keyed by transport object id. */
 	private array $_sessions = [];
 
 	/** @var ?TWebSocketCluster The cluster coordinator, when the server is a cluster node. */
@@ -158,6 +164,46 @@ class TWebSocketServer extends TSocketServer
 	{
 		$value = is_array($value) ? $value : array_map('trim', explode(',', (string) $value));
 		$this->_origins = array_values(array_filter($value, fn ($o) => $o !== ''));
+	}
+
+	/**
+	 * Returns the maximum message size applied to accepted connections.
+	 * @return int The maximum size in bytes, or 0 for unlimited.
+	 */
+	public function getMaxMessageSize(): int
+	{
+		return $this->_maxMessageSize;
+	}
+
+	/**
+	 * Sets the maximum message size applied to every accepted connection.  It bounds inbound frame and
+	 * message size (and any extension's decoded output), so an oversized frame is refused before its
+	 * payload is buffered.  Default {@see TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE}; 0 is unlimited.
+	 * @param int|string $value The maximum size in bytes.
+	 */
+	public function setMaxMessageSize($value): void
+	{
+		$this->_maxMessageSize = max(0, (int) $value);
+	}
+
+	/**
+	 * Returns the opening-handshake timeout.
+	 * @return float The handshake timeout in seconds, or 0 for no bound.
+	 */
+	public function getHandshakeTimeout(): float
+	{
+		return $this->_handshakeTimeout;
+	}
+
+	/**
+	 * Sets the seconds a peer has to complete the opening handshake.  The blocking accept-path read is
+	 * bounded to this deadline, so a silent or dribbling peer is dropped instead of stalling the serve
+	 * loop (slow-loris).  Default 10; 0 disables the bound (unsafe on a public listener).
+	 * @param float|int|string $value The handshake timeout in seconds.
+	 */
+	public function setHandshakeTimeout($value): void
+	{
+		$this->_handshakeTimeout = max(0, (float) $value);
 	}
 
 	/**
@@ -284,7 +330,7 @@ class TWebSocketServer extends TSocketServer
 	public function serveOnce(?int $seconds = null, int $microseconds = 0): void
 	{
 		$read = array_merge([$this], array_column($this->_sessions, 'transport'), $this->_cluster?->getSources() ?? []);
-		$write = null;
+		$write = $this->pendingWriteTransports();
 		$except = null;
 		if (TSocketServer::select($read, $write, $except, $seconds, $microseconds) !== false) {
 			foreach ($read as $ready) {
@@ -302,8 +348,42 @@ class TWebSocketServer extends TSocketServer
 					}
 				}
 			}
+			foreach ($write as $ready) {
+				try {
+					$this->flushSession($ready);
+				} catch (\Throwable $e) {
+					$this->dropSession($ready);   // a broken pipe while draining the backlog drops the connection
+				}
+			}
 		}
-		$this->_cluster?->tick();
+		try {
+			$this->_cluster?->tick();
+		} catch (\Throwable $e) {
+			// A backplane fault (e.g. a dropped Redis connection) degrades cluster messaging but must
+			// never terminate the serve loop that is handling live client connections.
+		}
+		$this->flushHttp2Output();
+	}
+
+	/**
+	 * Pulls each HTTP/2 session's pending protocol output and queues it, so bytes produced outside a
+	 * read pump — a cluster broadcast or any out-of-band send between reads — reach the wire this loop
+	 * rather than waiting for the session's next inbound frame.  An HTTP/1.1 connection needs no such
+	 * pass: its send queues directly into its own outbound buffer, which the write set already watches.
+	 */
+	protected function flushHttp2Output(): void
+	{
+		foreach (array_column($this->_sessions, 'transport') as $transport) {
+			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+			if ($session === null || !isset($session['protocol'])) {
+				continue;
+			}
+			try {
+				$this->queueHttp2Output($transport, $session['protocol']->send());
+			} catch (\Throwable $e) {
+				$this->dropSession($transport);   // a session error while producing output drops only that session
+			}
+		}
 	}
 
 	/**
@@ -343,6 +423,9 @@ class TWebSocketServer extends TSocketServer
 		// loop switches the transport back to non-blocking once the session is established.
 		try {
 			$transport->setBlocking(true);
+			if ($this->_handshakeTimeout > 0) {
+				$transport->setTimeout(max(1, (int) ceil($this->_handshakeTimeout)));   // bound each blocking handshake read
+			}
 			if ($this->isHttp2Preface($transport)) {
 				if ($this->isHttp2Available()) {
 					$this->acceptHttp2Session($transport);
@@ -393,7 +476,7 @@ class TWebSocketServer extends TSocketServer
 	protected function acceptHttp1Session(TSocketStream $transport): void
 	{
 		try {
-			$request = TWebSocketHandshake::receiveRequest($transport);
+			$request = TWebSocketHandshake::receiveRequest($transport, $this->_handshakeTimeout ?: null);
 		} catch (TWebSocketException $e) {
 			$transport->close();
 			return;
@@ -409,6 +492,7 @@ class TWebSocketServer extends TSocketServer
 			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // an internal endpoint does not negotiate
 			$transport->setBlocking(false);
 			$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
+			$connection->setMaxMessageSize($this->_maxMessageSize);
 			$endpoint->accept($connection, $transport, $request);
 			return;
 		}
@@ -436,6 +520,7 @@ class TWebSocketServer extends TSocketServer
 		$transport->write(TWebSocketHandshake::buildServerResponse($key, $responseHeaders));
 		$transport->setBlocking(false);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
+		$connection->setMaxMessageSize($this->_maxMessageSize);
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
 		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
@@ -476,15 +561,13 @@ class TWebSocketServer extends TSocketServer
 		$protocol = Prado::createComponent(THttp2WebSocketProtocol::class, $handler);
 		$protocol->setOrigins($this->_origins);
 		$protocol->setAllowedHosts($this->_allowedHosts);
+		$protocol->setMaxMessageSize($this->_maxMessageSize);
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
 		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
 		$transport->setBlocking(false);
-		$initial = $protocol->send();
-		if ($initial !== '') {
-			$transport->write($initial);
-		}
-		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'protocol' => $protocol];
+		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => ''];
+		$this->queueHttp2Output($transport, $protocol->send());   // the initial SETTINGS, queued and drained non-blocking
 	}
 
 	/**
@@ -542,6 +625,90 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the session transports with bytes still queued to write, so {@see serveOnce()} watches
+	 * them for writability and drains the backlog without blocking.
+	 * @return TSocketStream[] The transports awaiting a writable socket.
+	 */
+	protected function pendingWriteTransports(): array
+	{
+		$pending = [];
+		foreach ($this->_sessions as $session) {
+			if (isset($session['connection']) && $session['connection']->hasPendingOutbound()) {
+				$pending[] = $session['transport'];
+			} elseif (($session['outbound'] ?? '') !== '') {
+				$pending[] = $session['transport'];
+			}
+		}
+		return $pending;
+	}
+
+	/**
+	 * Drains a writable session's queued output: an HTTP/1.1 connection's own send buffer, or an
+	 * HTTP/2 session's aggregated output.  A drained, closed HTTP/1.1 connection ends here.
+	 * @param TSocketStream $transport The writable transport.
+	 */
+	protected function flushSession(TSocketStream $transport): void
+	{
+		$session = $this->_sessions[spl_object_id($transport)] ?? null;
+		if ($session === null) {
+			return;
+		}
+		if (isset($session['connection'])) {
+			$session['connection']->flushOutbound();   // throws on a broken pipe; serveOnce drops the session
+			if ($session['connection']->getIsClosed() && !$session['connection']->hasPendingOutbound()) {
+				$this->endHttp1Session($transport, $session['connection']);
+			}
+		} else {
+			$this->drainHttp2Output($transport);
+		}
+	}
+
+	/**
+	 * Queues an HTTP/2 session's output and drains what the socket accepts now, keeping any tail for
+	 * the event loop to flush once the transport is writable.
+	 * @param TSocketStream $transport The session transport.
+	 * @param string $bytes The bytes the protocol produced.
+	 */
+	protected function queueHttp2Output(TSocketStream $transport, string $bytes): void
+	{
+		$id = spl_object_id($transport);
+		if (!isset($this->_sessions[$id])) {
+			return;
+		}
+		$this->_sessions[$id]['outbound'] = ($this->_sessions[$id]['outbound'] ?? '') . $bytes;
+		$this->drainHttp2Output($transport);
+	}
+
+	/**
+	 * Drains an HTTP/2 session's queued output to its non-blocking transport, keeping any tail the
+	 * send buffer could not accept.  A broken pipe ends the session.
+	 * @param TSocketStream $transport The session transport.
+	 */
+	protected function drainHttp2Output(TSocketStream $transport): void
+	{
+		$id = spl_object_id($transport);
+		$buffer = $this->_sessions[$id]['outbound'] ?? '';
+		if ($buffer === '') {
+			return;
+		}
+		$length = strlen($buffer);
+		$sent = 0;
+		try {
+			while ($sent < $length) {
+				$wrote = $transport->write($sent === 0 ? $buffer : substr($buffer, $sent));
+				if ($wrote <= 0) {
+					break;
+				}
+				$sent += $wrote;
+			}
+		} catch (\RuntimeException $e) {
+			$this->endHttp2Session($transport);
+			return;
+		}
+		$this->_sessions[$id]['outbound'] = $sent >= $length ? '' : substr($buffer, $sent);
+	}
+
+	/**
 	 * Reads a single-WebSocket connection, dispatches its messages, and ends the session on a
 	 * Close frame, a protocol error, or end of stream.
 	 * @param TSocketStream $transport The ready transport.
@@ -592,9 +759,7 @@ class TWebSocketServer extends TSocketServer
 			$this->endHttp2Session($transport);
 			return;
 		}
-		if ($output !== '') {
-			$transport->write($output);
-		}
+		$this->queueHttp2Output($transport, $output);
 	}
 
 	/**
@@ -620,10 +785,8 @@ class TWebSocketServer extends TSocketServer
 	{
 		$session = $this->_sessions[spl_object_id($transport)] ?? null;
 		unset($this->_sessions[spl_object_id($transport)]);
-		if ($this->_cluster !== null && isset($session['protocol'])) {
-			foreach ($session['protocol']->getConnections() as $connection) {
-				$this->_cluster->unregister($connection);
-			}
+		if (isset($session['protocol'])) {
+			$session['protocol']->shutdown();   // fire onClose (which unregisters each connection from the cluster) for every live stream
 		}
 		$transport->close();
 	}
@@ -652,6 +815,7 @@ class TWebSocketServer extends TSocketServer
 	protected function dispatchStream(StreamInterface $stream): void
 	{
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
+		$connection->setMaxMessageSize($this->_maxMessageSize);
 		$this->onConnection($connection);
 		$this->getHandler()?->handleConnection($connection);
 	}

@@ -60,6 +60,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var string[] The `:authority` hosts allowed to open a stream, empty to allow any. */
 	private array $_allowedHosts = [];
 
+	/** @var int The maximum message size applied to each stream's connection, or 0 for unlimited. */
+	private int $_maxMessageSize = 0;
+
 	/** @var ?callable The per-stream notification callback set during {@see serve()}. */
 	private $_onStream;
 
@@ -120,6 +123,24 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	public function setAllowedHosts(array $value): void
 	{
 		$this->_allowedHosts = array_values($value);
+	}
+
+	/**
+	 * Returns the maximum message size applied to each stream's connection.
+	 * @return int The maximum size in bytes, or 0 for unlimited.
+	 */
+	public function getMaxMessageSize(): int
+	{
+		return $this->_maxMessageSize;
+	}
+
+	/**
+	 * Sets the maximum message size applied to each multiplexed stream's connection.
+	 * @param int $value The maximum size in bytes, or 0 for unlimited.
+	 */
+	public function setMaxMessageSize(int $value): void
+	{
+		$this->_maxMessageSize = max(0, $value);
 	}
 
 	/**
@@ -191,6 +212,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 				$connection->write($out);
 			}
 		}
+		$this->shutdown();   // the transport ended; fire onClose for any streams still open
 	}
 
 	/** @var int The maximum bytes read from the transport per pump. */
@@ -203,22 +225,23 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	protected function acceptStream(TH2Stream $stream): void
 	{
 		if ($stream->getHeader(':method') !== 'CONNECT' || $stream->getHeader(':protocol') !== 'websocket') {
-			$this->_session->respond($stream, [':status' => '400']);
+			$this->rejectStream($stream, '400');
 			return;
 		}
 		$origin = $stream->getHeader('origin');
 		if (!TWebSocketHandshake::isOriginAllowed($origin === null ? [] : ['origin' => $origin], $this->_origins ?: null)) {
-			$this->_session->respond($stream, [':status' => '403']);   // refuse a disallowed origin before upgrading
+			$this->rejectStream($stream, '403');   // refuse a disallowed origin before upgrading
 			return;
 		}
 		$authority = $stream->getHeader(':authority');
 		if (!TWebSocketHandshake::isHostAllowed($authority === null ? [] : ['host' => $authority], $this->_allowedHosts ?: null)) {
-			$this->_session->respond($stream, [':status' => '400']);   // refuse a disallowed :authority
+			$this->rejectStream($stream, '400');   // refuse a disallowed :authority
 			return;
 		}
 		$this->_session->respond($stream, [':status' => '200']);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
 		$connection->setValidateMasking(false);   // RFC 8441 carries WebSocket DATA without RFC 6455 masking
+		$connection->setMaxMessageSize($this->_maxMessageSize);
 		$this->_connections[$stream->getStreamId()] = $connection;
 		if ($this->_onStream !== null) {
 			($this->_onStream)($stream);
@@ -242,6 +265,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		} catch (TWebSocketException $e) {
 			$this->_handler->onError($connection, $e);
 			$connection->close($e->getCloseCode());
+			$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
 			return;
 		}
 		foreach ($messages as $message) {
@@ -253,7 +277,20 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Closes the WebSocket connection for a stream and raises the service close once.
+	 * Responds to a stream with a rejection status and ends it, so a refused Extended CONNECT does not
+	 * linger half-open (the deferred data provider otherwise keeps the stream alive indefinitely).
+	 * @param TH2Stream $stream The request stream to reject.
+	 * @param string $status The HTTP/2 status to respond with.
+	 */
+	protected function rejectStream(TH2Stream $stream, string $status): void
+	{
+		$this->_session->respond($stream, [':status' => $status]);
+		$this->endLocalStream($stream);
+	}
+
+	/**
+	 * Closes the WebSocket connection for a stream, ends the HTTP/2 stream, and raises the service
+	 * close once.
 	 * @param TH2Stream $stream The closed stream.
 	 */
 	protected function closeStream(TH2Stream $stream): void
@@ -263,7 +300,35 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			return;
 		}
 		unset($this->_connections[$stream->getStreamId()]);
+		$this->endLocalStream($stream);
 		$this->_handler->onClose($connection);
 		$this->onClose($connection);
+	}
+
+	/**
+	 * Ends the local (server) half of a stream so nghttp2 emits END_STREAM and reclaims it; best effort,
+	 * since the stream may already be gone.
+	 * @param TH2Stream $stream The stream to end.
+	 */
+	protected function endLocalStream(TH2Stream $stream): void
+	{
+		try {
+			$stream->markLocalClosed();
+		} catch (\Throwable $e) {
+			// The stream was already reset or closed by the peer; nothing to end.
+		}
+	}
+
+	/**
+	 * Shuts the session down, raising the service close for every still-live multiplexed connection so
+	 * a transport that ends abruptly does not skip {@see onClose}.  Called on session exit.
+	 */
+	public function shutdown(): void
+	{
+		foreach ($this->_connections as $streamId => $connection) {
+			unset($this->_connections[$streamId]);
+			$this->_handler->onClose($connection);
+			$this->onClose($connection);
+		}
 	}
 }
