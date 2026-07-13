@@ -24,7 +24,6 @@ use Psr\Http\Message\StreamInterface;
  * This is the default stack of {@see TWebSocketServer}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-4
  */
 class THttp1WebSocketProtocol implements IWebSocketProtocol

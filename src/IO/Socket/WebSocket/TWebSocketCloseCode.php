@@ -36,7 +36,6 @@ use Prado\TEnumerable;
  * wire, which {@see isSendable()} reports.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-7.4
  */
 class TWebSocketCloseCode extends TEnumerable

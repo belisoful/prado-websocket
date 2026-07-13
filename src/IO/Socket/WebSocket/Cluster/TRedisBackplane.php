@@ -37,7 +37,6 @@ use Prado\TPropertyValue;
  * and {@see setNodeTtl() NodeTtl}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TRedisBackplane extends TComponent implements IWebSocketBackplane
 {

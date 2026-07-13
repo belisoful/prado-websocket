@@ -27,7 +27,6 @@ use Psr\Http\Message\StreamInterface;
  * RFC 6455 value.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-4
  */
 class TWebSocketHandshake

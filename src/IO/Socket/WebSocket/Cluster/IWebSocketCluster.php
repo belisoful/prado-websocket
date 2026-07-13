@@ -19,7 +19,6 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
  * directed message targets a client on this node.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 interface IWebSocketCluster
 {

@@ -31,7 +31,6 @@ use Prado\TComponent;
  * cluster.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TWebSocketCluster extends TComponent implements IWebSocketCluster
 {

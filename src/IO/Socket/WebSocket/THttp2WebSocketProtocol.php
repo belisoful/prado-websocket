@@ -40,7 +40,6 @@ use Psr\Http\Message\StreamInterface;
  *  - onClose: as a stream's {@see TWebSocketConnection} closes.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc8441.html
  */
 class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol

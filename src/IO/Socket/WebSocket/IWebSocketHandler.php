@@ -25,7 +25,6 @@ namespace Prado\IO\Socket\WebSocket;
  * request into the PRADO service pipeline.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html
  */
 interface IWebSocketHandler

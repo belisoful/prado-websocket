@@ -24,7 +24,6 @@ namespace Prado\IO\Socket\WebSocket;
  * lower-cased name to string value, or `true` for a valueless flag.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-9.1
  */
 interface IWebSocketExtensionNegotiator

@@ -49,7 +49,6 @@ use Prado\Xml\TXmlElement;
  * ```
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  */
 class TWebSocketModule extends TModule
 {

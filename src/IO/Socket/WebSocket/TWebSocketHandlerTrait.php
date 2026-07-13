@@ -21,7 +21,6 @@ namespace Prado\IO\Socket\WebSocket;
  * {@see \Prado\TComponent::raiseEvent()}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  */
 trait TWebSocketHandlerTrait
 {

@@ -33,7 +33,6 @@ use Psr\Http\Message\StreamInterface;
  *    transport, not this TCP server.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc8441.html
  */
 interface IWebSocketProtocol

@@ -22,7 +22,6 @@ use Prado\TComponent;
  * its payload, so it substitutes for the raw message where only the bytes matter.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  */
 class TWebSocketMessage extends TComponent implements \Stringable
 {

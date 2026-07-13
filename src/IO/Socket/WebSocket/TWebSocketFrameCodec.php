@@ -28,7 +28,6 @@ use Psr\Http\Message\StreamInterface;
  * frame begins, and throws on a truncated frame.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
  */
 class TWebSocketFrameCodec

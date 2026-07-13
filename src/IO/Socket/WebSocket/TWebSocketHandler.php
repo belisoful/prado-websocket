@@ -27,7 +27,6 @@ use Prado\TComponent;
  *  - onError: a protocol error occurred (param the {@see \Throwable}).
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html
  */
 class TWebSocketHandler extends TComponent implements IWebSocketHandler

@@ -4,6 +4,9 @@ WebSockets for the [PRADO PHP Framework](https://github.com/pradosoft/prado) (ve
 
 - **[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) over HTTP/1.1** — the classic `Upgrade` handshake, one WebSocket per connection. The base capability; needs only PHP and PRADO.
 - **[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) over HTTP/2** — Extended CONNECT, many WebSockets multiplexed over one connection. **Optional**: enabled only when the [`prado-http2`](https://github.com/pradosoft/prado-http2) extension and the system `libnghttp2` are present.
+- **[RFC 7692](https://www.rfc-editor.org/rfc/rfc7692.html) permessage-deflate** — negotiated per-message compression, layered on either transport. **Optional**: enabled by offering the extension; needs `ext-zlib`.
+
+A **clustering** layer (`TWebSocketModule` + pluggable backplanes) additionally lets many server processes act as one logical endpoint, so a publish or presence change on any node reaches clients on every node.
 
 The standalone `TWebSocketServer` owns its listening socket end to end, so it completes the upgrade and streams frames in its own process — and **auto-selects HTTP/1.1 or HTTP/2 per connection** by peeking the first bytes (it serves HTTP/1.1 only when HTTP/2 is unavailable). A typical web SAPI (PHP-FPM, mod_php) cannot do WebSockets: the web server owns the socket and FastCGI cannot hand it to PHP. Run this as a long-lived server process instead.
 
@@ -18,6 +21,8 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2` |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
 | `ext-sockets` | suggested | Faster socket primitives for the standalone server |
+| `ext-zlib` | suggested | RFC 7692 permessage-deflate message compression |
+| `ext-redis` | suggested | The Redis-backed cluster backplane (`TRedisBackplane`) for multi-host scaling |
 
 HTTP/2 is **opt-in**. Add it with:
 
@@ -42,7 +47,10 @@ composer require belisoful/prado-websockets
 | `TWebSocketOpcode` / `TWebSocketCloseCode` | Opcode and close-code enumerations, with `isControl()` / `isSendable()` |
 | `TWebSocketHandshake` | The HTTP/1.1 opening handshake: accept-key computation, request/response building, and end-to-end stream drivers (`acceptConnection()`, `openConnection()`) |
 | `TWebSocketConnection` | A connection: `send()`/`sendBinary()`/`ping()`/`pong()`/`close()`, blocking `receive()`/`receiveFrame()`, non-blocking `feed()`, and `onPing`/`onPong`/`onClose` events |
+| `TWebSocketMessage` | The `Stringable` message model (opcode + payload), with `getIsText()`/`getIsBinary()` |
 | `TWebSocketException` | A protocol/handshake failure carrying a `CloseCode`; extends `TIOException` |
+| `IWebSocketExtension` / `IWebSocketExtensionNegotiator` | The RFC 6455 extension seam: an extension transforms message payloads on the wire; its negotiator agrees terms during the handshake |
+| `TPermessageDeflateExtension` / `TPermessageDeflateNegotiator` | RFC 7692 permessage-deflate — negotiated, DoS-bounded message compression |
 | `IWebSocketProtocol` | The protocol-stack seam: turns a transport into the WebSocket logical streams it carries |
 | `THttp1WebSocketProtocol` | The RFC 6455 stack — one WebSocket per connection |
 | `THttp2WebSocketProtocol` | The RFC 8441 stack — many WebSockets over one HTTP/2 connection (uses `prado-http2`) |
@@ -51,10 +59,18 @@ composer require belisoful/prado-websockets
 | `TWebSocketHandler` | The standalone handler: a `TComponent` raising the lifecycle events, used by `TWebSocketServer` |
 | `Prado\Web\Services\TWebSocketService` | A `TService` adapting the `IWebSocketHandler` role to a SAPI upgrade request in the PRADO service pipeline |
 | `TWebSocketModule` | The cluster module, making the server one node of a cluster over an `IWebSocketBackplane` (the `websocket_*` error codes and Prado3 class names are registered by Composer from `extra.prado`) |
+| `TWebSocketCluster` | The cluster coordinator: `subscribe()`/`publish()`/`broadcast()`/`sendToClient()`/`presence()` fanning across nodes |
+| `IWebSocketBackplane` | The transport seam a cluster relays through; `TWebSocketEnvelope` is its unit of exchange |
+| `TNullBackplane` | Single-node no-op backplane (the default) |
+| `TFileBackplane` | Shared-directory backplane for one host or a shared filesystem (dev/small clusters); owner-only spool |
+| `TRedisBackplane` | Redis pub/sub + presence backplane for multi-host scaling (needs `ext-redis`) |
+| `TMeshBackplane` | Peer-to-peer gossip backplane over server-to-server WebSocket links; shared-secret authenticated |
 
 ## Architecture
 
 ```
+   TWebSocketModule / TWebSocketCluster ──► IWebSocketBackplane  (Null / File / Redis / Mesh)
+                                │                    (fan a publish/presence across nodes)
                          TWebSocketServer  (select() event loop; peeks preface, auto-selects)
                                 │
               ┌─────────────────┴─────────────────┐
@@ -62,6 +78,8 @@ composer require belisoful/prado-websockets
    (RFC 6455 Upgrade, 1 WS/conn)         (RFC 8441 Extended CONNECT, N WS/conn)
                                 │
                        TWebSocketConnection   (send/receive/control; blocking + feed())
+                                │
+              IWebSocketExtension pipeline   (RFC 7692 permessage-deflate, …)
                                 │
               TWebSocketFrameCodec ◄──► TWebSocketFrame / Opcode / CloseCode
                                 │
@@ -136,6 +154,62 @@ use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 $bytes = TWebSocketFrameCodec::encode(TWebSocketFrame::text('hi'));   // server frame (unmasked)
 $frame = TWebSocketFrameCodec::tryDecode($buffer);                    // null until a whole frame
 ```
+
+### Subprotocols and extensions
+
+```php
+$server->setSubprotocols(['chat', 'superchat']);   // offered in order; the agreed one is echoed in Sec-WebSocket-Protocol
+// per connection: $connection->getSubprotocol()   // the negotiated subprotocol, or null
+```
+
+Extensions are pluggable through `IWebSocketExtension` (transforms payloads on the wire) and `IWebSocketExtensionNegotiator` (agrees terms during the handshake). Offer them on the server in preference order:
+
+```php
+use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
+
+$server->setExtensions([new TPermessageDeflateNegotiator()]);   // offer RFC 7692 permessage-deflate
+```
+
+## Compression (RFC 7692 permessage-deflate)
+
+`TPermessageDeflateExtension` compresses message payloads with DEFLATE when both peers negotiate it; it is transparent to `onMessage`/`receive()`. Enable it by offering `TPermessageDeflateNegotiator` (above); the negotiator's constructor tunes the context-takeover and window-bits parameters, and inflation is **bounded** (chunked, output-capped) so a compression-bomb frame cannot exhaust memory. It needs `ext-zlib`.
+
+## Hardening and limits
+
+`TWebSocketServer` exposes the operational limits and origin checks a public deployment needs. All are optional; the defaults are safe but permissive on the network-policy axes (empty allow-lists accept any origin/host).
+
+| Property | Default | Effect |
+|---|---|---|
+| `setMaxMessageSize($bytes)` | 10 MiB | Caps an inbound frame/message; a larger one is rejected (`MessageTooBig`) before buffering |
+| `setHandshakeTimeout($seconds)` | 10.0 | Deadline for the opening handshake; a slow client is dropped |
+| `setIdleTimeout($seconds)` | 0 (off) | Pings, then reaps, a connection idle this long |
+| `setMaxConnections($n)` | 0 (unlimited) | Concurrent-session cap; a further connection is accepted and shed with 503 |
+| `setOrigins([...])` | `[]` (any) | Allowed `Origin` values; a disallowed origin is refused with 403 before upgrading |
+| `setAllowedHosts([...])` | `[]` (any) | Allowed `Host` values; a disallowed host is refused with 400 |
+
+These apply on both the HTTP/1.1 and HTTP/2 paths.
+
+## Clustering (multi-node)
+
+Several server processes act as one logical endpoint by relaying through an `IWebSocketBackplane`, so `publish()`/`broadcast()`/`sendToClient()` and presence on any node reach clients on every node. Configure `TWebSocketModule` with a `<backplane>` child; without one it runs a single node on `TNullBackplane`.
+
+```xml
+<modules>
+    <module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule" NodeId="edge-1">
+        <backplane class="Prado\IO\Socket\WebSocket\Cluster\TRedisBackplane" Host="127.0.0.1" Port="6379" />
+    </module>
+</modules>
+<services>
+    <service id="websocket" class="Prado\Web\Services\TWebSocketService" />
+</services>
+```
+
+Backplane choices:
+
+- **`TNullBackplane`** — single node, no relay (the default).
+- **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it or it is a symlink.
+- **`TRedisBackplane`** — Redis pub/sub + a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`); the driver for multi-host scaling. Needs `ext-redis`.
+- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving a shared `Secret` (a handshake HMAC plus a post-upgrade nonce challenge); set it and prefer a `tls://` transport on any untrusted network.
 
 ## HTTP/2 multiplexing (RFC 8441)
 

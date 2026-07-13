@@ -39,7 +39,6 @@ use Psr\Http\Message\StreamInterface;
  *  - onClose: raised with the Close {@see TWebSocketFrame} when the peer closes.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html
  */
 class TWebSocketConnection extends TComponent

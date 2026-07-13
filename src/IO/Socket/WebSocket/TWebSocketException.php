@@ -23,7 +23,6 @@ use Prado\Exceptions\TIOException;
  * lets a connection map the failure onto the close code it sends in the Close frame.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TWebSocketException extends TIOException
 {

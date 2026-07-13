@@ -47,10 +47,9 @@
 - Classes must have a clear and comprehensive docblock at the top with class description with:
   - Examples, where necessary
   - `@author` for attribution
-  - `@since` for version
   - `@method` for dynamic events with prefix 'dy-'; which are called (on "$this->dy-") but not defined.
 - Inline comments should be in English and start with `//`
-- When documenting new methods or classes with "@since" use the next release version.
+- Do NOT add `@since` tags: the extension is at its initial release (v1.0.0), so every symbol is "since 1.0.0" and the tag carries no information.
 - All documentation should be written in present perfect tense
 
 ### Error Handling
@@ -58,7 +57,7 @@
 - Throw appropriate PRADO exceptions (`TInvalidDataValueException`, `TInvalidOperationException`, etc.)
 - Return false or null for methods that are designed to fail gracefully
 - All methods should handle edge cases and validate input parameters
-- Extension Exceptions use errorCodes specified in src/messages.txt; messages.txt is purely for user information display only.
+- Extension Exceptions use error codes (keys) defined in `config/errorMessages.txt`; the message text is purely for user information display only.
 
 ### Imports and Includes
 - Use PSR-4 autoloading - no manual includes required
@@ -84,17 +83,17 @@
 - Follow the TPage Lifecycle (via TPageService::runPage): onPreInit → initRecursive → onInitComplete → loadPageState (POST/Callback) → processPostData (POST/Callback) → onPreLoad → loadRecursive → processPostData (POST/Callback) → raiseChangedEvents (POST/Callback) → raisePostBackEvent (POST-only) → processCallbackEvent (Callback-only) → onLoadComplete → preRenderRecursive  onPreRenderComplete → savePageState → onSaveStateComplete → renderControl (GET/POST) → renderCallbackResponse (Callback-only) → unloadRecursive
 - XML and PHP is supported for application configuration 
 - TPageService::onPreRunPage gives PRADO Modules event access to the TPage Lifecycle before it runs
-- 'framework/classes.php' MUST be updated with all new classes.
+- Framework core updates 'framework/classes.php' with new classes; this does NOT apply to this extension (see the PSR-4 / class-map note below).
 - Web Pages are PHP classes with a ".page" TTemplate file with the same base name
 - UI Portlets are PHP classes with a ".tpl" TTemplate file with the same base name
 - Data components should support `TActiveRecord` pattern
 - All UI controls should have proper template support and state management
-- All changes must be backward compatible
+- This is a new, pre-release extension with no published API to preserve, so backward compatibility is NOT a constraint; prefer the better design over a compatible one
 - A full check consists of the 4 checks (in order): `php -l` compile, php-cs-fixer, phpstan, phpunit (all checks must pass successfully)
 - A full check must be done for code to be ready for git commit.
-- The current version is 1.0.0 (initial release). New classes/methods use `@since 1.0.0`.
-- This extension namespaces its classes under `Prado\IO\Socket\WebSocket\` (PSR-4 `Prado\` → `src/`); extensions do NOT update the framework's `classes.php`.
-- Error codes live in `src/errorMessages.txt`, registered by `TWebSocketModule`; the framework's `messages.txt` is not used.
+- The current version of this extension is **v1.0.0** (initial release). It targets PRADO 4.4+. Because it is the initial release, source docblocks carry no `@since` tags.
+- This extension namespaces its classes under `Prado\IO\Socket\WebSocket\` (PSR-4 `Prado\` → `src/`); extensions do NOT update the framework's `classes.php`. Prado3 short class names are supplied via `config/classMap.json`, registered by Composer from `composer.json` `extra.prado.class-map`.
+- Error codes (keys) and their messages live in `config/errorMessages.txt`, registered by Composer from `composer.json` `extra.prado.error-messages` (not loaded by `TWebSocketModule`); the framework's `messages.txt` is not used.
 
 ## Testing Guidelines
 - The testing platform is "phpunit"

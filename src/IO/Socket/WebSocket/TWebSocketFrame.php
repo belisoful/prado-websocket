@@ -24,7 +24,6 @@ use Prado\TComponent;
  * {@see getCloseCode()} and {@see getCloseReason()} read the two-byte code and the reason.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
  */
 class TWebSocketFrame extends TComponent

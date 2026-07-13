@@ -35,7 +35,6 @@ use Prado\TComponent;
  * A {@see TPermessageDeflateNegotiator} configures and produces this extension during the handshake.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc7692.html
  */
 class TPermessageDeflateExtension extends TComponent implements IWebSocketExtension

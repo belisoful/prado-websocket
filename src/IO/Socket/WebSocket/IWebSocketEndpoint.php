@@ -24,7 +24,6 @@ use Prado\IO\Socket\TSocketStream;
  * {@see accept()}.  An internal endpoint does not negotiate a subprotocol or extensions.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  */
 interface IWebSocketEndpoint
 {

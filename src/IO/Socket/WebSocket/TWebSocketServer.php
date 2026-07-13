@@ -44,7 +44,6 @@ use Psr\Http\Message\StreamInterface;
  *  - onConnection: raised with each ready {@see TWebSocketConnection} before the handler runs it.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html
  */
 class TWebSocketServer extends TSocketServer

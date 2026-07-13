@@ -21,7 +21,6 @@ use Prado\TComponent;
  * mesh) is configured.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TNullBackplane extends TComponent implements IWebSocketBackplane
 {

@@ -31,7 +31,6 @@ use Prado\TEnumerable;
  * {@see TWebSocketFrameCodec}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
  */
 class TWebSocketOpcode extends TEnumerable

@@ -50,6 +50,7 @@
 	"suggest": {
 		"ext-openssl": "TLS with ALPN for wss:// and HTTP/2 over TLS (h2).",
 		"ext-sockets": "Faster socket primitives for the standalone server.",
+		"ext-zlib": "RFC 7692 permessage-deflate message compression (TPermessageDeflateExtension).",
 		"ext-redis": "Redis-backed cluster backplane (TRedisBackplane) for multi-host scaling.",
 		"lib-nghttp2": "The system libnghttp2 shared library, used by belisoful/prado-http2 for HTTP/2.",
 		"ext-ffi": "Required by belisoful/prado-http2 to bind libnghttp2 for HTTP/2.",

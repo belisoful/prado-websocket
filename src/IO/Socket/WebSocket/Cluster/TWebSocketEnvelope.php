@@ -26,12 +26,13 @@ use Prado\TComponent;
  *  - {@see PRESENCE_SET}/{@see PRESENCE_DROP}: update the presence mirror for ClientId.
  *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI;
  *    the coordinator itself ignores it, while the mesh backplane uses it to find peers and detect failures.
+ *  - {@see AUTH_CHALLENGE}/{@see AUTH_RESPONSE}: a mesh-only peer authentication handshake (a nonce and its
+ *    signed answer) consumed by the backplane itself, never routed to the coordinator.
  *
  * Each envelope carries OriginNode and a unique {@see getId() Id} so a coordinator drops its own
  * echo and a mesh backplane can suppress duplicate relays.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TWebSocketEnvelope extends TComponent
 {

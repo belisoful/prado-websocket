@@ -25,7 +25,6 @@ namespace Prado\IO\Socket\WebSocket;
  * no negotiated extension owns.  Two extensions on one connection must not reserve the same bit.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-9
  */
 interface IWebSocketExtension

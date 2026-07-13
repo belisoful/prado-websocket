@@ -32,7 +32,6 @@ use Prado\IO\Socket\WebSocket\TWebSocketHandlerTrait;
  * events the same way.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc6455.html
  */
 class TWebSocketService extends TService implements IWebSocketHandler

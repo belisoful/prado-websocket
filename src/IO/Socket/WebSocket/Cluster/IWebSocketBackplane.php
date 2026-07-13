@@ -24,7 +24,6 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
  * empty array and does its work in {@see tick()}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 interface IWebSocketBackplane
 {

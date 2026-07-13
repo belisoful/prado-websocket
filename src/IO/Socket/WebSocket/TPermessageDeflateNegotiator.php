@@ -36,7 +36,6 @@ use Prado\TComponent;
  * only the matching send side.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
  * @see https://www.rfc-editor.org/rfc/rfc7692.html#section-7.1
  */
 class TPermessageDeflateNegotiator extends TComponent implements IWebSocketExtensionNegotiator

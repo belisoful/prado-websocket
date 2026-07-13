@@ -47,7 +47,6 @@ use Prado\TPropertyValue;
  * untrusted network; an unset secret leaves the mesh open to anyone who reaches the path.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSocketEndpoint
 {

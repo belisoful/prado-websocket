@@ -39,7 +39,6 @@ use Prado\TComponent;
  * planted symlink.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 4.4.0
  */
 class TFileBackplane extends TComponent implements IWebSocketBackplane
 {
