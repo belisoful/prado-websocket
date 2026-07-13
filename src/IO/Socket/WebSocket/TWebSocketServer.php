@@ -13,7 +13,6 @@ namespace Prado\IO\Socket\WebSocket;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketStream;
-use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
 use Prado\Web\THttpHeaderName;
@@ -67,6 +66,9 @@ class TWebSocketServer extends TSocketServer
 
 	/** @var IWebSocketExtensionNegotiator[] The extension negotiators offered during the handshake. */
 	private array $_extensions = [];
+
+	/** @var IWebSocketEndpoint[] The internal endpoints matched before normal client handling. */
+	private array $_endpoints = [];
 
 	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol}> Live sessions, keyed by transport object id. */
 	private array $_sessions = [];
@@ -203,6 +205,45 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the internal endpoints an upgrade is matched against before normal client handling, in
+	 * order.  The cluster's backplane is included automatically when it is itself an endpoint (the
+	 * mesh `/cluster` peer link).
+	 * @return IWebSocketEndpoint[] The internal endpoints, in match order.
+	 */
+	public function getEndpoints(): array
+	{
+		$backplane = $this->_cluster?->getBackplane();
+		if ($backplane instanceof IWebSocketEndpoint) {
+			return [...$this->_endpoints, $backplane];
+		}
+		return $this->_endpoints;
+	}
+
+	/**
+	 * Sets the internal endpoints matched before normal client handling.
+	 * @param IWebSocketEndpoint[] $value The internal endpoints.
+	 * @throws TWebSocketException When a value does not implement {@see IWebSocketEndpoint}.
+	 */
+	public function setEndpoints(array $value): void
+	{
+		foreach ($value as $endpoint) {
+			if (!$endpoint instanceof IWebSocketEndpoint) {
+				throw new TWebSocketException('websocket_endpoint_invalid');
+			}
+		}
+		$this->_endpoints = array_values($value);
+	}
+
+	/**
+	 * Adds an internal endpoint matched before normal client handling.
+	 * @param IWebSocketEndpoint $endpoint The endpoint to add.
+	 */
+	public function addEndpoint(IWebSocketEndpoint $endpoint): void
+	{
+		$this->_endpoints[] = $endpoint;
+	}
+
+	/**
 	 * Returns the cluster coordinator the server registers its connections with.
 	 * @return ?TWebSocketCluster The cluster, or null when the server is standalone.
 	 */
@@ -247,14 +288,43 @@ class TWebSocketServer extends TSocketServer
 		$except = null;
 		if (TSocketServer::select($read, $write, $except, $seconds, $microseconds) !== false) {
 			foreach ($read as $ready) {
-				if ($ready === $this) {
-					$this->acceptSession();
-				} elseif (isset($this->_sessions[spl_object_id($ready)])) {
-					$this->pumpSession($ready);
+				try {
+					if ($ready === $this) {
+						$this->acceptSession();
+					} elseif (isset($this->_sessions[spl_object_id($ready)])) {
+						$this->pumpSession($ready);
+					}
+				} catch (\Throwable $e) {
+					// One connection's failure (a broken pipe on write, a handler throw, a teardown
+					// error) must not stop the server; drop only that connection and keep serving.
+					if ($ready !== $this) {
+						$this->dropSession($ready);
+					}
 				}
 			}
 		}
 		$this->_cluster?->tick();
+	}
+
+	/**
+	 * Drops one session after a failure, ending it by its protocol and forgetting it even when the
+	 * teardown itself fails on the dead transport.
+	 * @param TSocketStream $transport The session transport to drop.
+	 */
+	protected function dropSession(TSocketStream $transport): void
+	{
+		try {
+			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+			if ($session !== null && isset($session['protocol'])) {
+				$this->endHttp2Session($transport);
+			} elseif ($session !== null) {
+				$this->endHttp1Session($transport, $session['connection']);
+			} else {
+				$transport->close();
+			}
+		} catch (\Throwable $e) {
+			unset($this->_sessions[spl_object_id($transport)]);
+		}
 	}
 
 	/**
@@ -268,14 +338,25 @@ class TWebSocketServer extends TSocketServer
 		if ($transport === null) {
 			return;
 		}
-		if ($this->isHttp2Preface($transport)) {
-			if ($this->isHttp2Available()) {
-				$this->acceptHttp2Session($transport);
+		// accept() may inherit the listener's non-blocking mode (the BSD/macOS behavior), so the
+		// synchronous handshake read would race the peer's request.  Read it blocking; the message
+		// loop switches the transport back to non-blocking once the session is established.
+		try {
+			$transport->setBlocking(true);
+			if ($this->isHttp2Preface($transport)) {
+				if ($this->isHttp2Available()) {
+					$this->acceptHttp2Session($transport);
+				} else {
+					$transport->close();   // the client speaks HTTP/2, which is not available here
+				}
 			} else {
-				$transport->close();   // the client speaks HTTP/2, which is not available here
+				$this->acceptHttp1Session($transport);
 			}
-		} else {
-			$this->acceptHttp1Session($transport);
+		} catch (\Throwable $e) {
+			// A handshake-time failure (e.g. the peer dropping mid-upgrade) drops only this pending
+			// connection rather than crashing the accept loop.
+			unset($this->_sessions[spl_object_id($transport)]);
+			$transport->close();
 		}
 	}
 
@@ -318,16 +399,17 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$key = $request['headers'][strtolower(THttpHeaderName::SecWebSocketKey)];
-		$mesh = $this->meshFor($request['target']);
-		if ($mesh !== null) {
-			if (!$mesh->authenticate($request['headers'])) {
-				$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse the peer before upgrading
+		$endpoint = $this->endpointFor($request['target']);
+		if ($endpoint !== null) {
+			if (!$endpoint->authenticate($request['headers'])) {
+				$transport->write(TWebSocketHandshake::buildRejection(403));   // refuse before upgrading
 				$transport->close();
 				return;
 			}
-			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // a peer link does not negotiate
+			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // an internal endpoint does not negotiate
 			$transport->setBlocking(false);
-			$mesh->addPeer(Prado::createComponent(TWebSocketConnection::class, $transport, false), $transport);
+			$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
+			$endpoint->accept($connection, $transport, $request);
 			return;
 		}
 
@@ -363,17 +445,18 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Returns the mesh backplane an upgrade should join as a peer, or null for a client request.
-	 * A request whose target is the cluster's {@see TMeshBackplane::getPath() mesh path} is an
-	 * inbound peer link rather than a client.
+	 * Returns the internal endpoint that claims an upgrade target, or null for a normal client
+	 * request.  The {@see getEndpoints() endpoints} are tried in order; the first whose
+	 * {@see IWebSocketEndpoint::matchesTarget()} claims the path wins.
 	 * @param ?string $target The request target (path).
-	 * @return ?TMeshBackplane The mesh to add the peer to, or null when the request is a client.
+	 * @return ?IWebSocketEndpoint The matching endpoint, or null when the request is a client.
 	 */
-	protected function meshFor(?string $target): ?TMeshBackplane
+	protected function endpointFor(?string $target): ?IWebSocketEndpoint
 	{
-		$backplane = $this->_cluster?->getBackplane();
-		if ($backplane instanceof TMeshBackplane && $target !== null && $target === $backplane->getPath()) {
-			return $backplane;
+		foreach ($this->getEndpoints() as $endpoint) {
+			if ($endpoint->matchesTarget($target)) {
+				return $endpoint;
+			}
 		}
 		return null;
 	}
@@ -472,7 +555,7 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		try {
-			$messages = $connection->feed($bytes);
+			$messages = $connection->feedMessages($bytes);
 		} catch (TWebSocketException $e) {
 			$this->getHandler()?->onError($connection, $e);
 			$connection->close($e->getCloseCode());
@@ -480,7 +563,7 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		foreach ($messages as $message) {
-			$this->getHandler()?->onMessage($connection, $message);
+			$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
 		}
 		if ($connection->getIsClosed()) {
 			$this->endHttp1Session($transport, $connection);

@@ -16,19 +16,18 @@ use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
 use Prado\TComponent;
-use Prado\Util\TPluginModule;
+use Prado\TModule;
 use Prado\Xml\TXmlElement;
 
 /**
  * TWebSocketModule class.
  *
- * The bootstrap module of the PRADO WebSockets extension, named in `extra.bootstrap` of the
- * package's composer.json.  Extending {@see TPluginModule} registers the adjacent
- * `errorMessages.txt` automatically (its {@see TPluginModule::getErrorFile() error file} is
- * resolved from the module's own directory), so the `websocket_*` codes resolve in a PRADO
- * application without any further wiring.
+ * The cluster module of the PRADO WebSockets extension.  The package's `websocket_*` error codes and
+ * its Prado3 short class names are registered by Composer from the `extra.prado.error-messages` and
+ * `extra.prado.class-map` entries of composer.json, so the extension's default features work without
+ * this module; configure it only to run the server as a cluster node.
  *
- * The module also owns the {@see TWebSocketCluster cluster coordinator}, which makes the server one
+ * The module owns the {@see TWebSocketCluster cluster coordinator}, which makes the server one
  * node of a cluster.  Configure a {@see Cluster\IWebSocketBackplane backplane} as a child element to
  * relay across nodes; without one the module runs a single node on a {@see TNullBackplane}.  A
  * daemon hands the cluster to its server with {@see prepareServer()}, and application code reaches
@@ -52,7 +51,7 @@ use Prado\Xml\TXmlElement;
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 1.0.0
  */
-class TWebSocketModule extends TPluginModule
+class TWebSocketModule extends TModule
 {
 	/** @var ?string The configured node id; a generated id is used when null. */
 	private ?string $_nodeId = null;

@@ -39,9 +39,11 @@ interface IWebSocketHandler
 	/**
 	 * Handles a complete message received on a connection.
 	 * @param TWebSocketConnection $connection The connection.
-	 * @param string $message The received message.
+	 * @param string $message The received message payload.
+	 * @param int $opcode The message's opcode (a {@see TWebSocketOpcode} value), so a handler can
+	 *   echo a Text message as Text and a Binary message as Binary even within a batch.
 	 */
-	public function onMessage(TWebSocketConnection $connection, string $message): void;
+	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void;
 
 	/**
 	 * Handles a connection that has closed or whose stream has ended.

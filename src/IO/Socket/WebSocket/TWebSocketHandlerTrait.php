@@ -35,7 +35,8 @@ trait TWebSocketHandlerTrait
 		$this->onOpen($connection);
 		try {
 			while (($message = $connection->receive()) !== null) {
-				$this->onMessage($connection, $message);
+				// receive() returns one message at a time, so getLastOpcode() is its opcode.
+				$this->onMessage($connection, $message, $connection->getLastOpcode() ?? TWebSocketOpcode::Text);
 			}
 		} catch (TWebSocketException $e) {
 			$this->onError($connection, $e);
@@ -56,11 +57,13 @@ trait TWebSocketHandlerTrait
 	}
 
 	/**
-	 * Raised when a complete message has been received.
+	 * Raised when a complete message has been received.  A handler that overrides this reads
+	 * {@see $opcode} to tell a Text message from a Binary one; the event carries the payload string.
 	 * @param TWebSocketConnection $connection The connection (the event sender).
-	 * @param string $message The received message.
+	 * @param string $message The received message payload.
+	 * @param int $opcode The message's opcode (a {@see TWebSocketOpcode} value).
 	 */
-	public function onMessage(TWebSocketConnection $connection, string $message): void
+	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
 	{
 		$this->raiseEvent('onMessage', $connection, $message);
 	}

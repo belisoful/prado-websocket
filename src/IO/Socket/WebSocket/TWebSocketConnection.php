@@ -179,21 +179,65 @@ class TWebSocketConnection extends TComponent
 		return $this->_closed;
 	}
 
-	/** @return ?int The opcode of the most recently received data message, or null. */
+	/**
+	 * Returns the opcode of the most recently received data message, the right opcode after a
+	 * single {@see receive()}.  A per-message handler over {@see feedMessages()} reads each
+	 * message's own {@see TWebSocketMessage::getOpcode()} instead, as a batch leaves this holding
+	 * only the last message's opcode.
+	 * @return ?int A {@see TWebSocketOpcode} value, or null before any data message.
+	 */
 	public function getLastOpcode(): ?int
 	{
 		return $this->_lastOpcode;
 	}
 
 	/**
-	 * Encodes and writes a frame, masking it on the client side.
+	 * Encodes and writes a frame, masking it on the client side.  The whole frame is drained, so a
+	 * large frame is not truncated when a non-blocking socket's send buffer fills mid-write.
 	 * @param TWebSocketFrame $frame The frame to send.
 	 * @return int The number of bytes written.
 	 */
 	public function sendFrame(TWebSocketFrame $frame): int
 	{
 		$maskKey = $this->_isClient ? random_bytes(4) : null;
-		return $this->_stream->write(TWebSocketFrameCodec::encode($frame, $maskKey));
+		return $this->writeAll(TWebSocketFrameCodec::encode($frame, $maskKey));
+	}
+
+	/**
+	 * Writes the full buffer to the stream.  A single {@see \Prado\IO\TStream::write()} can accept
+	 * only part of a large frame on a non-blocking socket; this resumes from the unwritten tail,
+	 * waiting for the socket to drain, so the frame reaches the wire whole.
+	 * @param string $data The bytes to write.
+	 * @return int The number of bytes written (the full length).
+	 */
+	private function writeAll(string $data): int
+	{
+		$length = strlen($data);
+		$sent = 0;
+		while ($sent < $length) {
+			$wrote = $this->_stream->write($sent === 0 ? $data : substr($data, $sent));
+			$sent += $wrote;
+			if ($wrote === 0 && $sent < $length) {
+				$this->awaitWritable();   // the send buffer is full; let it drain before resuming
+			}
+		}
+		return $sent;
+	}
+
+	/**
+	 * Waits until the underlying socket can accept more output, so {@see writeAll()} does not spin on
+	 * a full send buffer.  Falls back to a brief sleep when the stream exposes no selectable resource.
+	 */
+	private function awaitWritable(): void
+	{
+		$resource = ($this->_stream instanceof TResource) ? $this->_stream->getResource() : null;
+		if (is_resource($resource)) {
+			$write = [$resource];
+			$read = $except = null;
+			@stream_select($read, $write, $except, 5);
+		} else {
+			usleep(1000);
+		}
 	}
 
 	/**
@@ -342,7 +386,8 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Feeds received bytes and returns the complete data messages they yield (non-blocking).
+	 * Feeds received bytes and returns the complete data messages they yield (non-blocking), each
+	 * paired with its opcode.
 	 *
 	 * This is the event-loop counterpart to {@see receive()}: a {@see select()}-driven server
 	 * reads whatever bytes are available and feeds them here without blocking.  Bytes are
@@ -350,11 +395,15 @@ class TWebSocketConnection extends TComponent
 	 * (auto-Pong, close handshake), and fragmented messages are reassembled.  A Close frame marks
 	 * the connection {@see getIsClosed() closed}.
 	 *
+	 * One read can yield several messages of different kinds, so each {@see TWebSocketMessage} carries
+	 * its own opcode; a per-message handler reads that rather than {@see getLastOpcode()}, which holds
+	 * only the last message's opcode after the batch.
+	 *
 	 * @param string $bytes The bytes just read from the transport.
 	 * @throws TWebSocketException When a frame is malformed (the caller should close).
-	 * @return string[] The complete data messages, in order (empty when none completed).
+	 * @return TWebSocketMessage[] The complete messages, in order (empty when none completed).
 	 */
-	public function feed(string $bytes): array
+	public function feedMessages(string $bytes): array
 	{
 		$this->_readBuffer .= $bytes;
 		$messages = [];
@@ -368,10 +417,25 @@ class TWebSocketConnection extends TComponent
 			}
 			$message = $this->ingestDataFrame($frame);
 			if ($message !== null) {
-				$messages[] = $message;
+				// _lastOpcode holds this message's opcode here: it was set on the message's first
+				// frame and is not overwritten until the next message begins.
+				$messages[] = new TWebSocketMessage($this->_lastOpcode ?? TWebSocketOpcode::Text, $message);
 			}
 		}
 		return $messages;
+	}
+
+	/**
+	 * Feeds received bytes and returns the complete data message payloads they yield (non-blocking).
+	 * The string-only counterpart to {@see feedMessages()}, for a caller that does not need the
+	 * per-message opcode (e.g. an envelope reader).
+	 * @param string $bytes The bytes just read from the transport.
+	 * @throws TWebSocketException When a frame is malformed (the caller should close).
+	 * @return string[] The complete message payloads, in order (empty when none completed).
+	 */
+	public function feed(string $bytes): array
+	{
+		return array_map(static fn (TWebSocketMessage $message): string => $message->getPayload(), $this->feedMessages($bytes));
 	}
 
 	/**

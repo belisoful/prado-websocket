@@ -5,6 +5,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
+use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\TStream;
 
@@ -143,6 +144,58 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		self::assertSame([], $messages, 'Control frames yield no data messages.');
 		self::assertSame('hb', $pinged);
 		self::assertTrue($server->getIsClosed(), 'A fed Close marks the connection closed.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testFeedMessagesCarryEachMessagesOwnOpcode()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$client = new TWebSocketConnection($a, true);
+		$server = new TWebSocketConnection($b, false);
+		$client->send('a-text');          // Text
+		$client->sendBinary('b-binary');  // Binary, arriving in the same read
+		$messages = $server->feedMessages($b->read(8192));
+
+		self::assertCount(2, $messages, 'Both messages decode from one read.');
+		self::assertSame(TWebSocketOpcode::Text, $messages[0]->getOpcode());
+		self::assertSame('a-text', $messages[0]->getPayload());
+		self::assertTrue($messages[0]->getIsText());
+		self::assertSame(TWebSocketOpcode::Binary, $messages[1]->getOpcode());
+		self::assertSame('b-binary', $messages[1]->getPayload());
+		self::assertTrue($messages[1]->getIsBinary());
+
+		// getLastOpcode() holds only the last message's opcode after the batch, which is exactly why a
+		// per-message handler reads each TWebSocketMessage's own opcode instead.
+		self::assertSame(TWebSocketOpcode::Binary, $server->getLastOpcode());
+		$a->close();
+		$b->close();
+	}
+
+	public function testHandlerDispatchesEachMessageWithItsOwnOpcode()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$client = new TWebSocketConnection($a, true);
+		$server = new TWebSocketConnection($b, false);
+		$client->send('first');         // Text
+		$client->sendBinary('second');  // Binary
+
+		$handler = new class () extends TWebSocketHandler {
+			/** @var array<int, array{0: int, 1: string}> */
+			public array $seen = [];
+			public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
+			{
+				$this->seen[] = [$opcode, $message];
+			}
+		};
+		foreach ($server->feedMessages($b->read(8192)) as $message) {
+			$handler->onMessage($server, $message->getPayload(), $message->getOpcode());
+		}
+		self::assertSame(
+			[[TWebSocketOpcode::Text, 'first'], [TWebSocketOpcode::Binary, 'second']],
+			$handler->seen,
+			'Each message dispatches under its own opcode, not the batch last opcode.',
+		);
 		$a->close();
 		$b->close();
 	}

@@ -239,4 +239,48 @@ class TWebSocketClusterTest extends PHPUnit\Framework\TestCase
 		self::assertSame('id-1', $copy->getId());
 		self::assertNull(TWebSocketEnvelope::decode('{not json'));
 	}
+
+	public function testReadOnlyIntrospectionReportsLocalAndClusterState()
+	{
+		[$a] = $this->makeConnection();
+		[$b] = $this->makeConnection();
+		$idA = $this->cluster->register($a, ['user' => 'alice']);
+		$idB = $this->cluster->register($b);
+		$this->cluster->subscribe($idA, 'news');
+		$this->cluster->subscribe($idB, 'news');
+		$this->cluster->subscribe($idA, 'sports');
+
+		// A remote client on another node arrives through the presence mirror.
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(
+			TWebSocketEnvelope::PRESENCE_SET,
+			'nodeB',
+			'',
+			null,
+			'nodeB-1',
+			['node' => 'nodeB'],
+		));
+
+		self::assertSame([$idA, $idB], $this->cluster->getLocalClientIds());
+		self::assertSame(2, $this->cluster->getLocalClientCount());
+		self::assertSame(3, $this->cluster->getClusterClientCount(), 'Two local clients plus one remote.');
+		self::assertSame(['nodeA' => 2, 'nodeB' => 1], $this->cluster->getNodes(), 'Per-node counts span the cluster.');
+		self::assertSame(['news' => 2, 'sports' => 1], $this->cluster->getChannels());
+		self::assertSame([$idA, $idB], $this->cluster->getChannelSubscribers('news'));
+		self::assertSame([], $this->cluster->getChannelSubscribers('absent'));
+	}
+
+	public function testGetStatsSnapshot()
+	{
+		[$a] = $this->makeConnection();
+		$idA = $this->cluster->register($a);
+		$this->cluster->subscribe($idA, 'news');
+
+		$stats = $this->cluster->getStats();
+		self::assertSame('nodeA', $stats['node']);
+		self::assertSame(SpyBackplane::class, $stats['backplane']);
+		self::assertSame(1, $stats['localClients']);
+		self::assertSame(1, $stats['clusterClients']);
+		self::assertSame(['nodeA' => 1], $stats['nodes']);
+		self::assertSame(['news' => 1], $stats['channels']);
+	}
 }

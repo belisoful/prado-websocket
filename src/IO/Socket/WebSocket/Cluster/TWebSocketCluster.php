@@ -261,6 +261,90 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		return $this->_presence;
 	}
 
+	// =========================================================================
+	// Introspection (read-only)
+	// =========================================================================
+
+	/**
+	 * Returns the ids of the clients connected to the local node.
+	 * @return string[] The local client ids.
+	 */
+	public function getLocalClientIds(): array
+	{
+		return array_keys($this->_clients);
+	}
+
+	/**
+	 * Returns the number of clients connected to the local node.
+	 * @return int The local client count.
+	 */
+	public function getLocalClientCount(): int
+	{
+		return count($this->_clients);
+	}
+
+	/**
+	 * Returns the number of clients across the whole cluster, the size of the presence mirror.
+	 * @return int The cluster-wide client count.
+	 */
+	public function getClusterClientCount(): int
+	{
+		return count($this->_presence);
+	}
+
+	/**
+	 * Returns the cluster's nodes with their client counts, drawn from the presence mirror in which
+	 * every entry carries its node id.  The local node is always present, even with no clients.
+	 * @return array<string, int> The client count keyed by node id.
+	 */
+	public function getNodes(): array
+	{
+		$nodes = [$this->_nodeId => 0];
+		foreach ($this->_presence as $meta) {
+			$node = (string) ($meta['node'] ?? $this->_nodeId);
+			$nodes[$node] = ($nodes[$node] ?? 0) + 1;
+		}
+		return $nodes;
+	}
+
+	/**
+	 * Returns the channels with a local subscriber, each with its local subscriber count.  This is
+	 * the local node's view; subscriptions held on other nodes are not mirrored here.
+	 * @return array<string, int> The local subscriber count keyed by channel.
+	 */
+	public function getChannels(): array
+	{
+		return array_map(static fn (array $subscribers): int => count($subscribers), $this->_channels);
+	}
+
+	/**
+	 * Returns the local subscribers of a channel.
+	 * @param string $channel The channel name.
+	 * @return string[] The local subscriber client ids, empty when the local node has none.
+	 */
+	public function getChannelSubscribers(string $channel): array
+	{
+		return array_keys($this->_channels[$channel] ?? []);
+	}
+
+	/**
+	 * Returns a read-only snapshot of the cluster for admin and monitoring: the local node, the
+	 * backplane in use, the local and cluster-wide client counts, the per-node client counts, and
+	 * the local channel subscriber counts.
+	 * @return array<string, mixed> The snapshot.
+	 */
+	public function getStats(): array
+	{
+		return [
+			'node' => $this->_nodeId,
+			'backplane' => $this->_backplane::class,
+			'localClients' => $this->getLocalClientCount(),
+			'clusterClients' => $this->getClusterClientCount(),
+			'nodes' => $this->getNodes(),
+			'channels' => $this->getChannels(),
+		];
+	}
+
 	/**
 	 * Routes an envelope received from the cluster to the local clients it concerns, dropping the
 	 * node's own echo.

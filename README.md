@@ -13,7 +13,7 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 |---|---|---|
 | PHP 8.1 or higher | required | The only hard requirement; HTTP/1.1 WebSockets need nothing more |
 | PRADO Framework `^4.4` | dev | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
-| `pradosoft/prado-http2` `^1.0` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
+| `belisoful/prado-http2` `^1.0` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2` |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
@@ -22,7 +22,7 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 HTTP/2 is **opt-in**. Add it with:
 
 ```sh
-composer require pradosoft/prado-http2        # then: brew install libnghttp2  (or apt-get install libnghttp2-dev)
+composer require belisoful/prado-http2        # then: brew install libnghttp2  (or apt-get install libnghttp2-dev)
 ```
 
 `TWebSocketServer::isHttp2Available()` reports whether both the `prado-http2` package and the `libnghttp2` library are present. When either is missing the server still runs — it just serves **HTTP/1.1 only**, and rejects connections that arrive speaking HTTP/2.
@@ -30,7 +30,7 @@ composer require pradosoft/prado-http2        # then: brew install libnghttp2  (
 ## Installation
 
 ```sh
-composer require pradosoft/prado-websockets
+composer require belisoful/prado-websockets
 ```
 
 ## What it provides
@@ -50,7 +50,7 @@ composer require pradosoft/prado-websockets
 | `IWebSocketHandler` | The connection/message contract the server dispatches through (`onOpen`/`onMessage`/`onClose`/`onError`) |
 | `TWebSocketHandler` | The standalone handler: a `TComponent` raising the lifecycle events, used by `TWebSocketServer` |
 | `Prado\Web\Services\TWebSocketService` | A `TService` adapting the `IWebSocketHandler` role to a SAPI upgrade request in the PRADO service pipeline |
-| `TWebSocketModule` | The `extra.bootstrap` module; registers the `websocket_*` error codes |
+| `TWebSocketModule` | The cluster module, making the server one node of a cluster over an `IWebSocketBackplane` (the `websocket_*` error codes and Prado3 class names are registered by Composer from `extra.prado`) |
 
 ## Architecture
 

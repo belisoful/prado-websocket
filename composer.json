@@ -75,6 +75,9 @@
 		"unittest": "vendor/bin/phpunit --testsuite unit"
 	},
 	"extra": {
-		"bootstrap": "Prado\\IO\\Socket\\WebSocket\\TWebSocketModule"
+		"prado": {
+			"error-messages": "config/errorMessages.txt",
+			"class-map": "config/classMap.json"
+		}
 	}
 }

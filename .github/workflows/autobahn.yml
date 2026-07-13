@@ -1,0 +1,72 @@
+name: Autobahn TestSuite
+on: [push, pull_request]
+jobs:
+  autobahn:
+    name: Autobahn fuzzingclient (server compliance)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: prado-websockets
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v5
+        with:
+          path: prado-websockets
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v5
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado
+
+      - name: Checkout Belisoful HTTP/2 extension
+        uses: actions/checkout@v5
+        with:
+          repository: belisoful/prado-http2
+          ref: main
+          path: prado-http2
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: ctype, dom, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Run the echo server and the Autobahn fuzzingclient
+        run: |
+          mkdir -p tests/autobahn/reports
+          php tests/autobahn/echo-server.php &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          # Wait for the echo server to accept connections on 127.0.0.1:9001, failing fast if it
+          # exits early or never listens (so wstest does not run against a dead port).
+          ready=0
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "echo server exited before listening"; exit 1; fi
+            if (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; then exec 3>&- 3<&-; ready=1; break; fi
+            sleep 0.5
+          done
+          if [ "$ready" != 1 ]; then echo "echo server never listened on 127.0.0.1:9001"; exit 1; fi
+          docker run --rm --network host \
+            -v "$PWD/tests/autobahn:/config" \
+            -v "$PWD/tests/autobahn/reports:/reports" \
+            crossbario/autobahn-testsuite \
+            wstest -m fuzzingclient -s /config/fuzzingclient.json
+
+      - name: Check the Autobahn report
+        run: |
+          sudo chown -R "$USER" tests/autobahn/reports 2>/dev/null || true
+          php tests/autobahn/check-report.php tests/autobahn/reports/servers/index.json
+
+      - name: Upload the Autobahn report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: prado-websockets/tests/autobahn/reports

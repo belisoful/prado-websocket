@@ -8,4 +8,4 @@
 
 require_once(__DIR__ . '/../../vendor/autoload.php');
 
-\Prado\Exceptions\TException::addMessageFile(__DIR__ . '/../../src/IO/Socket/WebSocket/errorMessages.txt');
+\Prado\Exceptions\TException::addMessageFile(__DIR__ . '/../../config/errorMessages.txt');

@@ -11,6 +11,7 @@
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\Prado;
@@ -47,7 +48,7 @@ use Prado\TPropertyValue;
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 4.4.0
  */
-class TMeshBackplane extends TComponent implements IWebSocketBackplane
+class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSocketEndpoint
 {
 	/** The maximum bytes read from a peer per drain. */
 	public const READ_CHUNK = 65536;
@@ -258,6 +259,29 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane
 			// Announce this node so the peer, and through its re-flood the rest of the mesh, can dial back.
 			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise]));
 		}
+	}
+
+	/**
+	 * Indicates whether an upgrade targets the mesh peer path, so the server hands it here as a peer
+	 * link rather than a client.  Implements {@see IWebSocketEndpoint}.
+	 * @param ?string $target The request target (path).
+	 * @return bool Whether the target is the mesh {@see getPath() Path}.
+	 */
+	public function matchesTarget(?string $target): bool
+	{
+		return $target !== null && $target === $this->_path;
+	}
+
+	/**
+	 * Joins an authenticated, upgraded connection to the mesh as a peer.  Implements
+	 * {@see IWebSocketEndpoint}.
+	 * @param TWebSocketConnection $connection The upgraded peer connection.
+	 * @param TSocketStream $transport The connection transport.
+	 * @param array<string, mixed> $request The parsed upgrade request.
+	 */
+	public function accept(TWebSocketConnection $connection, TSocketStream $transport, array $request): void
+	{
+		$this->addPeer($connection, $transport);
 	}
 
 	/**
