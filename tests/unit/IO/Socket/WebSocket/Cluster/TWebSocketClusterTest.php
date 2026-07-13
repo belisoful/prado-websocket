@@ -91,6 +91,16 @@ class TWebSocketClusterTest extends PHPUnit\Framework\TestCase
 		self::assertSame('nodeA', $this->cluster->getNodeId());
 	}
 
+	public function testClientIdsAreNotReusedAcrossRestartsUnderAStaticNodeId()
+	{
+		[$a] = $this->makeConnection();
+		[$b] = $this->makeConnection();
+		$before = (new TWebSocketCluster('nodeA', new SpyBackplane()))->register($a);
+		$after = (new TWebSocketCluster('nodeA', new SpyBackplane()))->register($b);   // same node id, a fresh process
+		self::assertStringStartsWith('nodeA-', $before);
+		self::assertNotSame($before, $after, 'A restart under a static node id mints ids in a new epoch, not reused.');
+	}
+
 	public function testRegisterAssignsUniqueIdsAndAnnouncesPresence()
 	{
 		[$a] = $this->makeConnection();

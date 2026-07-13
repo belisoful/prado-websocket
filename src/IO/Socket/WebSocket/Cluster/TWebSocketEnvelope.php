@@ -24,7 +24,8 @@ use Prado\TComponent;
  *  - {@see BROADCAST}: deliver Payload to every local client.
  *  - {@see DIRECT}: deliver Payload to the local client named by {@see getClientId() ClientId}.
  *  - {@see PRESENCE_SET}/{@see PRESENCE_DROP}: update the presence mirror for ClientId.
- *  - {@see NODE_UP}/{@see NODE_DOWN}: update the node registry mirror for {@see getOriginNode() OriginNode}.
+ *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI;
+ *    the coordinator itself ignores it, while the mesh backplane uses it to find peers and detect failures.
  *
  * Each envelope carries OriginNode and a unique {@see getId() Id} so a coordinator drops its own
  * echo and a mesh backplane can suppress duplicate relays.
@@ -49,11 +50,17 @@ class TWebSocketEnvelope extends TComponent
 	/** A client left a node. */
 	public const PRESENCE_DROP = 'presence.drop';
 
-	/** A node joined the cluster. */
+	/** A mesh node's discovery and liveness heartbeat, carrying its advertised URI. */
 	public const NODE_UP = 'node.up';
 
-	/** A node left the cluster. */
+	/** Reserved: node failure is detected by a backplane's liveness timeout (which calls {@see IWebSocketCluster::dropNodePresence()}), not by this envelope. */
 	public const NODE_DOWN = 'node.down';
+
+	/** A mesh peer's anti-replay challenge: a fresh nonce the accepting node asks a new peer to sign. */
+	public const AUTH_CHALLENGE = 'auth.challenge';
+
+	/** A mesh peer's answer to a challenge: the HMAC of the nonce under the shared secret. */
+	public const AUTH_RESPONSE = 'auth.response';
 
 	/** @var string The routing type, one of the class constants. */
 	private string $_type;

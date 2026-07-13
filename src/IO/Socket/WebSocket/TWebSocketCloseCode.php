@@ -63,8 +63,8 @@ class TWebSocketCloseCode extends TEnumerable
 	 */
 	public static function isSendable(int $code): bool
 	{
-		if ($code === self::NoStatusReceived || $code === self::Abnormal || $code === self::TLSHandshake) {
-			return false;
+		if ($code === self::NoStatusReceived || $code === self::Abnormal || $code === self::TLSHandshake || $code === 1004) {
+			return false;   // 1004 is reserved with no meaning, alongside the status-only 1005/1006/1015
 		}
 		return ($code >= 1000 && $code <= 1011) || ($code >= 3000 && $code <= 4999);
 	}

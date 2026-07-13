@@ -259,6 +259,31 @@ class TWebSocketNegotiationTest extends PHPUnit\Framework\TestCase
 		self::assertSame('a b', $offers[1]['params']['q'], 'A quoted value is unwrapped.');
 	}
 
+	public function testParseExtensionHeaderRespectsQuotedDelimiters()
+	{
+		$offers = TWebSocketHandshake::parseExtensionHeader('x-a; note="one, two; three", x-b');
+		self::assertCount(2, $offers, 'A comma inside a quoted value does not split the offer.');
+		self::assertSame('x-a', $offers[0]['name']);
+		self::assertSame('one, two; three', $offers[0]['params']['note'], 'A quoted value keeps its commas and semicolons.');
+		self::assertSame('x-b', $offers[1]['name']);
+	}
+
+	public function testParseExtensionHeaderUnescapesQuotedPairs()
+	{
+		$offers = TWebSocketHandshake::parseExtensionHeader('x; q="a\\"b"');
+		self::assertSame('a"b', $offers[0]['params']['q'], 'A backslash-escaped quote is unescaped.');
+	}
+
+	public function testVerifyServerResponseRequiresUpgradeAndConnectionHeaders()
+	{
+		$key = TWebSocketHandshake::generateKey();
+		$accept = TWebSocketHandshake::acceptKey($key);
+		$ok = ['statusCode' => 101, 'headers' => ['upgrade' => 'websocket', 'connection' => 'Upgrade', 'sec-websocket-accept' => $accept]];
+		self::assertTrue(TWebSocketHandshake::verifyServerResponse($ok, $key));
+		self::assertFalse(TWebSocketHandshake::verifyServerResponse(['statusCode' => 101, 'headers' => ['connection' => 'Upgrade', 'sec-websocket-accept' => $accept]], $key), 'A response missing Upgrade is rejected.');
+		self::assertFalse(TWebSocketHandshake::verifyServerResponse(['statusCode' => 101, 'headers' => ['upgrade' => 'websocket', 'sec-websocket-accept' => $accept]], $key), 'A response missing Connection: Upgrade is rejected.');
+	}
+
 	public function testRepeatedExtensionKeepsEachOfferInOrder()
 	{
 		$offers = TWebSocketHandshake::parseExtensionHeader('x-key; key=1, x-key; key=2');

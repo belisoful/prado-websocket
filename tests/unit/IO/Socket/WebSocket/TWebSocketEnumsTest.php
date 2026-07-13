@@ -6,6 +6,17 @@ use Prado\TEnumerable;
 
 class TWebSocketEnumsTest extends PHPUnit\Framework\TestCase
 {
+	public function testIsSendableExcludesReservedCloseCodes()
+	{
+		self::assertTrue(TWebSocketCloseCode::isSendable(1000));
+		self::assertTrue(TWebSocketCloseCode::isSendable(1011));
+		self::assertTrue(TWebSocketCloseCode::isSendable(3000));
+		self::assertFalse(TWebSocketCloseCode::isSendable(1004), '1004 is reserved with no meaning and not sendable.');
+		self::assertFalse(TWebSocketCloseCode::isSendable(1005), '1005 is status-only.');
+		self::assertFalse(TWebSocketCloseCode::isSendable(1006), '1006 is status-only.');
+		self::assertFalse(TWebSocketCloseCode::isSendable(1015), '1015 is status-only.');
+	}
+
 	public function testOpcodeValues()
 	{
 		self::assertInstanceOf(TEnumerable::class, new TWebSocketOpcode());

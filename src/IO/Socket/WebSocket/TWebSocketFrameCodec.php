@@ -279,10 +279,11 @@ class TWebSocketFrameCodec
 	public static function applyMask(string $payload, string $maskKey): string
 	{
 		$length = strlen($payload);
-		for ($i = 0; $i < $length; $i++) {
-			$payload[$i] = $payload[$i] ^ $maskKey[$i & 3];
+		if ($length === 0) {
+			return '';
 		}
-		return $payload;
+		$mask = substr(str_repeat($maskKey, intdiv($length + 3, 4)), 0, $length);   // native string XOR, far faster than a per-byte loop
+		return $payload ^ $mask;
 	}
 
 	/**

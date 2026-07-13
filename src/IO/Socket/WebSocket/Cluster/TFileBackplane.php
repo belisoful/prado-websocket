@@ -33,6 +33,11 @@ use Prado\TComponent;
  * The log grows without bound, so this driver suits development, tests, and small clusters; a
  * high-throughput deployment uses a service-backed driver (Redis).
  *
+ * The spool is created owner-only ({@see DIR_MODE}/{@see FILE_MODE}) and {@see open()} refuses a
+ * directory that is a symlink, owned by another user, or writable by group or others — so another
+ * local user can neither read the cluster's traffic and presence nor redirect its writes through a
+ * planted symlink.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 4.4.0
  */
@@ -40,6 +45,12 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 {
 	/** The log file name within the directory. */
 	public const LOG_FILE = 'messages.log';
+
+	/** The owner-only mode for the spool directory (past umask), so other local users cannot read or forge cluster state. */
+	public const DIR_MODE = 0o700;
+
+	/** The owner-only mode for spool files. */
+	public const FILE_MODE = 0o600;
 
 	/** The presence subdirectory within the directory. */
 	public const PRESENCE_DIR = 'presence';
@@ -52,6 +63,15 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 
 	/** @var int The byte offset read up to in the log. */
 	private int $_offset = 0;
+
+	/** @var array<string, true> The local clients whose presence files this node refreshes. */
+	private array $_localClients = [];
+
+	/** @var int The seconds a presence file may go unrefreshed before it is reaped as a crashed node's. */
+	private int $_presenceTtl = 30;
+
+	/** @var float The last {@see microtime()} the presence heartbeat ran. */
+	private float $_lastPresenceBeat = 0.0;
 
 	/**
 	 * Binds the owning coordinator.
@@ -83,6 +103,27 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	}
 
 	/**
+	 * Returns the presence-file staleness TTL.
+	 * @return int The TTL in seconds.
+	 */
+	public function getPresenceTtl(): int
+	{
+		return $this->_presenceTtl;
+	}
+
+	/**
+	 * Sets the seconds a presence file may go unrefreshed before it is reaped as a crashed node's.  A
+	 * live node refreshes its files every third of this; a file untouched for twice it is removed.
+	 * @param int|string $value The TTL in seconds.
+	 * @return static The current backplane.
+	 */
+	public function setPresenceTtl($value): static
+	{
+		$this->_presenceTtl = max(1, (int) $value);
+		return $this;
+	}
+
+	/**
 	 * Joins the cluster: creates the directory layout, starts reading the log from its current end
 	 * (so prior traffic is not replayed), and seeds the presence mirror from the registry.
 	 * @throws TConfigurationException When the directory is unset or cannot be created.
@@ -92,14 +133,62 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		if ($this->_directory === null) {
 			throw new TConfigurationException('websocket_backplane_directory_required');
 		}
-		$presence = $this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR;
-		if (!is_dir($presence) && !@mkdir($presence, 0o777, true) && !is_dir($presence)) {
-			throw new TConfigurationException('websocket_backplane_directory_unwritable', $this->_directory);
-		}
+		$this->ensureSecureDirectory($this->_directory);   // create-and-lock or verify the base spool
+		$this->ensureSecureDirectory($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR);
 		clearstatcache();
+
 		$log = $this->logPath();
+		if (is_link($log)) {
+			throw new TConfigurationException('websocket_backplane_path_unsafe', $log);   // a planted symlink must never be appended through
+		}
+		if (!is_file($log)) {
+			@touch($log);
+			@chmod($log, self::FILE_MODE);   // create the log owner-only, before any node appends to it
+		}
 		$this->_offset = is_file($log) ? (int) filesize($log) : 0;
+		$this->reapStalePresence();   // drop a crashed node's leftover presence before seeding, so it is not replayed
 		$this->seedPresence();
+	}
+
+	/**
+	 * Creates a spool directory owner-only when absent, then asserts it is safe to trust.  A directory
+	 * this process creates is locked to {@see DIR_MODE} past a permissive umask; a pre-existing one is
+	 * checked as found, so an insecure spool is refused rather than silently adopted.
+	 * @param string $path The directory to create and secure.
+	 * @throws TConfigurationException When the directory cannot be created, or is unsafe.
+	 */
+	private function ensureSecureDirectory(string $path): void
+	{
+		if (!is_dir($path)) {
+			if (!@mkdir($path, self::DIR_MODE, true) && !is_dir($path)) {
+				throw new TConfigurationException('websocket_backplane_directory_unwritable', $this->_directory);
+			}
+			@chmod($path, self::DIR_MODE);   // enforce owner-only on a directory we just made, past the umask
+		}
+		$this->assertSecureDirectory($path);
+	}
+
+	/**
+	 * Asserts a spool directory is safe to trust: a real directory (not a symlink an attacker planted
+	 * to redirect writes), owned by this process, and not writable by group or others.  Once this
+	 * holds, no other local user can create, read, or forge any entry inside it, so the cluster's
+	 * files, presence, and locks cannot be tampered with.
+	 * @param string $path The directory to check.
+	 * @throws TConfigurationException When the directory is a symlink, other-owned, or other-writable.
+	 */
+	private function assertSecureDirectory(string $path): void
+	{
+		clearstatcache(true, $path);
+		if (is_link($path)) {
+			throw new TConfigurationException('websocket_backplane_path_unsafe', $path);   // a symlink standing in for the spool directory
+		}
+		$perms = @fileperms($path);
+		if ($perms !== false && ($perms & 0o022) !== 0) {
+			throw new TConfigurationException('websocket_backplane_directory_insecure', $path);   // group/other-writable: another user could plant or read cluster state
+		}
+		if (function_exists('posix_geteuid') && @fileowner($path) !== posix_geteuid()) {
+			throw new TConfigurationException('websocket_backplane_directory_insecure', $path);   // owned by another user: not this process's trusted spool
+		}
 	}
 
 	/**
@@ -125,6 +214,10 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		}
 		$envelopes = [];
 		flock($fp, LOCK_SH);
+		clearstatcache();
+		if ((int) fstat($fp)['size'] < $this->_offset) {
+			$this->_offset = 0;   // the log was truncated or rotated; re-read the fresh, smaller log from its start
+		}
 		fseek($fp, $this->_offset);
 		while (($line = fgets($fp)) !== false) {
 			$line = rtrim($line, "\n");
@@ -138,6 +231,41 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 
 		foreach ($envelopes as $envelope) {
 			$this->_cluster->receiveEnvelope($envelope);
+		}
+		$this->presenceHousekeeping();
+	}
+
+	/**
+	 * Refreshes this node's presence files and reaps stale ones, throttled to a third of the TTL.  A
+	 * live node keeps its clients' files fresh; a file no node has touched within twice the TTL belonged
+	 * to a node that crashed, so it is removed rather than replayed as a phantom client forever.
+	 */
+	private function presenceHousekeeping(): void
+	{
+		$now = microtime(true);
+		if (($now - $this->_lastPresenceBeat) < ($this->_presenceTtl / 3)) {
+			return;
+		}
+		$this->_lastPresenceBeat = $now;
+		foreach (array_keys($this->_localClients) as $clientId) {
+			@touch($this->presencePath($clientId));
+		}
+		$this->reapStalePresence();
+	}
+
+	/**
+	 * Removes presence files no node has refreshed within twice the TTL — the residue of a crashed node.
+	 */
+	private function reapStalePresence(): void
+	{
+		if ($this->_directory === null) {
+			return;
+		}
+		$cutoff = time() - 2 * $this->_presenceTtl;
+		foreach (glob($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+			if ((int) @filemtime($file) < $cutoff) {
+				@unlink($file);
+			}
 		}
 	}
 
@@ -185,7 +313,13 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		if ($this->_directory === null) {
 			return;
 		}
-		@file_put_contents($this->presencePath($clientId), (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+		$path = $this->presencePath($clientId);
+		if (is_link($path)) {
+			return;   // never write metadata through a symlink; the secured spool should hold none
+		}
+		@file_put_contents($path, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+		@chmod($path, self::FILE_MODE);   // presence metadata is owner-only, not world-readable
+		$this->_localClients[$clientId] = true;
 		$node = $this->_cluster !== null ? $this->_cluster->getNodeId() : (string) ($meta['node'] ?? '');
 		$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, $clientId, $meta));
 	}
@@ -200,6 +334,7 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		@unlink($this->presencePath($clientId));
+		unset($this->_localClients[$clientId]);
 		$node = $this->_cluster !== null ? $this->_cluster->getNodeId() : '';
 		$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $node, '', null, $clientId));
 	}
@@ -218,7 +353,15 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		flock($fp, LOCK_EX);
-		fwrite($fp, $envelope->encode() . "\n");
+		$data = $envelope->encode() . "\n";
+		$length = strlen($data);
+		for ($written = 0; $written < $length;) {
+			$wrote = fwrite($fp, substr($data, $written));
+			if ($wrote === false || $wrote === 0) {
+				break;   // a short write would leave a torn line; stop rather than silently drop the tail
+			}
+			$written += $wrote;
+		}
 		fflush($fp);
 		flock($fp, LOCK_UN);
 		fclose($fp);

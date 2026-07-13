@@ -114,21 +114,23 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
 			$redis->setOption(\Redis::OPT_READ_TIMEOUT, $this->_timeout > 0 ? $this->_timeout : self::RECONNECT_INTERVAL);   // a stalled Redis must not block the serve loop forever
-			if ($this->_password !== null && $this->_password !== '') {
-				$redis->auth($this->_password);
+			if (($this->_password !== null && $this->_password !== '') && !$redis->auth($this->_password)) {
+				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
-			if ($this->_database !== 0) {
-				$redis->select($this->_database);
+			if ($this->_database !== 0 && !$redis->select($this->_database)) {
+				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
+			$this->_redis = $redis;
+			$this->_channels = [];
+			$this->heartbeat(true);   // the first registry write can fail too, so it stays inside the guard
+			$this->seedPresence();
 		} catch (TConfigurationException $e) {
+			$this->_redis = null;
 			throw $e;
 		} catch (\Throwable $e) {
+			$this->_redis = null;   // never leave a half-initialized handle behind
 			throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 		}
-		$this->_redis = $redis;
-		$this->_channels = [];
-		$this->heartbeat(true);
-		$this->seedPresence();
 	}
 
 	/**
@@ -141,13 +143,18 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		$node = $this->nodeId();
-		foreach (array_keys($this->_channels) as $channel) {
-			$this->_redis->sRem($this->_prefix . 'ch:' . $channel, $node);
+		try {
+			foreach (array_keys($this->_channels) as $channel) {
+				$this->_redis->sRem($this->_prefix . 'ch:' . $channel, $node);
+			}
+			$this->_redis->del($this->_prefix . 'nodech:' . $node);
+			$this->_redis->sRem($this->_prefix . 'nodes', $node);
+			$this->_redis->del($this->_prefix . 'node:' . $node);
+			$this->_redis->del($this->_prefix . 'inbox:' . $node);
+			$this->_redis->close();
+		} catch (\Throwable $e) {
+			// The connection is already gone; the node's keys expire by TTL and are reaped by a peer.
 		}
-		$this->_redis->sRem($this->_prefix . 'nodes', $node);
-		$this->_redis->del($this->_prefix . 'node:' . $node);
-		$this->_redis->del($this->_prefix . 'inbox:' . $node);
-		$this->_redis->close();
 		$this->_redis = null;
 		$this->_channels = [];
 	}
@@ -168,14 +175,13 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 		}
 		$this->guard(function (): void {
 			$inbox = $this->_prefix . 'inbox:' . $this->nodeId();
-			for ($i = 0; $i < self::DRAIN_LIMIT; $i++) {
-				$line = $this->_redis->lPop($inbox);
-				if (!is_string($line)) {
-					break;
-				}
-				$envelope = TWebSocketEnvelope::decode($line);
-				if ($envelope !== null) {
-					$this->_cluster->receiveEnvelope($envelope);
+			$lines = $this->_redis->lRange($inbox, 0, self::DRAIN_LIMIT - 1);   // one round-trip for the batch, not one per message
+			if (is_array($lines) && $lines !== []) {
+				$this->_redis->lTrim($inbox, count($lines), -1);   // remove exactly what was read (this node is the sole consumer of its inbox)
+				foreach ($lines as $line) {
+					if (is_string($line) && ($envelope = TWebSocketEnvelope::decode($line)) !== null) {
+						$this->_cluster->receiveEnvelope($envelope);
+					}
 				}
 			}
 			$this->heartbeat(false);
@@ -279,7 +285,11 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	public function subscribe(string $channel): void
 	{
 		$this->_channels[$channel] = true;
-		$this->guard(fn () => $this->_redis->sAdd($this->_prefix . 'ch:' . $channel, $this->nodeId()));
+		$this->guard(function () use ($channel): void {
+			$node = $this->nodeId();
+			$this->_redis->sAdd($this->_prefix . 'ch:' . $channel, $node);
+			$this->_redis->sAdd($this->_prefix . 'nodech:' . $node, $channel);   // reverse index so a dead node's interest can be reaped
+		});
 	}
 
 	/**
@@ -289,7 +299,11 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	public function unsubscribe(string $channel): void
 	{
 		unset($this->_channels[$channel]);
-		$this->guard(fn () => $this->_redis->sRem($this->_prefix . 'ch:' . $channel, $this->nodeId()));
+		$this->guard(function () use ($channel): void {
+			$node = $this->nodeId();
+			$this->_redis->sRem($this->_prefix . 'ch:' . $channel, $node);
+			$this->_redis->sRem($this->_prefix . 'nodech:' . $node, $channel);
+		});
 	}
 
 	/**
@@ -411,9 +425,39 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		$this->_lastPrune = $now;
+		$self = $this->nodeId();
 		foreach ($this->peerNodes() as $node) {
-			if (!$this->_redis->exists($this->_prefix . 'node:' . $node)) {
-				$this->_redis->sRem($this->_prefix . 'nodes', $node);
+			if ($node !== $self && !$this->_redis->exists($this->_prefix . 'node:' . $node)) {
+				$this->reapNode($node);
+			}
+		}
+	}
+
+	/**
+	 * Reclaims all state a crashed node left behind: its registry membership, its channel interest
+	 * (so publishes stop re-creating its inbox), its inbox list (which has no TTL of its own), and its
+	 * clients' presence entries.  Without this a node that dies ungracefully leaks unbounded Redis
+	 * memory and leaves phantom clients advertised cluster-wide.
+	 * @param string $node The expired node id.
+	 */
+	private function reapNode(string $node): void
+	{
+		$this->_redis->sRem($this->_prefix . 'nodes', $node);
+		$channels = $this->_redis->sMembers($this->_prefix . 'nodech:' . $node);
+		if (is_array($channels)) {
+			foreach ($channels as $channel) {
+				$this->_redis->sRem($this->_prefix . 'ch:' . $channel, $node);
+			}
+		}
+		$this->_redis->del($this->_prefix . 'nodech:' . $node);
+		$this->_redis->del($this->_prefix . 'inbox:' . $node);
+		$presence = $this->_redis->hGetAll($this->_prefix . 'presence');
+		if (is_array($presence)) {
+			foreach ($presence as $clientId => $json) {
+				$meta = json_decode((string) $json, true);
+				if (is_array($meta) && ($meta['node'] ?? null) === $node) {
+					$this->_redis->hDel($this->_prefix . 'presence', (string) $clientId);
+				}
 			}
 		}
 	}

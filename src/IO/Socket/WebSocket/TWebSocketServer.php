@@ -73,10 +73,19 @@ class TWebSocketServer extends TSocketServer
 	/** @var float The seconds a peer has to complete the opening handshake before the accept is dropped. */
 	private float $_handshakeTimeout = 10.0;
 
+	/** @var int The maximum concurrent sessions, or 0 for unlimited. */
+	private int $_maxConnections = 0;
+
+	/** @var float The seconds a session may be idle before it is pinged and, if unanswered, reaped; 0 disables. */
+	private float $_idleTimeout = 0.0;
+
+	/** @var float The last {@see microtime()} idle sessions were scanned. */
+	private float $_lastIdleScan = 0.0;
+
 	/** @var IWebSocketEndpoint[] The internal endpoints matched before normal client handling. */
 	private array $_endpoints = [];
 
-	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string}> Live sessions, keyed by transport object id. */
+	/** @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float}> Live sessions, keyed by transport object id. */
 	private array $_sessions = [];
 
 	/** @var ?TWebSocketCluster The cluster coordinator, when the server is a cluster node. */
@@ -84,6 +93,9 @@ class TWebSocketServer extends TSocketServer
 
 	/** @var int The maximum bytes read from a ready connection per pump. */
 	public const READ_CHUNK = 65536;
+
+	/** @var int The select timeout, in seconds, that bounds an otherwise-blocking pump when a cluster is present, so the cluster ticks. */
+	public const CLUSTER_TICK_INTERVAL = 1;
 
 	/** @var string The HTTP/2 connection preface; a peeked match selects the HTTP/2 stack. */
 	public const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -207,6 +219,45 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the maximum concurrent sessions.
+	 * @return int The maximum, or 0 for unlimited.
+	 */
+	public function getMaxConnections(): int
+	{
+		return $this->_maxConnections;
+	}
+
+	/**
+	 * Sets the maximum concurrent sessions; a further connection is accepted and immediately closed.
+	 * Admission control at the edge (a proxy, or the OS `ulimit`) is still recommended for load shedding.
+	 * @param int|string $value The maximum, or 0 for unlimited.
+	 */
+	public function setMaxConnections($value): void
+	{
+		$this->_maxConnections = max(0, (int) $value);
+	}
+
+	/**
+	 * Returns the idle session timeout.
+	 * @return float The timeout in seconds, or 0 when idle reaping is disabled.
+	 */
+	public function getIdleTimeout(): float
+	{
+		return $this->_idleTimeout;
+	}
+
+	/**
+	 * Sets the seconds a session may be idle before the server pings it and, if the ping goes
+	 * unanswered for as long again, closes it — reclaiming a half-open connection whose peer vanished
+	 * without a Close.  A client that answers pings (or sends any frame) stays connected.  0 disables.
+	 * @param float|int|string $value The idle timeout in seconds.
+	 */
+	public function setIdleTimeout($value): void
+	{
+		$this->_idleTimeout = max(0, (float) $value);
+	}
+
+	/**
 	 * Returns the Host authorities allowed to upgrade.
 	 * @return string[] The allowed hosts, empty to allow any.
 	 */
@@ -316,8 +367,13 @@ class TWebSocketServer extends TSocketServer
 	public function serve(?int $seconds = null): void
 	{
 		$this->setBlocking(false);
-		while ($this->isListening()) {
-			$this->serveOnce($seconds);
+		$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
+		try {
+			while ($this->isListening()) {
+				$this->serveOnce($seconds);
+			}
+		} finally {
+			$this->_cluster?->close();
 		}
 	}
 
@@ -329,6 +385,9 @@ class TWebSocketServer extends TSocketServer
 	 */
 	public function serveOnce(?int $seconds = null, int $microseconds = 0): void
 	{
+		if ($this->_cluster !== null && $seconds === null && $microseconds === 0) {
+			$seconds = self::CLUSTER_TICK_INTERVAL;   // never block forever with a cluster: async dials complete on writability and deadlines must still fire, both advanced by tick()
+		}
 		$read = array_merge([$this], array_column($this->_sessions, 'transport'), $this->_cluster?->getSources() ?? []);
 		$write = $this->pendingWriteTransports();
 		$except = null;
@@ -363,6 +422,47 @@ class TWebSocketServer extends TSocketServer
 			// never terminate the serve loop that is handling live client connections.
 		}
 		$this->flushHttp2Output();
+		$this->reapIdleSessions();
+	}
+
+	/**
+	 * Pings sessions idle beyond {@see getIdleTimeout() the idle timeout} and closes those that have
+	 * not answered within a further timeout, reclaiming half-open connections whose peer vanished.  The
+	 * scan is throttled, and any inbound frame (including a Pong) refreshes a session's activity.
+	 */
+	protected function reapIdleSessions(): void
+	{
+		if ($this->_idleTimeout <= 0) {
+			return;
+		}
+		$now = microtime(true);
+		if (($now - $this->_lastIdleScan) < ($this->_idleTimeout / 2)) {
+			return;
+		}
+		$this->_lastIdleScan = $now;
+		foreach (array_column($this->_sessions, 'transport') as $transport) {
+			$id = spl_object_id($transport);
+			$session = $this->_sessions[$id] ?? null;
+			if ($session === null || !isset($session['connection'])) {
+				continue;   // HTTP/2 sessions carry their own keepalive through nghttp2 PING
+			}
+			$idle = $now - ($session['active'] ?? $now);
+			if ($idle < $this->_idleTimeout) {
+				continue;
+			}
+			if (($session['pinged'] ?? 0.0) > 0.0) {
+				if (($now - $session['pinged']) >= $this->_idleTimeout) {
+					$this->endHttp1Session($transport, $session['connection']);   // the ping went unanswered; the peer is gone
+				}
+				continue;
+			}
+			try {
+				$session['connection']->ping();
+				$this->_sessions[$id]['pinged'] = $now;
+			} catch (\Throwable $e) {
+				$this->dropSession($transport);   // the ping could not be written; the connection is dead
+			}
+		}
 	}
 
 	/**
@@ -416,6 +516,11 @@ class TWebSocketServer extends TSocketServer
 	{
 		$transport = $this->accept(0.0);
 		if ($transport === null) {
+			return;
+		}
+		if ($this->_maxConnections > 0 && count($this->_sessions) >= $this->_maxConnections) {
+			$transport->write(TWebSocketHandshake::buildRejection(503, 'Service Unavailable'));   // at capacity; shed the load
+			$transport->close();
 			return;
 		}
 		// accept() may inherit the listener's non-blocking mode (the BSD/macOS behavior), so the
@@ -523,10 +628,8 @@ class TWebSocketServer extends TSocketServer
 		$connection->setMaxMessageSize($this->_maxMessageSize);
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
-		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
-		$this->_cluster?->register($connection);
-		$this->onConnection($connection);
-		$this->getHandler()?->onOpen($connection);
+		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection, 'active' => microtime(true)];
+		$this->activateConnection($transport, $connection);
 	}
 
 	/**
@@ -583,10 +686,38 @@ class TWebSocketServer extends TSocketServer
 	{
 		$transport->setBlocking(false);
 		$this->addConnection($transport);
-		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection];
-		$this->_cluster?->register($connection);
-		$this->onConnection($connection);
-		$this->getHandler()?->onOpen($connection);
+		$this->_sessions[spl_object_id($transport)] = ['transport' => $transport, 'connection' => $connection, 'active' => microtime(true)];
+		$this->activateConnection($transport, $connection);
+	}
+
+	/**
+	 * Registers a ready connection with the cluster and raises {@see onConnection} and the handler's
+	 * open.  A throwing callback rolls the whole activation back — unregistering the cluster presence,
+	 * raising the handler close, and closing the transport — so a handler bug cannot leave a phantom
+	 * cluster registration (presence announced cluster-wide) or a live session behind.
+	 * @param TSocketStream $transport The session transport.
+	 * @param TWebSocketConnection $connection The ready connection.
+	 */
+	protected function activateConnection(TSocketStream $transport, TWebSocketConnection $connection): void
+	{
+		try {
+			$this->_cluster?->register($connection);
+			$this->onConnection($connection);
+			$this->getHandler()?->onOpen($connection);
+		} catch (\Throwable $e) {
+			unset($this->_sessions[spl_object_id($transport)]);
+			try {
+				$this->_cluster?->unregister($connection);
+			} catch (\Throwable $inner) {
+				// The cluster teardown failed on the dead registration; the transport still closes.
+			}
+			try {
+				$this->getHandler()?->onClose($connection);
+			} catch (\Throwable $inner) {
+				// The handler close failed; the transport still closes.
+			}
+			$transport->close();
+		}
 	}
 
 	/**
@@ -721,6 +852,10 @@ class TWebSocketServer extends TSocketServer
 			$this->endHttp1Session($transport, $connection);
 			return;
 		}
+		if ($bytes !== '' && isset($this->_sessions[spl_object_id($transport)])) {
+			$this->_sessions[spl_object_id($transport)]['active'] = microtime(true);   // any inbound frame (a Pong included) keeps the session alive
+			unset($this->_sessions[spl_object_id($transport)]['pinged']);
+		}
 		try {
 			$messages = $connection->feedMessages($bytes);
 		} catch (TWebSocketException $e) {
@@ -798,8 +933,13 @@ class TWebSocketServer extends TSocketServer
 	 */
 	public function serveConnection(TSocketStream $connection): void
 	{
+		$protocol = $this->getProtocol();
+		if ($protocol instanceof THttp1WebSocketProtocol) {
+			$protocol->setOrigins($this->_origins);         // the synchronous path enforces the same allowlists as serveOnce()
+			$protocol->setAllowedHosts($this->_allowedHosts);
+		}
 		try {
-			$this->getProtocol()->serve($connection, function (StreamInterface $stream): void {
+			$protocol->serve($connection, function (StreamInterface $stream): void {
 				$this->dispatchStream($stream);
 			});
 		} catch (TWebSocketException $e) {

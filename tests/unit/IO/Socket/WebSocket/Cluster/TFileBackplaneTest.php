@@ -54,6 +54,69 @@ class TFileBackplaneTest extends PHPUnit\Framework\TestCase
 		$cluster->open();
 	}
 
+	public function testSpoolIsCreatedOwnerOnly()
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('n1', $backplane);
+		$backplane->open();
+		self::assertSame(0o700, fileperms($this->dir . DIRECTORY_SEPARATOR . 'presence') & 0o777, 'The presence directory is owner-only, not 0777.');
+
+		$backplane->putPresence('c1', ['node' => 'n1']);
+		self::assertSame(0o600, fileperms($this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . 'c1') & 0o777, 'A presence file is owner-only, not world-readable.');
+	}
+
+	public function testOpenRefusesASymlinkedDirectory()
+	{
+		$real = $this->dir . '_real';
+		mkdir($real, 0o700, true);
+		symlink($real, $this->dir);   // an attacker redirects the spool through a symlink
+
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('n1', $backplane);
+		try {
+			$this->expectException(TConfigurationException::class);
+			$backplane->open();
+		} finally {
+			@unlink($this->dir);
+			$this->removeTree($real);
+		}
+	}
+
+	public function testOpenRefusesAnOtherWritableDirectory()
+	{
+		mkdir($this->dir, 0o777, true);   // a pre-existing group/other-writable spool another user could tamper with
+		chmod($this->dir, 0o777);
+
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('n1', $backplane);
+		$this->expectException(TConfigurationException::class);
+		$backplane->open();
+	}
+
+	public function testStalePresenceFilesAreReapedWhileFreshOnesSurvive()
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('n1', $backplane);
+		$backplane->open();
+		$backplane->putPresence('live', ['node' => 'n1']);   // just written, fresh
+
+		$ghost = $this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . 'ghost';
+		file_put_contents($ghost, '{"node":"dead"}');
+		touch($ghost, time() - 100);   // a crashed node's residue, well past 2x the default TTL
+
+		$fresh = new TFileBackplane();
+		$fresh->setDirectory($this->dir);
+		new TWebSocketCluster('n2', $fresh);
+		$fresh->open();   // reapStalePresence() runs before seeding
+
+		self::assertFileDoesNotExist($ghost, "A crashed node's stale presence file is reaped, not replayed.");
+		self::assertFileExists($this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . 'live', 'A recently written presence file survives.');
+	}
+
 	public function testPublishCrossesNodesThroughTheFiles()
 	{
 		$node1 = $this->makeNode('node1');
@@ -67,6 +130,25 @@ class TFileBackplaneTest extends PHPUnit\Framework\TestCase
 
 		$node2->tick();
 		self::assertGreaterThan(0, $sink->getSize(), 'A publish on node1 reaches a subscriber on node2.');
+	}
+
+	public function testTruncatedLogIsReReadFromStart()
+	{
+		$writer = $this->makeNode('w');
+		$reader = $this->makeNode('r');
+		[$conn, $sink] = $this->makeConnection();
+		$reader->register($conn);
+
+		$writer->broadcast('first');
+		$writer->broadcast('second');
+		$reader->tick();   // the reader's offset advances past two broadcasts
+		$delivered = $sink->getSize();
+		self::assertGreaterThan(0, $delivered);
+
+		file_put_contents($this->dir . DIRECTORY_SEPARATOR . 'messages.log', '');   // the log is rotated to a smaller file
+		$writer->broadcast('after');
+		$reader->tick();   // the reader detects the shrink and re-reads from the start rather than seeking past EOF
+		self::assertGreaterThan($delivered, $sink->getSize(), 'A truncated/rotated log is re-read from the start, not stranded.');
 	}
 
 	public function testBroadcastCrossesNodes()

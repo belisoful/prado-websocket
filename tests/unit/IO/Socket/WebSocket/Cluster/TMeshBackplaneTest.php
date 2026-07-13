@@ -3,6 +3,7 @@
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\TComponent;
@@ -34,6 +35,14 @@ class SpyCluster extends TComponent implements IWebSocketCluster
 	{
 		return false;
 	}
+
+	/** @var string[] The nodes the backplane declared dead. */
+	public array $droppedNodes = [];
+
+	public function dropNodePresence(string $node): void
+	{
+		$this->droppedNodes[] = $node;
+	}
 }
 
 /** A mesh that records dial attempts instead of opening real sockets. */
@@ -48,12 +57,33 @@ class RecordingMesh extends TMeshBackplane
 	}
 }
 
+/** A mesh with a settable clock, so the failure detector's TTL can be advanced deterministically. */
+class ClockMesh extends TMeshBackplane
+{
+	public float $clock = 1000.0;
+
+	protected function now(): float
+	{
+		return $this->clock;
+	}
+}
+
 class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 {
 	/** @return array{0: TMeshBackplane, 1: SpyCluster} A mesh node and its spy coordinator. */
 	private function makeNode(string $id): array
 	{
 		$mesh = new TMeshBackplane();
+		$spy = new SpyCluster($id);
+		$mesh->setCluster($spy);
+		return [$mesh, $spy];
+	}
+
+	/** @return array{0: TMeshBackplane, 1: SpyCluster} A secret-gated mesh node and its spy coordinator. */
+	private function makeSecretNode(string $id, string $secret): array
+	{
+		$mesh = new TMeshBackplane();
+		$mesh->setSecret($secret);
 		$spy = new SpyCluster($id);
 		$mesh->setCluster($spy);
 		return [$mesh, $spy];
@@ -129,6 +159,58 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 		$envelope = array_values($presence)[0];
 		self::assertSame('A-1', $envelope->getClientId());
 		self::assertSame('alice', $envelope->getMeta()['user']);
+	}
+
+	public function testSilentNodeIsDeclaredDownAndItsPresenceReaped()
+	{
+		[$a] = $this->makeNode('A');
+
+		$b = new ClockMesh();
+		$b->setNodeTtl(10);
+		$spyB = new SpyCluster('B');
+		$b->setCluster($spyB);
+		$this->link($a, $b);
+
+		$a->putPresence('a-client', ['node' => 'A']);   // floods PRESENCE_SET, originNode 'A'
+		$b->clock = 1000.0;
+		$b->tick();   // B ingests the presence and records that node A is alive
+		self::assertNotContains('A', $spyB->droppedNodes, 'A node just heard from is not declared down.');
+
+		$b->clock = 1000.0 + 11.0;   // A never heartbeats again; advance B past the TTL
+		$b->tick();
+		self::assertContains('A', $spyB->droppedNodes, 'A node unheard past the TTL is declared down and its presence reaped.');
+	}
+
+	public function testAliveNodeIsNotDeclaredDown()
+	{
+		[$a] = $this->makeNode('A');
+		$b = new ClockMesh();
+		$b->setNodeTtl(10);
+		$b->setCluster($spyB = new SpyCluster('B'));
+		$this->link($a, $b);
+
+		$a->putPresence('a-client', ['node' => 'A']);
+		$b->clock = 1000.0;
+		$b->tick();
+
+		// A keeps heartbeating (a fresh envelope from A) before the TTL elapses.
+		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', 'alive'));
+		$b->clock = 1000.0 + 8.0;
+		$b->tick();   // refreshes _nodeSeen[A]
+		$b->clock = 1000.0 + 12.0;
+		$b->tick();   // 12 since the last scan, but only 4 since A was last heard
+		self::assertNotContains('A', $spyB->droppedNodes, 'A node still being heard within the TTL stays alive.');
+	}
+
+	public function testConnectPeerDoesNotDuplicateAnInFlightDial()
+	{
+		$mesh = new TMeshBackplane();
+		$mesh->setSecret('shh');
+		new TWebSocketCluster('n', $mesh);
+		$mesh->connectPeer('tcp://127.0.0.1:59991');
+		$mesh->connectPeer('tcp://127.0.0.1:59991');   // the same peer is already being dialed
+		self::assertSame(1, $mesh->getPendingCount(), 'A second dial to a peer already in flight is skipped.');
+		$mesh->close();
 	}
 
 	public function testDeadPeerIsPruned()
@@ -227,5 +309,67 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 		self::assertFalse($mesh->authenticate(['sec-websocket-key' => $key, 'x-cluster-auth' => 'forged']), 'A wrong proof is rejected.');
 		self::assertFalse($mesh->authenticate(['sec-websocket-key' => $key]), 'A missing proof is rejected.');
 		self::assertFalse($mesh->authenticate([]), 'A missing handshake key is rejected.');
+	}
+
+	public function testChallengeAdmitsAPeerThatProvesTheSecret()
+	{
+		[$a] = $this->makeSecretNode('A', 'clustersecret');
+		[$b, $spyB] = $this->makeSecretNode('B', 'clustersecret');
+		[$rawA, $rawB] = TSocketStream::pair();
+		$rawA->setBlocking(false);
+		$rawB->setBlocking(false);
+		$a->putPresence('a-1', ['node' => 'A']);   // a local client A shares only once it is trusted
+
+		$a->addPeer(new TWebSocketConnection($rawA, true), $rawA);    // dialer: awaits the challenge
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);   // acceptor: issues the challenge, withholds its state
+		self::assertCount(0, $spyB->received, 'The acceptor delivers nothing from an unproven peer.');
+
+		$a->tick();   // A reads the challenge, signs the nonce, and releases its join state
+		$b->tick();   // B verifies the answer and accepts A's presence
+
+		self::assertSame(1, $b->getPeerCount(), 'A peer that proves the secret stays linked.');
+		$presence = array_filter($spyB->received, fn ($e) => $e->getType() === TWebSocketEnvelope::PRESENCE_SET && $e->getClientId() === 'a-1');
+		self::assertCount(1, $presence, 'Once the challenge is answered, the peer\'s presence is accepted.');
+	}
+
+	public function testChallengeRejectsAReplayedHandshakeThatCannotAnswer()
+	{
+		[$b, $spyB] = $this->makeSecretNode('B', 'clustersecret');
+		[$rawAtk, $rawB] = TSocketStream::pair();
+		$rawAtk->setBlocking(false);
+		$rawB->setBlocking(false);
+
+		// An attacker replayed a captured upgrade to reach B but does not know the secret.
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);
+		self::assertSame(1, $b->getPeerCount(), 'The challenged peer is held pending its answer.');
+
+		$attacker = new TWebSocketConnection($rawAtk, true);
+		$attacker->send((new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'evil', '', null, 'evil-1', ['node' => 'evil']))->encode());
+		$b->tick();   // B ignores an unverified peer's traffic
+		$injected = array_filter($spyB->received, fn ($e) => $e->getClientId() === 'evil-1');
+		self::assertCount(0, $injected, 'An unproven peer cannot inject presence before answering the challenge.');
+		self::assertSame(1, $b->getPeerCount());
+
+		$attacker->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, 'evil', 'forged-token'))->encode());
+		$b->tick();   // a wrong answer drops the peer
+		self::assertSame(0, $b->getPeerCount(), 'A peer that fails the challenge is dropped.');
+	}
+
+	public function testUnansweredChallengeIsDroppedAfterTheTimeout()
+	{
+		$b = new ClockMesh();
+		$b->setSecret('clustersecret');
+		$b->setCluster(new SpyCluster('B'));
+		[$rawAtk, $rawB] = TSocketStream::pair();
+		$rawAtk->setBlocking(false);
+		$rawB->setBlocking(false);
+
+		$b->clock = 1000.0;
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);   // authDeadline = 1000 + Timeout
+		self::assertSame(1, $b->getPeerCount());
+
+		$b->clock = 1000.0 + $b->getTimeout() + 1.0;   // the peer never answers; advance past the deadline
+		$b->tick();
+		self::assertSame(0, $b->getPeerCount(), 'A peer that never answers the challenge is dropped after the timeout.');
 	}
 }

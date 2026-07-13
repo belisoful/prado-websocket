@@ -262,14 +262,15 @@ class TWebSocketHandshake
 	public static function parseExtensionHeader(string $value): array
 	{
 		$offers = [];
-		foreach (explode(',', $value) as $segment) {
-			$parts = array_map('trim', explode(';', trim($segment)));
-			$name = strtolower((string) array_shift($parts));
+		foreach (self::splitOutsideQuotes($value, ',') as $segment) {
+			$parts = self::splitOutsideQuotes(trim($segment), ';');
+			$name = strtolower(trim((string) array_shift($parts)));
 			if ($name === '') {
 				continue;
 			}
 			$params = [];
 			foreach ($parts as $part) {
+				$part = trim($part);
 				if ($part === '') {
 					continue;
 				}
@@ -277,7 +278,7 @@ class TWebSocketHandshake
 					[$key, $val] = explode('=', $part, 2);
 					$val = trim($val);
 					if (strlen($val) >= 2 && $val[0] === '"' && $val[-1] === '"') {
-						$val = substr($val, 1, -1);
+						$val = (string) preg_replace('/\\\\(.)/', '$1', substr($val, 1, -1));   // unwrap the quoted-string and undo backslash escapes
 					}
 					$params[strtolower(trim($key))] = $val;
 				} else {
@@ -287,6 +288,38 @@ class TWebSocketHandshake
 			$offers[] = ['name' => $name, 'params' => $params];
 		}
 		return $offers;
+	}
+
+	/**
+	 * Splits a header value on a delimiter, ignoring delimiters inside a double-quoted string (with
+	 * backslash escapes), so a quoted parameter value containing a comma or semicolon is not broken.
+	 * @param string $value The header value.
+	 * @param string $delimiter The single-character delimiter (',' or ';').
+	 * @return string[] The segments.
+	 */
+	private static function splitOutsideQuotes(string $value, string $delimiter): array
+	{
+		$parts = [];
+		$current = '';
+		$inQuotes = false;
+		$length = strlen($value);
+		for ($i = 0; $i < $length; $i++) {
+			$char = $value[$i];
+			if ($inQuotes && $char === '\\' && $i + 1 < $length) {
+				$current .= $char . $value[$i + 1];   // keep the escaped pair together
+				$i++;
+			} elseif ($char === '"') {
+				$inQuotes = !$inQuotes;
+				$current .= $char;
+			} elseif ($char === $delimiter && !$inQuotes) {
+				$parts[] = $current;
+				$current = '';
+			} else {
+				$current .= $char;
+			}
+		}
+		$parts[] = $current;
+		return $parts;
 	}
 
 	/**
@@ -450,8 +483,12 @@ class TWebSocketHandshake
 	 */
 	public static function verifyServerResponse(array $response, string $sentKey): bool
 	{
+		$headers = $response['headers'] ?? [];
+		$connection = array_map('trim', explode(',', strtolower($headers[strtolower(THttpHeaderName::Connection)] ?? '')));
 		return ($response['statusCode'] ?? 0) === 101
-			&& ($response['headers'][strtolower(THttpHeaderName::SecWebSocketAccept)] ?? '') === self::acceptKey($sentKey);
+			&& strtolower($headers[strtolower(THttpHeaderName::Upgrade)] ?? '') === 'websocket'
+			&& in_array('upgrade', $connection, true)
+			&& ($headers[strtolower(THttpHeaderName::SecWebSocketAccept)] ?? '') === self::acceptKey($sentKey);
 	}
 
 	/**
@@ -489,7 +526,7 @@ class TWebSocketHandshake
 	 * When `origins` is set, the request's `Origin` must be in the list or the upgrade is refused with
 	 * a `403`.  An unset or empty `origins` allows any origin.
 	 * @param StreamInterface $stream The accepted transport stream.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], headers?: array<string, string>} $options
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>} $options
 	 *   The supported subprotocols, extension negotiators, allowed origins, and extra response headers.
 	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade or the origin is rejected.
 	 * @return array{method: ?string, target: ?string, headers: array<string, string>, subprotocol: ?string, extensions: IWebSocketExtension[]}
@@ -507,6 +544,10 @@ class TWebSocketHandshake
 		if (!self::isOriginAllowed($headers, $options['origins'] ?? null)) {
 			$stream->write(self::buildRejection(403, 'Forbidden'));
 			throw new TWebSocketException('websocket_handshake_origin_rejected', $headers[strtolower(THttpHeaderName::Origin)] ?? '');
+		}
+		if (!self::isHostAllowed($headers, $options['allowedHosts'] ?? null)) {
+			$stream->write(self::buildRejection(400, 'Bad Request'));
+			throw new TWebSocketException('websocket_handshake_not_upgrade');   // the Host is not one this server serves
 		}
 		$subprotocol = self::negotiateSubprotocol($headers, $options['subprotocols'] ?? []);
 		$negotiated = self::negotiateExtensions($headers, $options['extensions'] ?? []);
@@ -594,6 +635,9 @@ class TWebSocketHandshake
 			throw new TWebSocketException('websocket_handshake_rejected', $response['statusCode'] ?? 0);
 		}
 		$subprotocol = $response['headers'][strtolower(THttpHeaderName::SecWebSocketProtocol)] ?? null;
+		if ($subprotocol !== null && $subprotocol !== '' && !in_array($subprotocol, $subprotocols, true)) {
+			throw new TWebSocketException('websocket_subprotocol_not_offered', $subprotocol);   // RFC 6455 s4.1: fail on a subprotocol the client did not offer
+		}
 		$extensions = self::resolveExtensions($response['headers'], $negotiators);
 		return $response + ['subprotocol' => $subprotocol, 'extensions' => $extensions];
 	}

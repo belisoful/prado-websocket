@@ -40,10 +40,11 @@ use Prado\TPropertyValue;
  * any pair initiate, and an established peer is never dialed twice).  Dials are asynchronous and
  * advance in {@see tick()}, so the serve loop never blocks on a connecting or handshaking peer.
  *
- * A peer joins only by proving the shared {@see setSecret() Secret} during its handshake
- * ({@see authenticate()}); the secret never crosses the wire, since the proof is an HMAC of the
- * connection's handshake key.  Set the secret and prefer a `tls://` transport on any untrusted
- * network; an unset secret leaves the mesh open to anyone who reaches the path.
+ * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
+ * key ({@see authenticate()}), then an answer to a fresh-nonce challenge the accepting node issues
+ * after the upgrade ({@see addPeer()}), so a captured handshake cannot be replayed onto the mesh.
+ * The secret never crosses the wire.  Set the secret and prefer a `tls://` transport on any
+ * untrusted network; an unset secret leaves the mesh open to anyone who reaches the path.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 4.4.0
@@ -59,7 +60,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
-	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string}> The peer links, keyed by link object id. */
+	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, authDeadline: float}> The peer links, keyed by link object id. */
 	private array $_peers = [];
 
 	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id. */
@@ -97,6 +98,18 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 
 	/** @var float The dial timeout in seconds. */
 	private float $_timeout = 2.0;
+
+	/** @var array<string, float> The last {@see now()} an envelope was seen from each node, for liveness. */
+	private array $_nodeSeen = [];
+
+	/** @var int The seconds a node may go unheard before it is declared down and its presence reaped. */
+	private int $_nodeTtl = 30;
+
+	/** @var float The last {@see now()} a heartbeat was flooded. */
+	private float $_lastHeartbeat = 0.0;
+
+	/** @var float The last {@see now()} the failure detector scanned. */
+	private float $_lastNodeScan = 0.0;
 
 	/**
 	 * Binds the owning coordinator.
@@ -146,6 +159,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		$this->_seen = [];
 		$this->_knownUris = [];
 		$this->_connectedUris = [];
+		$this->_nodeSeen = [];
 	}
 
 	/**
@@ -159,6 +173,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		}
 		$this->advancePending();
 		foreach ($this->_peers as $id => $peer) {
+			if (!$peer['verified'] && $peer['authDeadline'] > 0.0 && $this->now() > $peer['authDeadline']) {
+				$this->dropPeer($id);   // never answered the challenge in time
+				continue;
+			}
 			$bytes = $this->readPeer($peer['transport']);
 			if ($bytes === null || $peer['link']->getIsClosed()) {
 				$this->dropPeer($id);
@@ -166,6 +184,45 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			}
 			if ($bytes !== '') {
 				$this->ingest($id, $bytes);
+			}
+		}
+		$this->heartbeat();
+		$this->detectFailures();
+	}
+
+	/**
+	 * Floods a node-alive heartbeat to every peer, throttled to a third of the {@see getNodeTtl() TTL}.
+	 * Every node hears every other node's heartbeat, so each independently tracks the whole cluster's
+	 * liveness — a single dropped link is not mistaken for a node failure in a multi-path mesh.
+	 */
+	private function heartbeat(): void
+	{
+		$now = $this->now();
+		if (($now - $this->_lastHeartbeat) < ($this->_nodeTtl / 3)) {
+			return;
+		}
+		$this->_lastHeartbeat = $now;
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise]);
+		$this->markSeen($envelope->getId());
+		$this->flood($envelope, null);
+	}
+
+	/**
+	 * Reaps the presence of nodes not heard from within the TTL, throttled to once per TTL.  A node
+	 * that stopped heartbeating is declared down and its clients dropped from the coordinator's mirror,
+	 * so a crashed peer's clients do not linger as phantom presence.
+	 */
+	private function detectFailures(): void
+	{
+		$now = $this->now();
+		if (($now - $this->_lastNodeScan) < $this->_nodeTtl) {
+			return;
+		}
+		$this->_lastNodeScan = $now;
+		foreach ($this->_nodeSeen as $node => $seen) {
+			if (($now - $seen) > $this->_nodeTtl) {
+				unset($this->_nodeSeen[$node]);
+				$this->_cluster?->dropNodePresence($node);
 			}
 		}
 	}
@@ -247,17 +304,83 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 */
 	public function addPeer(TWebSocketConnection $link, TSocketStream $transport, string $uri = ''): void
 	{
-		$this->_peers[spl_object_id($link)] = ['link' => $link, 'transport' => $transport, 'uri' => $uri];
+		$peerId = spl_object_id($link);
+		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'authDeadline' => 0.0];
 		if ($uri !== '') {
 			$this->_connectedUris[$uri] = true;
 			$this->_knownUris[$uri] = true;
 		}
+		if ($this->_secret === '') {
+			$this->sendJoinState($link);
+			return;
+		}
+		if (!$link->getIsClient()) {
+			// This node accepted the inbound peer: challenge it to sign a fresh nonce, so a replayed
+			// upgrade (a captured Sec-WebSocket-Key and proof) cannot join without the shared secret.
+			// The peer's traffic is ignored, and this node's join state withheld, until it answers.
+			$nonce = bin2hex(random_bytes(16));
+			$this->_peers[$peerId]['verified'] = false;
+			$this->_peers[$peerId]['nonce'] = $nonce;
+			$this->_peers[$peerId]['authDeadline'] = $this->now() + $this->_timeout;
+			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, $this->nodeId(), $nonce));
+			return;
+		}
+		// This node dialed the peer, so it trusts the chosen endpoint; it sends its join state once it
+		// answers the peer's challenge (in answerChallenge), when the peer is about to trust it.
+	}
+
+	/**
+	 * Sends this node's join state to a peer: its local clients' presence and, when advertising, its
+	 * node announce.  Withheld until a challenged peer is verified, so state is never leaked to an
+	 * unproven connector.
+	 * @param TWebSocketConnection $link The peer link.
+	 */
+	private function sendJoinState(TWebSocketConnection $link): void
+	{
 		foreach ($this->_localPresence as $clientId => $meta) {
 			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
 		}
 		if ($this->_advertise !== '') {
 			// Announce this node so the peer, and through its re-flood the rest of the mesh, can dial back.
 			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise]));
+		}
+	}
+
+	/**
+	 * Answers an accepting peer's challenge by signing the nonce, then sends this node's join state,
+	 * since the peer is about to trust it.
+	 * @param int $peerId The peer the challenge arrived on.
+	 * @param string $nonce The challenge nonce.
+	 */
+	private function answerChallenge(int $peerId, string $nonce): void
+	{
+		if ($nonce === '' || $this->_secret === '' || !isset($this->_peers[$peerId])) {
+			return;
+		}
+		$link = $this->_peers[$peerId]['link'];
+		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, $this->nodeId(), $this->authToken($nonce)));
+		$this->sendJoinState($link);
+	}
+
+	/**
+	 * Verifies a peer's challenge answer: a correct HMAC of the nonce marks the peer trusted and
+	 * releases the withheld join state; a wrong or missing answer drops the peer.
+	 * @param int $peerId The peer the answer arrived on.
+	 * @param string $response The peer's HMAC of the nonce.
+	 */
+	private function verifyChallenge(int $peerId, string $response): void
+	{
+		if (!isset($this->_peers[$peerId])) {
+			return;
+		}
+		$nonce = $this->_peers[$peerId]['nonce'];
+		if ($nonce !== '' && $response !== '' && hash_equals($this->authToken($nonce), $response)) {
+			$this->_peers[$peerId]['verified'] = true;
+			$this->_peers[$peerId]['nonce'] = '';
+			$this->_peers[$peerId]['authDeadline'] = 0.0;
+			$this->sendJoinState($this->_peers[$peerId]['link']);
+		} else {
+			$this->dropPeer($peerId);   // failed the challenge: not a legitimate peer
 		}
 	}
 
@@ -298,6 +421,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		if (!preg_match('#^(tcp|tls|ssl)://#i', $uri)) {
 			return;   // only dial stream sockets; refuse gossiped non-socket URIs (SSRF hardening)
 		}
+		foreach ($this->_pending as $pending) {
+			if ($pending['uri'] === $uri) {
+				return;   // a dial to this peer is already in flight; do not open a duplicate link
+			}
+		}
 		$this->_knownUris[$uri] = true;
 		$transport = TSocketStream::connect($uri, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT);
 		$transport->setBlocking(false);
@@ -313,9 +441,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 
 	/**
 	 * Verifies an inbound peer handshake against the shared secret.  The proof is an HMAC of the
-	 * connection's `Sec-WebSocket-Key` keyed by the secret, so the secret never crosses the wire and
-	 * a captured proof cannot authenticate a different connection (each handshake key is fresh).  The
-	 * mesh is disabled without a secret, so an unauthenticated peer can never join.
+	 * connection's `Sec-WebSocket-Key` keyed by the secret, so the secret never crosses the wire and a
+	 * proof lifted onto a different handshake key is rejected.  The mesh is disabled without a secret,
+	 * so an unauthenticated peer can never join.
+	 *
+	 * This handshake proof is a bearer credential a wire-tap could replay, so it is only the first
+	 * gate: once upgraded, the accepting node issues a fresh-nonce challenge ({@see addPeer()}) that a
+	 * replayed handshake cannot answer without the secret.  Still prefer a `tls://` transport on any
+	 * untrusted network so traffic and presence stay confidential.
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @return bool Whether the peer is authorized to join.
 	 */
@@ -369,6 +502,22 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 */
 	private function receive(TWebSocketEnvelope $envelope, int $fromPeerId): void
 	{
+		$type = $envelope->getType();
+		if ($type === TWebSocketEnvelope::AUTH_CHALLENGE) {
+			$this->answerChallenge($fromPeerId, $envelope->getPayload());
+			return;   // a point-to-point challenge, never flooded or deduplicated
+		}
+		if ($type === TWebSocketEnvelope::AUTH_RESPONSE) {
+			$this->verifyChallenge($fromPeerId, $envelope->getPayload());
+			return;   // a point-to-point answer, never flooded or deduplicated
+		}
+		if (isset($this->_peers[$fromPeerId]) && !$this->_peers[$fromPeerId]['verified']) {
+			return;   // a challenged peer's traffic is ignored until it proves the secret
+		}
+		$origin = $envelope->getOriginNode();
+		if ($origin !== '' && $origin !== $this->nodeId()) {
+			$this->_nodeSeen[$origin] = $this->now();   // any traffic (data or heartbeat) proves the origin node is alive, even a duplicate copy
+		}
 		if (isset($this->_seen[$envelope->getId()])) {
 			return;
 		}
@@ -781,6 +930,27 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	public function setTimeout($value): static
 	{
 		$this->_timeout = TPropertyValue::ensureFloat($value);
+		return $this;
+	}
+
+	/**
+	 * Returns the node-liveness TTL.
+	 * @return int The TTL in seconds.
+	 */
+	public function getNodeTtl(): int
+	{
+		return $this->_nodeTtl;
+	}
+
+	/**
+	 * Sets the seconds a node may go unheard before it is declared down and its clients' presence is
+	 * reaped.  A heartbeat floods every third of this, so a live node is always seen within the TTL.
+	 * @param int|string $value The TTL in seconds.
+	 * @return static The current backplane.
+	 */
+	public function setNodeTtl($value): static
+	{
+		$this->_nodeTtl = max(1, (int) $value);
 		return $this;
 	}
 }

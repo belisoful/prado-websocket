@@ -38,10 +38,15 @@ trait TWebSocketHandlerTrait
 				// receive() returns one message at a time, so getLastOpcode() is its opcode.
 				$this->onMessage($connection, $message, $connection->getLastOpcode() ?? TWebSocketOpcode::Text);
 			}
-		} catch (TWebSocketException $e) {
+		} catch (\Throwable $e) {
 			$this->onError($connection, $e);
 			if (!$connection->getIsClosing()) {
-				$connection->close($e->getCloseCode());
+				$code = $e instanceof TWebSocketException ? $e->getCloseCode() : TWebSocketCloseCode::InternalServerError;
+				try {
+					$connection->close($code);
+				} catch (\Throwable $inner) {
+					// A close on a broken pipe cannot be written; onClose still runs below.
+				}
 			}
 		}
 		$this->onClose($connection);

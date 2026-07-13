@@ -56,6 +56,9 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	/** @var int A per-node counter making each local client id unique. */
 	private int $_counter = 0;
 
+	/** @var string A per-process epoch so client ids are not reused across a restart under a static node id. */
+	private string $_epoch;
+
 	/**
 	 * @param ?string $nodeId The local node id; a generated id is used when null or empty.
 	 * @param ?IWebSocketBackplane $backplane The transport; a {@see TNullBackplane} (single node) when null.
@@ -63,6 +66,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	public function __construct(?string $nodeId = null, ?IWebSocketBackplane $backplane = null)
 	{
 		$this->_nodeId = ($nodeId === null || $nodeId === '') ? bin2hex(random_bytes(6)) : $nodeId;
+		$this->_epoch = bin2hex(random_bytes(3));
 		$this->setBackplane($backplane ?? new TNullBackplane());
 		parent::__construct();
 	}
@@ -121,7 +125,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	 */
 	public function register(TWebSocketConnection $connection, array $meta = []): string
 	{
-		$clientId = $this->_nodeId . '-' . (++$this->_counter);
+		$clientId = $this->_nodeId . '-' . $this->_epoch . '-' . (++$this->_counter);   // the epoch keeps ids unique across restarts under a static node id
 		$this->_clients[$clientId] = $connection;
 		$this->_localIds[spl_object_id($connection)] = $clientId;
 		$meta['node'] = $this->_nodeId;
@@ -380,6 +384,21 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 					unset($this->_presence[$clientId]);
 				}
 				break;
+		}
+	}
+
+	/**
+	 * Drops the presence mirror entries whose node matches a dead node, called by a backplane's
+	 * failure detector so a crashed node's clients stop being advertised.  Local clients never match,
+	 * since their node is this node, which the detector never targets.
+	 * @param string $node The dead node id.
+	 */
+	public function dropNodePresence(string $node): void
+	{
+		foreach ($this->_presence as $clientId => $meta) {
+			if (($meta['node'] ?? null) === $node) {
+				unset($this->_presence[$clientId]);
+			}
 		}
 	}
 

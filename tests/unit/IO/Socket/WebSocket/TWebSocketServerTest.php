@@ -3,6 +3,8 @@
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\IWebSocketProtocol;
 use Prado\IO\Socket\WebSocket\THttp1WebSocketProtocol;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -133,6 +135,73 @@ class TWebSocketServerTest extends PHPUnit\Framework\TestCase
 		self::assertStringContainsString('403', $response, 'The server answers a foreign origin with 403.');
 		self::assertSame(0, $server->getConnectionCount(), 'A rejected upgrade leaves no session.');
 		$client->close();
+		$server->close();
+	}
+
+	public function testServeConnectionEnforcesTheOriginAllowlist()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setOrigins(['https://app.example.com']);
+		$dispatched = 0;
+		$server->attachEventHandler('onConnection', function () use (&$dispatched) {
+			$dispatched++;
+		});
+
+		[$a, $b] = TSocketStream::pair();
+		$a->write("GET / HTTP/1.1\r\nHost: ex\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+			. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+			. "Origin: https://evil.example.com\r\n\r\n");
+		$server->serveConnection($b);   // the synchronous one-shot path must enforce the same allowlist as serveOnce()
+
+		self::assertStringContainsString('403', $a->read(4096), 'serveConnection() refuses a foreign origin.');
+		self::assertSame(0, $dispatched, 'A rejected upgrade is not dispatched.');
+		$a->close();
+		$server->close();
+	}
+
+	public function testThrowingOnOpenRollsBackClusterRegistration()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$cluster = new TWebSocketCluster('s1', new TNullBackplane());
+		$server->setCluster($cluster);
+		$closed = 0;
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onOpen', function () {
+			throw new \RuntimeException('handler bug in onOpen');
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
+		$server->serveOnce(0, 300000);
+
+		self::assertCount(0, $cluster->presence(), 'A throwing onOpen leaves no phantom cluster registration.');
+		self::assertSame(1, $closed, 'A throwing onOpen still runs onClose for cleanup.');
+		$server->serveOnce(0, 50000);   // the loop keeps serving after the rolled-back accept
+		$client->close();
+		$server->close();
+	}
+
+	public function testMaxConnectionsShedsExcessLoadWith503()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxConnections(1);
+
+		$first = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$first->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
+		$server->serveOnce(0, 200000);   // the single slot is occupied
+
+		$second = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$second->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
+		$server->serveOnce(0, 200000);
+		self::assertStringContainsString('503', $second->read(4096), 'A connection past the cap is shed with 503 before the handshake.');
+
+		$first->close();
+		$second->close();
 		$server->close();
 	}
 
