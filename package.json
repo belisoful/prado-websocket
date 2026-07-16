@@ -1,0 +1,14 @@
+{
+	"name": "prado-websocket",
+	"description": "PRADO WebSocket extension — browser client tests",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"playwright": "playwright test",
+		"playwright:headed": "HEADLESS=false playwright test",
+		"playwright:install": "playwright install chromium firefox webkit"
+	},
+	"devDependencies": {
+		"@playwright/test": "1.60.0"
+	}
+}

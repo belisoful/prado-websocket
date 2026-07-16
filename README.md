@@ -209,7 +209,7 @@ Backplane choices:
 - **`TNullBackplane`** — single node, no relay (the default).
 - **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it or it is a symlink.
 - **`TRedisBackplane`** — Redis pub/sub + a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`); the driver for multi-host scaling. Needs `ext-redis`.
-- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving a shared `Secret` (a handshake HMAC plus a post-upgrade nonce challenge); set it and prefer a `tls://` transport on any untrusted network.
+- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving a shared `Secret` — a handshake HMAC plus a *mutual* post-upgrade nonce challenge, so each side proves the secret to the other and shows no state until it has; set it and prefer a `tls://` transport on any untrusted network.
 
 ## HTTP/2 multiplexing (RFC 8441)
 
@@ -235,6 +235,20 @@ vendor/bin/phpstan analyse src/ --memory-limit=512M  # static analysis
 ```
 
 Tests cover the codec (round-trips, masking, fragmentation, control-frame rules), the handshake (RFC 6455 accept-key vector), the connection (blocking and `feed()` paths over socket pairs), the server (HTTP/1.1 over a real socket and HTTP/2 auto-selection), and the RFC 8441 round-trip end to end. HTTP/2 tests skip cleanly where `libnghttp2` is absent.
+
+### Browser client tests (Playwright)
+
+A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate.
+
+```sh
+npm install                                  # or: bun install
+npx playwright install                       # download the browser builds (or: bunx playwright install)
+npx playwright test                          # all three engines  (or: bunx playwright test)
+npx playwright test --project=chromium       # one engine
+HEADLESS=false npx playwright test           # watch it run
+```
+
+The specs live in `tests/playwright/`; a small PHP echo server ([`ws-server.php`](tests/playwright/ws-server.php)) is spawned per run, and a static page server gives the browser a real HTTP origin. Nothing here is required for the PHP suite — it is an optional, browser-only layer.
 
 ## License
 

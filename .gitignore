@@ -32,3 +32,10 @@ atlassian-ide-plugin.xml
 # mac deployment helpers
 switch
 index
+# Node / Playwright (browser client tests)
+/node_modules
+/build/
+/test-results/
+/playwright-report/
+bun.lock
+bun.lockb

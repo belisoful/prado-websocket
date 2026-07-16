@@ -41,10 +41,12 @@ use Prado\TPropertyValue;
  * advance in {@see tick()}, so the serve loop never blocks on a connecting or handshaking peer.
  *
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
- * key ({@see authenticate()}), then an answer to a fresh-nonce challenge the accepting node issues
- * after the upgrade ({@see addPeer()}), so a captured handshake cannot be replayed onto the mesh.
- * The secret never crosses the wire.  Set the secret and prefer a `tls://` transport on any
- * untrusted network; an unset secret leaves the mesh open to anyone who reaches the path.
+ * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
+ * ({@see addPeer()}) in which each side signs the other's nonce and shows no state until it has
+ * verified the peer.  So a captured handshake cannot be replayed onto the mesh, and a node a peer
+ * dials cannot harvest that node's presence or advertised URI without the secret.  The secret never
+ * crosses the wire.  Set the secret and prefer a `tls://` transport on any untrusted network; an
+ * unset secret leaves the mesh open to anyone who reaches the path.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
@@ -77,6 +79,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	/** @var string The HTTP header carrying a peer's authentication proof. */
 	public const AUTH_HEADER = 'X-Cluster-Auth';
 
+	/** The domain-separation tag for the handshake proof, so a proof cannot be reused as a challenge answer. */
+	private const AUTH_CONTEXT_HANDSHAKE = 'handshake';
+
+	/** The domain-separation tag for the challenge answer, so an answer cannot be reused as a handshake proof. */
+	private const AUTH_CONTEXT_CHALLENGE = 'challenge';
+
 	/** @var string The shared cluster secret; a peer proves it to join. '' leaves the mesh open (trusted networks only). */
 	private string $_secret = '';
 
@@ -97,6 +105,9 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 
 	/** @var float The dial timeout in seconds. */
 	private float $_timeout = 2.0;
+
+	/** @var int The maximum peers accepted but not yet verified, or 0 for unlimited; bounds a connection flood from a replayed handshake proof. */
+	private int $_maxPendingPeers = 64;
 
 	/** @var array<string, float> The last {@see now()} an envelope was seen from each node, for liveness. */
 	private array $_nodeSeen = [];
@@ -295,8 +306,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	// =========================================================================
 
 	/**
-	 * Adds an established peer link and sends it the local presence snapshot so the peer converges.
+	 * Adds an established peer link and, on a secret-gated mesh, begins mutually authenticating it.
 	 * A known remote URI is recorded so the same peer is never linked twice.
+	 *
+	 * Authentication is symmetric: this node challenges the peer with a fresh nonce and withholds its
+	 * join state — and every other cluster message — until it has verified the peer's answer.  Because
+	 * both a dialed and an accepted peer are challenged this way, and the dialer no longer trusts an
+	 * endpoint merely because it dialed it, a node a peer dials cannot harvest that node's presence or
+	 * advertised URI without proving the secret.
 	 * @param TWebSocketConnection $link The peer connection.
 	 * @param TSocketStream $transport The connection's transport, for the event loop.
 	 * @param string $uri The remote's URI when known (a dialed peer), or '' for an accepted peer.
@@ -310,28 +327,33 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			$this->_knownUris[$uri] = true;
 		}
 		if ($this->_secret === '') {
-			$this->sendJoinState($link);
+			$this->sendJoinState($link);   // an open mesh trusts any peer that reaches the path
 			return;
 		}
-		if (!$link->getIsClient()) {
-			// This node accepted the inbound peer: challenge it to sign a fresh nonce, so a replayed
-			// upgrade (a captured Sec-WebSocket-Key and proof) cannot join without the shared secret.
-			// The peer's traffic is ignored, and this node's join state withheld, until it answers.
-			$nonce = bin2hex(random_bytes(16));
-			$this->_peers[$peerId]['verified'] = false;
-			$this->_peers[$peerId]['nonce'] = $nonce;
-			$this->_peers[$peerId]['authDeadline'] = $this->now() + $this->_timeout;
-			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, $this->nodeId(), $nonce));
-			return;
+		// An inbound peer is subject to the pending-peer cap: a replayed handshake proof passes
+		// authenticate() repeatedly and accepted peers do not count against the server's connection
+		// limit, so this bounds how many half-authenticated links a flood can hold at once.
+		if (!$link->getIsClient() && $this->_maxPendingPeers > 0 && $this->countUnverifiedPeers() >= $this->_maxPendingPeers) {
+			unset($this->_peers[$peerId]);
+			try {
+				$link->close();
+			} catch (\Throwable $e) {
+				// The peer is already gone; nothing to close cleanly.
+			}
+			return;   // shed: too many peers are mid-authentication (a replayed-proof connection flood)
 		}
-		// This node dialed the peer, so it trusts the chosen endpoint; it sends its join state once it
-		// answers the peer's challenge (in answerChallenge), when the peer is about to trust it.
+		// Challenge the peer and withhold trust (and all state) until it answers.
+		$nonce = bin2hex(random_bytes(16));
+		$this->_peers[$peerId]['verified'] = false;
+		$this->_peers[$peerId]['nonce'] = $nonce;
+		$this->_peers[$peerId]['authDeadline'] = $this->now() + $this->_timeout;
+		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, $this->nodeId(), $nonce));
 	}
 
 	/**
 	 * Sends this node's join state to a peer: its local clients' presence and, when advertising, its
-	 * node announce.  Withheld until a challenged peer is verified, so state is never leaked to an
-	 * unproven connector.
+	 * node announce.  On a secret-gated mesh this runs only from {@see verifyChallenge()}, once this
+	 * node has verified the peer, so state is never shown to an unproven peer — dialed or accepted.
 	 * @param TWebSocketConnection $link The peer link.
 	 */
 	private function sendJoinState(TWebSocketConnection $link): void
@@ -346,8 +368,9 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	}
 
 	/**
-	 * Answers an accepting peer's challenge by signing the nonce, then sends this node's join state,
-	 * since the peer is about to trust it.
+	 * Answers a peer's challenge by signing the nonce.  Answering only proves this node knows the
+	 * secret; it grants no trust and releases no state — that happens in {@see verifyChallenge()} when
+	 * this node has verified the peer's answer to its own nonce.
 	 * @param int $peerId The peer the challenge arrived on.
 	 * @param string $nonce The challenge nonce.
 	 */
@@ -357,13 +380,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			return;
 		}
 		$link = $this->_peers[$peerId]['link'];
-		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, $this->nodeId(), $this->authToken($nonce)));
-		$this->sendJoinState($link);
+		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, $this->nodeId(), $this->authToken(self::AUTH_CONTEXT_CHALLENGE, $nonce)));
 	}
 
 	/**
-	 * Verifies a peer's challenge answer: a correct HMAC of the nonce marks the peer trusted and
-	 * releases the withheld join state; a wrong or missing answer drops the peer.
+	 * Verifies a peer's answer to this node's challenge: a correct HMAC of the nonce marks the peer
+	 * trusted — releasing the withheld join state and letting its traffic flow — while a wrong or
+	 * missing answer drops the peer.  Trust is per-direction: the peer independently verifies this node
+	 * before it trusts this node in turn.
 	 * @param int $peerId The peer the answer arrived on.
 	 * @param string $response The peer's HMAC of the nonce.
 	 */
@@ -373,7 +397,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			return;
 		}
 		$nonce = $this->_peers[$peerId]['nonce'];
-		if ($nonce !== '' && $response !== '' && hash_equals($this->authToken($nonce), $response)) {
+		if ($nonce === '') {
+			return;   // no outstanding challenge (already verified); ignore a stray or duplicate answer rather than drop a good peer
+		}
+		if ($response !== '' && hash_equals($this->authToken(self::AUTH_CONTEXT_CHALLENGE, $nonce), $response)) {
 			$this->_peers[$peerId]['verified'] = true;
 			$this->_peers[$peerId]['nonce'] = '';
 			$this->_peers[$peerId]['authDeadline'] = 0.0;
@@ -446,8 +473,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 *
 	 * This handshake proof is a bearer credential a wire-tap could replay, so it is only the first
 	 * gate: once upgraded, the accepting node issues a fresh-nonce challenge ({@see addPeer()}) that a
-	 * replayed handshake cannot answer without the secret.  Still prefer a `tls://` transport on any
-	 * untrusted network so traffic and presence stay confidential.
+	 * replayed handshake cannot answer without the secret.  The proof and the challenge answer are
+	 * domain-separated ({@see authToken()}), so a node that a peer dials cannot be used as a signing
+	 * oracle to turn a challenge answer into a forged handshake proof.  Still prefer a `tls://`
+	 * transport on any untrusted network so traffic and presence stay confidential.
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @return bool Whether the peer is authorized to join.
 	 */
@@ -458,17 +487,22 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		}
 		$key = $headers['sec-websocket-key'] ?? '';
 		$provided = $headers[strtolower(self::AUTH_HEADER)] ?? '';
-		return $key !== '' && $provided !== '' && hash_equals($this->authToken($key), $provided);
+		return $key !== '' && $provided !== '' && hash_equals($this->authToken(self::AUTH_CONTEXT_HANDSHAKE, $key), $provided);
 	}
 
 	/**
-	 * Computes the authentication proof for a handshake key.
-	 * @param string $key The connection's `Sec-WebSocket-Key`.
-	 * @return string The base64 HMAC-SHA256 of the key under the shared secret.
+	 * Computes an authentication token for a value under the shared secret, bound to a purpose.  The
+	 * `$context` tag domain-separates the two uses — the handshake proof over the `Sec-WebSocket-Key`
+	 * and the challenge answer over the nonce — so a token issued for one purpose can never satisfy the
+	 * other.  Without this separation, a malicious node a peer dials could harvest challenge answers for
+	 * chosen values and replay them as handshake proofs, defeating the secret.
+	 * @param string $context The purpose tag ({@see AUTH_CONTEXT_HANDSHAKE} or {@see AUTH_CONTEXT_CHALLENGE}).
+	 * @param string $value The value to sign (the handshake key, or the nonce).
+	 * @return string The base64 HMAC-SHA256 of the context-tagged value under the shared secret.
 	 */
-	private function authToken(string $key): string
+	private function authToken(string $context, string $value): string
 	{
-		return base64_encode(hash_hmac('sha256', $key, sha1($this->_secret), true));
+		return base64_encode(hash_hmac('sha256', $context . ':' . $value, sha1($this->_secret), true));
 	}
 
 	/**
@@ -487,6 +521,21 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	public function getPendingCount(): int
 	{
 		return count($this->_pending);
+	}
+
+	/**
+	 * Returns the number of accepted peers that have not yet answered their challenge.
+	 * @return int The unverified peer count.
+	 */
+	private function countUnverifiedPeers(): int
+	{
+		$count = 0;
+		foreach ($this->_peers as $peer) {
+			if (!$peer['verified']) {
+				$count++;
+			}
+		}
+		return $count;
 	}
 
 	// =========================================================================
@@ -572,14 +621,16 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	}
 
 	/**
-	 * Sends an envelope to every peer except an optional source.
+	 * Sends an envelope to every verified peer except an optional source.  An unverified peer receives
+	 * no cluster traffic — presence, publishes, broadcasts, or heartbeats — until it has proven the
+	 * secret, so a peer this node dials but has not yet verified is shown nothing.
 	 * @param TWebSocketEnvelope $envelope The envelope to send.
 	 * @param ?int $exceptPeerId The peer id to skip (the source of a re-flood), or null.
 	 */
 	private function flood(TWebSocketEnvelope $envelope, ?int $exceptPeerId): void
 	{
 		foreach ($this->_peers as $id => $peer) {
-			if ($id !== $exceptPeerId) {
+			if ($id !== $exceptPeerId && $peer['verified']) {
 				$this->sendTo($peer['link'], $envelope);
 			}
 		}
@@ -710,7 +761,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			return;
 		}
 		$key = TWebSocketHandshake::generateKey();
-		$headers = $this->_secret === '' ? [] : [self::AUTH_HEADER => $this->authToken($key)];
+		$headers = $this->_secret === '' ? [] : [self::AUTH_HEADER => $this->authToken(self::AUTH_CONTEXT_HANDSHAKE, $key)];
 		try {
 			$transport->write(TWebSocketHandshake::buildClientRequest($this->_host, $this->_path, $key, $headers));
 		} catch (\Throwable $e) {
@@ -929,6 +980,29 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	public function setTimeout($value): static
 	{
 		$this->_timeout = TPropertyValue::ensureFloat($value);
+		return $this;
+	}
+
+	/**
+	 * Returns the maximum number of peers accepted but not yet verified.
+	 * @return int The cap, or 0 for unlimited.
+	 */
+	public function getMaxPendingPeers(): int
+	{
+		return $this->_maxPendingPeers;
+	}
+
+	/**
+	 * Sets the maximum number of peers accepted but not yet verified.  A replayed handshake proof passes
+	 * {@see authenticate()} repeatedly, and accepted peers do not count against the server's connection
+	 * limit, so this bounds how many half-authenticated peer links a flood can hold at once.  0 removes
+	 * the cap.
+	 * @param int|string $value The cap, or 0 for unlimited.
+	 * @return static The current backplane.
+	 */
+	public function setMaxPendingPeers($value): static
+	{
+		$this->_maxPendingPeers = max(0, (int) $value);
 		return $this;
 	}
 

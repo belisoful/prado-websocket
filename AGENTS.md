@@ -97,6 +97,7 @@
 
 ## Testing Guidelines
 - The testing platform is "phpunit"
+- An optional Playwright browser-client suite lives in `tests/playwright/` (real Chromium/Firefox/WebKit `WebSocket` against the standalone server). It is JS, not PHP: run it with `npx playwright test` (or `bunx playwright test`), separate from the phpunit suite. Do not add these to the phpunit `unit` testsuite.
 - All new code must include unit tests
 - Unit test functions must comprehensively assert both typical and edge cases
 - Maximal coverage of code execution paths of a class is required

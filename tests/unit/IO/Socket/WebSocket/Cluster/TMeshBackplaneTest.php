@@ -304,11 +304,69 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 
 		$mesh->setSecret('s3cr3t');
 		$key = 'dGhlIHNhbXBsZSBub25jZQ==';
-		$proof = base64_encode(hash_hmac('sha256', $key, sha1('s3cr3t'), true));
+		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('s3cr3t'), true));   // domain-tagged for the handshake purpose
 		self::assertTrue($mesh->authenticate(['sec-websocket-key' => $key, 'x-cluster-auth' => $proof]), 'A valid HMAC proof is accepted.');
 		self::assertFalse($mesh->authenticate(['sec-websocket-key' => $key, 'x-cluster-auth' => 'forged']), 'A wrong proof is rejected.');
 		self::assertFalse($mesh->authenticate(['sec-websocket-key' => $key]), 'A missing proof is rejected.');
 		self::assertFalse($mesh->authenticate([]), 'A missing handshake key is rejected.');
+	}
+
+	public function testChallengeAnswerCannotBeForgedIntoAHandshakeProof()
+	{
+		// Regression for the signing-oracle: a malicious node that a legit peer dials issues a challenge
+		// for an attacker-chosen value; the dialer answers by signing it.  Because the handshake proof
+		// and the challenge answer are domain-separated, that harvested answer must NOT authenticate as a
+		// handshake proof for the same value — otherwise the oracle would forge a way past the secret.
+		[$victim] = $this->makeSecretNode('victim', 'clustersecret');
+		[$rawVictim, $rawAttacker] = TSocketStream::pair();
+		$rawVictim->setBlocking(false);
+		$rawAttacker->setBlocking(false);
+
+		// The victim dials the attacker (isClient = true), so it will answer the attacker's challenge.
+		$victim->addPeer(new TWebSocketConnection($rawVictim, true), $rawVictim);
+
+		// The attacker challenges with a nonce it will later try to reuse as its own Sec-WebSocket-Key.
+		$forgeKey = 'attacker-chosen-key-value';
+		$attacker = new TWebSocketConnection($rawAttacker, false);
+		$attacker->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, 'attacker', $forgeKey))->encode());
+		$victim->tick();   // the victim answers: AUTH_RESPONSE( token over $forgeKey )
+
+		// Harvest the victim's answer (what a malicious acceptor would capture).
+		$harvested = null;
+		foreach ($attacker->feed($rawAttacker->read(65536)) as $message) {
+			$envelope = TWebSocketEnvelope::decode($message);
+			if ($envelope !== null && $envelope->getType() === TWebSocketEnvelope::AUTH_RESPONSE) {
+				$harvested = $envelope->getPayload();
+			}
+		}
+		self::assertNotNull($harvested, 'The dialer answered the challenge (oracle output captured).');
+
+		// Replay the harvested answer as a handshake proof for key = $forgeKey against a fresh node.
+		[$target] = $this->makeSecretNode('target', 'clustersecret');
+		self::assertFalse(
+			$target->authenticate(['sec-websocket-key' => $forgeKey, 'x-cluster-auth' => $harvested]),
+			'A challenge answer harvested from a dialer must not pass as a handshake proof (domain separation).'
+		);
+	}
+
+	public function testConcurrentUnverifiedPeersAreCapped()
+	{
+		$node = new TMeshBackplane();
+		$node->setSecret('clustersecret');
+		$node->setMaxPendingPeers(2);
+		$node->setCluster(new SpyCluster('node'));
+
+		$keep = [];   // hold socket refs so the pairs stay open
+		for ($i = 0; $i < 5; $i++) {
+			[$rawPeer, $rawRemote] = TSocketStream::pair();
+			$rawPeer->setBlocking(false);
+			$rawRemote->setBlocking(false);
+			$keep[] = [$rawPeer, $rawRemote];
+			// Inbound (acceptor) peers that never answer their challenge — a replayed-proof flood.
+			$node->addPeer(new TWebSocketConnection($rawPeer, false), $rawPeer);
+		}
+
+		self::assertSame(2, $node->getPeerCount(), 'Concurrent unverified inbound peers are capped, so a flood cannot hold unbounded links.');
 	}
 
 	public function testChallengeAdmitsAPeerThatProvesTheSecret()
@@ -320,16 +378,51 @@ class TMeshBackplaneTest extends PHPUnit\Framework\TestCase
 		$rawB->setBlocking(false);
 		$a->putPresence('a-1', ['node' => 'A']);   // a local client A shares only once it is trusted
 
-		$a->addPeer(new TWebSocketConnection($rawA, true), $rawA);    // dialer: awaits the challenge
-		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);   // acceptor: issues the challenge, withholds its state
-		self::assertCount(0, $spyB->received, 'The acceptor delivers nothing from an unproven peer.');
+		$a->addPeer(new TWebSocketConnection($rawA, true), $rawA);    // each side challenges the other
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);
+		self::assertCount(0, $spyB->received, 'Neither side delivers anything from an unproven peer.');
 
-		$a->tick();   // A reads the challenge, signs the nonce, and releases its join state
-		$b->tick();   // B verifies the answer and accepts A's presence
+		// Mutual auth takes two round-trips: each side answers the other's challenge, then verifies the
+		// other's answer before releasing its join state.
+		for ($round = 0; $round < 3; $round++) {
+			$a->tick();
+			$b->tick();
+		}
 
 		self::assertSame(1, $b->getPeerCount(), 'A peer that proves the secret stays linked.');
 		$presence = array_filter($spyB->received, fn ($e) => $e->getType() === TWebSocketEnvelope::PRESENCE_SET && $e->getClientId() === 'a-1');
-		self::assertCount(1, $presence, 'Once the challenge is answered, the peer\'s presence is accepted.');
+		self::assertCount(1, $presence, 'Once both sides verify each other, the peer\'s presence is accepted.');
+	}
+
+	public function testDialedPeerGetsNoStateUntilItProvesTheSecret()
+	{
+		// Mutual-auth property: a node this one dials (e.g. a poisoned gossip URI pointing at an attacker)
+		// must not learn this node's presence or advertised URI unless it answers this node's challenge.
+		[$a] = $this->makeSecretNode('A', 'clustersecret');
+		$a->setAdvertise('tcp://node-a:9');
+		$a->putPresence('a-private-client', ['node' => 'A', 'user' => 'alice']);
+
+		[$rawA, $rawEvil] = TSocketStream::pair();
+		$rawA->setBlocking(false);
+		$rawEvil->setBlocking(false);
+		$a->addPeer(new TWebSocketConnection($rawA, true), $rawA);   // A dials the (secret-less) endpoint
+
+		// The endpoint (server side of A's dial) reads whatever A sends but never answers A's challenge.
+		$evil = new TWebSocketConnection($rawEvil, false);
+		$leaked = [];
+		for ($round = 0; $round < 3; $round++) {
+			$a->tick();
+			foreach ($evil->feed($rawEvil->read(65536)) as $message) {
+				$envelope = TWebSocketEnvelope::decode($message);
+				if ($envelope !== null) {
+					$leaked[] = $envelope->getType();
+				}
+			}
+		}
+
+		self::assertContains(TWebSocketEnvelope::AUTH_CHALLENGE, $leaked, 'A challenges the peer it dialed.');
+		self::assertNotContains(TWebSocketEnvelope::PRESENCE_SET, $leaked, 'An unproven dialed peer never receives this node\'s presence.');
+		self::assertNotContains(TWebSocketEnvelope::NODE_UP, $leaked, 'An unproven dialed peer never receives this node\'s advertised URI.');
 	}
 
 	public function testChallengeRejectsAReplayedHandshakeThatCannotAnswer()

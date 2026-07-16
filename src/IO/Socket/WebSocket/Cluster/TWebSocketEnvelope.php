@@ -57,7 +57,7 @@ class TWebSocketEnvelope extends TComponent
 	/** Reserved: node failure is detected by a backplane's liveness timeout (which calls {@see IWebSocketCluster::dropNodePresence()}), not by this envelope. */
 	public const NODE_DOWN = 'node.down';
 
-	/** A mesh peer's anti-replay challenge: a fresh nonce the accepting node asks a new peer to sign. */
+	/** A mesh peer's anti-replay challenge: a fresh nonce each side of a new peer link asks the other to sign. */
 	public const AUTH_CHALLENGE = 'auth.challenge';
 
 	/** A mesh peer's answer to a challenge: the HMAC of the nonce under the shared secret. */

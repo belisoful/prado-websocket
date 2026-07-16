@@ -72,7 +72,7 @@ class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
 
 		$peer = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
-		$proof = base64_encode(hash_hmac('sha256', $key, sha1('shh'), true));
+		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
 		$server->serveOnce(0, 300000);
 
@@ -94,7 +94,7 @@ class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
 
 		$peer = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
-		$proof = base64_encode(hash_hmac('sha256', $key, sha1('shh'), true));
+		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
 		$server->serveOnce(0, 300000);
 
