@@ -32,16 +32,6 @@
 					"pradosoft/prado": "4.4.0"
 				}
 			}
-		},
-		{
-			"type": "path",
-			"url": "../prado-http2",
-			"options": {
-				"symlink": true,
-				"versions": {
-					"belisoful/prado-http2": "1.0.0"
-				}
-			}
 		}
 	],
 	"require": {
