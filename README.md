@@ -35,7 +35,7 @@ composer require belisoful/prado-http2        # then: brew install libnghttp2  (
 ## Installation
 
 ```sh
-composer require belisoful/prado-websockets
+composer require belisoful/prado-websocket
 ```
 
 ## What it provides
