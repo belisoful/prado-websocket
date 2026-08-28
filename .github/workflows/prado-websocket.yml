@@ -12,13 +12,13 @@ jobs:
 
     defaults:
       run:
-        working-directory: prado-websockets
+        working-directory: prado-websocket
 
     steps:
       - name: Checkout extension
         uses: actions/checkout@v5
         with:
-          path: prado-websockets
+          path: prado-websocket
 
       - name: Checkout PRADO framework (4.4 dev)
         uses: actions/checkout@v5
@@ -60,6 +60,9 @@ jobs:
           path: ${{ steps.composer-cache.outputs.dir }}
           key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
           restore-keys: ${{ runner.os }}-composer-
+
+      - name: Register the sibling PRADO 4.4 checkout as a Composer path repository
+        run: composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader

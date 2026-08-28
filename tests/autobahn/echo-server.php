@@ -12,7 +12,7 @@
  * Usage: AUTOBAHN_HOST=127.0.0.1 AUTOBAHN_PORT=9001 php tests/autobahn/echo-server.php
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado-websockets
+ * @link https://github.com/belisoful/prado-websocket
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 

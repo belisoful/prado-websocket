@@ -548,7 +548,7 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Indicates whether HTTP/2 is available: the optional `pradosoft/prado-http2` package is
+	 * Indicates whether HTTP/2 is available: the optional `belisoful/prado-http2` package is
 	 * installed and its `libnghttp2` library loads.  When false, the server serves HTTP/1.1 only.
 	 * @return bool Whether HTTP/2 (RFC 8441) can be served.
 	 */

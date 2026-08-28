@@ -11,7 +11,7 @@
  * Usage: php tests/autobahn/check-report.php <path-to-index.json>
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado-websockets
+ * @link https://github.com/belisoful/prado-websocket
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 $path = $argv[1] ?? '';

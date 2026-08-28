@@ -3,7 +3,7 @@
 WebSockets for the [PRADO PHP Framework](https://github.com/pradosoft/prado) (version 4.4+), implemented as a PRADO 4 extension:
 
 - **[RFC 6455](https://www.rfc-editor.org/rfc/rfc6455.html) over HTTP/1.1** — the classic `Upgrade` handshake, one WebSocket per connection. The base capability; needs only PHP and PRADO.
-- **[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) over HTTP/2** — Extended CONNECT, many WebSockets multiplexed over one connection. **Optional**: enabled only when the [`prado-http2`](https://github.com/pradosoft/prado-http2) extension and the system `libnghttp2` are present.
+- **[RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) over HTTP/2** — Extended CONNECT, many WebSockets multiplexed over one connection. **Optional**: enabled only when the [`prado-http2`](https://github.com/belisoful/prado-http2) extension and the system `libnghttp2` are present.
 - **[RFC 7692](https://www.rfc-editor.org/rfc/rfc7692.html) permessage-deflate** — negotiated per-message compression, layered on either transport. **Optional**: enabled by offering the extension; needs `ext-zlib`.
 
 A **clustering** layer (`TWebSocketModule` + pluggable backplanes) additionally lets many server processes act as one logical endpoint, so a publish or presence change on any node reaches clients on every node.

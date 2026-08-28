@@ -2,7 +2,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 /**
- * Playwright configuration for the prado-websockets browser-client tests.
+ * Playwright configuration for the prado-websocket browser-client tests.
  *
  * These specs drive a real browser `WebSocket` against the standalone
  * {@link ./tests/playwright/ws-server.php TWebSocketServer echo server}, so the

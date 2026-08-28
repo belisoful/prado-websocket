@@ -3,7 +3,7 @@
 	"type": "prado4-extension",
 	"description": "WebSocket server and client for the PRADO PHP framework: RFC 6455 over HTTP/1.1, with HTTP/2 (RFC 8441) via nghttp2.",
 	"keywords": [ "prado", "framework", "websocket", "rfc6455", "rfc8441", "http2", "nghttp2", "extension"],
-	"homepage": "https://github.com/pradosoft/prado-websockets",
+	"homepage": "https://github.com/belisoful/prado-websocket",
 	"license": "BSD-3-Clause",
 	"authors": [
 		{
@@ -22,20 +22,12 @@
 		{
 			"type": "composer",
 			"url": "https://asset-packagist.org"
-		},
-		{
-			"type": "path",
-			"url": "../prado",
-			"options": {
-				"symlink": true,
-				"versions": {
-					"pradosoft/prado": "4.4.0"
-				}
-			}
 		}
 	],
+	"prefer-stable": true,
 	"require": {
-		"php": ">=8.1.0"
+		"php": ">=8.1.0",
+		"pradosoft/prado": "^4.4@dev"
 	},
 	"suggest": {
 		"ext-openssl": "TLS with ALPN for wss:// and HTTP/2 over TLS (h2).",
@@ -47,7 +39,6 @@
 		"belisoful/prado-http2": "HTTP/2 (RFC 8441) WebSocket multiplexing; without it the server serves HTTP/1.1 only."
 	},
 	"require-dev" : {
-		"pradosoft/prado" : "^4.4",
 		"belisoful/prado-http2" : "^1.0",
 		"phpunit/phpunit" : "^10",
 		"phpdocumentor/shim": "^3",
