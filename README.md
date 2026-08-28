@@ -14,8 +14,8 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.1 or higher | required | The only hard requirement; HTTP/1.1 WebSockets need nothing more |
-| PRADO Framework `^4.4` | dev | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
+| PHP 8.1 or higher | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO |
+| PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
 | `belisoful/prado-http2` `^1.0` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2` |
