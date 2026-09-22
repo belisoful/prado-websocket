@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\TComponent;
 
 /**
@@ -96,15 +97,25 @@ class TWebSocketFrame extends TComponent
 	}
 
 	/**
-	 * Builds a Close control frame.
+	 * Builds a Close control frame.  A reason requires a code, since the code occupies the first two
+	 * payload bytes; the code must be one {@see TWebSocketCloseCode::isSendable()} permits.
 	 * @param ?int $code A {@see TWebSocketCloseCode} value, or null for an empty Close.
 	 * @param string $reason A UTF-8 reason phrase. Default ''.
+	 * @throws TInvalidDataValueException When a reason is given without a code, or the code is not sendable.
 	 * @return self The frame.
 	 */
 	public static function close(?int $code = null, string $reason = ''): self
 	{
-		$payload = $code === null ? '' : pack('n', $code) . $reason;
-		return new self(TWebSocketOpcode::Close, $payload);
+		if ($code === null) {
+			if ($reason !== '') {
+				throw new TInvalidDataValueException('websocket_close_reason_without_code');
+			}
+			return new self(TWebSocketOpcode::Close);
+		}
+		if (!TWebSocketCloseCode::isSendable($code)) {
+			throw new TInvalidDataValueException('websocket_close_code_not_sendable', $code);
+		}
+		return new self(TWebSocketOpcode::Close, pack('n', $code) . $reason);
 	}
 
 	/** @return bool Whether this is the final frame of a message. */

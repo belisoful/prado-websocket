@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -12,7 +15,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
  * Covers the RFC 6455 receive-side validations: masking, reserved bits, opcodes, fragmentation,
  * UTF-8, close-frame payloads, and the message-size limit.
  */
-class TWebSocketProtocolValidationTest extends PHPUnit\Framework\TestCase
+class TWebSocketProtocolValidationTest extends TestCase
 {
 	/** @return array{0: TWebSocketConnection, 1: TSocketStream, 2: TSocketStream} A server connection and the two pair ends. */
 	private function server(): array
@@ -149,8 +152,27 @@ class TWebSocketProtocolValidationTest extends PHPUnit\Framework\TestCase
 
 	public function testInvalidIncomingCloseCodeIsRejected()
 	{
-		$frame = TWebSocketFrame::close(TWebSocketCloseCode::NoStatusReceived);   // 1005, status-only
+		$frame = new TWebSocketFrame(TWebSocketOpcode::Close, pack('n', TWebSocketCloseCode::NoStatusReceived));   // 1005, status-only; the factory refuses it, so build the raw frame
 		$this->assertFails($this->masked($frame), TWebSocketCloseCode::ProtocolError, 'A status-only close code is a protocol error when received.');
+	}
+
+	public function testUnassignedIncomingCloseCodeIsRejected()
+	{
+		$frame = new TWebSocketFrame(TWebSocketOpcode::Close, pack('n', 1016));
+		$this->assertFails($this->masked($frame), TWebSocketCloseCode::ProtocolError, 'An unassigned close code (1016-2999) is a protocol error when received.');
+	}
+
+	public function testIanaAssignedCloseCodeIsAcceptedAndEchoed()
+	{
+		foreach ([TWebSocketCloseCode::ServiceRestart, TWebSocketCloseCode::TryAgainLater, TWebSocketCloseCode::BadGateway] as $code) {
+			[$server, $a, $b] = $this->server();
+			$server->feed($this->masked(TWebSocketFrame::close($code, 'later')));
+			self::assertTrue($server->getIsClosed(), "Close code $code is valid to receive.");
+			$echo = TWebSocketFrameCodec::decode($a);
+			self::assertSame($code, $echo->getCloseCode(), "The server echoes the received code $code.");
+			$a->close();
+			$b->close();
+		}
 	}
 
 	public function testOneByteCloseFrameIsRejected()
@@ -223,8 +245,13 @@ class TWebSocketProtocolValidationTest extends PHPUnit\Framework\TestCase
 		self::assertTrue(TWebSocketCloseCode::isValidIncoming(3000));
 		self::assertTrue(TWebSocketCloseCode::isValidIncoming(4999));
 		self::assertFalse(TWebSocketCloseCode::isValidIncoming(TWebSocketCloseCode::NoStatusReceived), '1005 is status-only.');
-		self::assertFalse(TWebSocketCloseCode::isValidIncoming(1004), '1004 is unassigned.');
+		self::assertFalse(TWebSocketCloseCode::isValidIncoming(1004), '1004 is reserved.');
 		self::assertFalse(TWebSocketCloseCode::isValidIncoming(999), 'Codes below 1000 are invalid.');
-		self::assertFalse(TWebSocketCloseCode::isValidIncoming(2999), 'The 1012-2999 range is unassigned.');
+		self::assertTrue(TWebSocketCloseCode::isValidIncoming(1012), '1012 Service Restart is IANA-assigned.');
+		self::assertTrue(TWebSocketCloseCode::isValidIncoming(1014), '1014 Bad Gateway is IANA-assigned.');
+		self::assertFalse(TWebSocketCloseCode::isValidIncoming(1015), '1015 is status-only.');
+		self::assertFalse(TWebSocketCloseCode::isValidIncoming(1016), 'The 1016-2999 range is unassigned.');
+		self::assertFalse(TWebSocketCloseCode::isValidIncoming(2999), 'The 1016-2999 range is unassigned.');
+		self::assertFalse(TWebSocketCloseCode::isValidIncoming(5000), 'Codes above 4999 are invalid.');
 	}
 }

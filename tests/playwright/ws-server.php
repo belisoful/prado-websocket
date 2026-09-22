@@ -20,7 +20,7 @@
 
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
-use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
+use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
 
 require_once __DIR__ . '/../../vendor/autoload.php';
@@ -31,12 +31,12 @@ $host = getenv('WS_HOST') ?: '127.0.0.1';
 $port = (int) (getenv('WS_PORT') ?: 8378);
 
 $handler = new TWebSocketHandler();
-$handler->attachEventHandler('onMessage', function ($connection, $message): void {
-	// Echo the frame back in the same mode it arrived in.
-	if ($connection->getLastOpcode() === TWebSocketOpcode::Binary) {
-		$connection->sendBinary($message);
+$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message): void {
+	// Echo the message back in the mode it arrived in; the event carries each message's own opcode.
+	if ($message->getIsBinary()) {
+		$connection->sendBinary($message->getPayload());
 	} else {
-		$connection->send($message);
+		$connection->send($message->getPayload());
 	}
 });
 

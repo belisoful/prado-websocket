@@ -6,6 +6,7 @@
 	"IWebSocketExtensionNegotiator": "Prado\\IO\\Socket\\WebSocket\\IWebSocketExtensionNegotiator",
 	"TWebSocketModule": "Prado\\IO\\Socket\\WebSocket\\TWebSocketModule",
 	"TWebSocketServer": "Prado\\IO\\Socket\\WebSocket\\TWebSocketServer",
+	"TWebSocketServerAction": "Prado\\IO\\Socket\\WebSocket\\TWebSocketServerAction",
 	"TWebSocketConnection": "Prado\\IO\\Socket\\WebSocket\\TWebSocketConnection",
 	"TWebSocketHandler": "Prado\\IO\\Socket\\WebSocket\\TWebSocketHandler",
 	"TWebSocketHandlerTrait": "Prado\\IO\\Socket\\WebSocket\\TWebSocketHandlerTrait",

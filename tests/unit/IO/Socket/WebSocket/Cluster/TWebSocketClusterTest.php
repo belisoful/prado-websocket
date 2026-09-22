@@ -1,10 +1,15 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
+use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\Stream\TBufferStream;
 use Prado\TComponent;
 
@@ -67,7 +72,7 @@ class SpyBackplane extends TComponent implements IWebSocketBackplane
 	}
 }
 
-class TWebSocketClusterTest extends PHPUnit\Framework\TestCase
+class TWebSocketClusterTest extends TestCase
 {
 	private SpyBackplane $spy;
 	private TWebSocketCluster $cluster;
@@ -292,5 +297,70 @@ class TWebSocketClusterTest extends PHPUnit\Framework\TestCase
 		self::assertSame(1, $stats['clusterClients']);
 		self::assertSame(['nodeA' => 1], $stats['nodes']);
 		self::assertSame(['news' => 1], $stats['channels']);
+	}
+
+	public function testBinaryPayloadsAreDeliveredAsBinaryFramesLocallyAndAcrossTheCluster()
+	{
+		[$a, $sa] = $this->makeConnection();
+		$idA = $this->cluster->register($a);
+		$this->cluster->subscribe($idA, 'blobs');
+		$bytes = "\x00\x01\xff\xfe";
+
+		$this->cluster->broadcast($bytes, true);
+		$frame = TWebSocketFrameCodec::tryDecode((string) $sa, false)['frame'] ?? null;
+		self::assertNotNull($frame);
+		self::assertSame(TWebSocketOpcode::Binary, $frame->getOpcode(), 'A binary broadcast reaches a local client as a Binary frame.');
+		self::assertSame($bytes, $frame->getPayload());
+		self::assertTrue($this->spy->published[0]->getIsBinary(), 'The envelope carries the binary flag to the other nodes.');
+		self::assertSame($bytes, TWebSocketEnvelope::decode($this->spy->published[0]->encode())->getPayload(), 'The bytes survive the wire encoding.');
+
+		$sa->reset();
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'nodeB', $bytes, 'blobs', null, [], '', true));
+		$frame = TWebSocketFrameCodec::tryDecode((string) $sa, false)['frame'] ?? null;
+		self::assertNotNull($frame);
+		self::assertSame(TWebSocketOpcode::Binary, $frame->getOpcode(), 'A binary envelope from another node is delivered as a Binary frame.');
+
+		$sa->reset();
+		$this->cluster->sendToClient($idA, 'text');
+		$frame = TWebSocketFrameCodec::tryDecode((string) $sa, false)['frame'] ?? null;
+		self::assertSame(TWebSocketOpcode::Text, $frame->getOpcode(), 'The default remains a Text frame.');
+	}
+
+	public function testGetLocalPresenceReportsOnlyThisNodesClients()
+	{
+		[$a] = $this->makeConnection();
+		$idA = $this->cluster->register($a, ['user' => 'alice']);
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'nodeB', '', null, 'nodeB-1', ['node' => 'nodeB']));
+
+		self::assertSame([$idA => ['user' => 'alice', 'node' => 'nodeA']], $this->cluster->getLocalPresence(), 'Only local clients are reported, with their node stamped.');
+		self::assertCount(2, $this->cluster->presence(), 'The full mirror still holds the remote client.');
+	}
+
+	public function testAFailingClientDoesNotAbortDeliveryToTheOthers()
+	{
+		$dead = new TWebSocketConnection(new ThrowingBufferStream(), false);
+		[$live, $sink] = $this->makeConnection();
+		$this->cluster->register($dead);
+		$liveId = $this->cluster->register($live);
+
+		$this->cluster->broadcast('hello');
+		self::assertStringContainsString('hello', (string) $sink, 'The client after the failing one is still delivered to.');
+		self::assertTrue($dead->getIsClosing(), 'The failing connection is closed so the server reaps it.');
+
+		$this->cluster->subscribe($liveId, 'news');
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'nodeB', 'remote', 'news'));
+		self::assertStringContainsString('remote', (string) $sink, 'Inbound delivery is isolated the same way.');
+	}
+
+	public function testRemotePresenceCannotOverwriteALocalClient()
+	{
+		[$a] = $this->makeConnection();
+		$idA = $this->cluster->register($a, ['user' => 'alice']);
+
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'nodeB', '', null, $idA, ['node' => 'nodeB']));
+		self::assertSame('nodeA', $this->cluster->presence()[$idA]['node'], "A remote claim on a local client's entry is ignored.");
+
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, 'nodeB', '', null, $idA));
+		self::assertArrayHasKey($idA, $this->cluster->presence(), 'A remote drop of a local client is ignored.');
 	}
 }

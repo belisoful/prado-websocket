@@ -7,7 +7,10 @@ use PhpCsFixer\Finder;
 
 $finder = PhpCsFixer\Finder::create()
 	->exclude('.git/')
+	->exclude('agents/')
+	->exclude('build/')
 	->exclude('docs/')
+	->exclude('node_modules/')
 	->exclude('tests/')
 	->exclude('vendor/')
 	->in(__DIR__);

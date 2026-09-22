@@ -1,14 +1,17 @@
-name: PRADO WebSockets Extension
+name: PRADO WebSocket Extension
 on: [push, pull_request]
+env:
+  # The PHP version used for the browser (Playwright) tests
+  PHP_VERSION: '8.4'
 jobs:
   composerext:
-    name: WebSockets
+    name: WebSocket (PHP ${{ matrix.php-versions }})
     runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
-        php-versions: ['8.1', '8.2', '8.3']
+        php-versions: ['8.1', '8.2', '8.3', '8.4', '8.5']
 
     defaults:
       run:
@@ -47,8 +50,11 @@ jobs:
       - name: Validate composer.json and composer.lock
         run: composer validate --strict
 
-      - name: Validate code syntax using php-cs-fixer
-        run: php-cs-fixer fix -vvv --dry-run --using-cache=no --format=checkstyle | cs2pr
+      - name: Validate code syntax using php-cs-fixer (src)
+        run: php-cs-fixer check src -vvv --using-cache=no --format=checkstyle | cs2pr
+
+      - name: Validate code syntax using php-cs-fixer (tests)
+        run: php-cs-fixer check tests -vvv --using-cache=no --format=checkstyle | cs2pr
 
       - name: Get composer cache directory
         id: composer-cache
@@ -58,11 +64,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: ${{ runner.os }}-composer-
+          key: ${{ runner.os }}-php${{ matrix.php-versions }}-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: ${{ runner.os }}-php${{ matrix.php-versions }}-composer-
 
-      - name: Register the sibling PRADO 4.4 checkout as a Composer path repository
-        run: composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+      - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
+        run: |
+          composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.0.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
@@ -72,3 +80,80 @@ jobs:
 
       - name: Run Unit Tests
         run: composer unittest
+
+  playwright:
+    name: WebSocket Playwright (${{ matrix.browser_name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - browser: chromium
+            browser_name: Chromium
+          - browser: firefox
+            browser_name: Firefox
+          - browser: webkit
+            browser_name: WebKit
+
+    defaults:
+      run:
+        working-directory: prado-websocket
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v5
+        with:
+          path: prado-websocket
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v5
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado
+
+      - name: Checkout Belisoful HTTP/2 extension
+        uses: actions/checkout@v5
+        with:
+          repository: belisoful/prado-http2
+          ref: main
+          path: prado-http2
+
+      - name: Install libnghttp2
+        run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: prado-websocket/.nvmrc
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Install Playwright browser (${{ matrix.browser_name }})
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
+        run: |
+          composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.0.0"}}}'
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Run Playwright browser-client tests (${{ matrix.browser_name }})
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload Playwright report (${{ matrix.browser_name }})
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: prado-websocket/build/playwright-report/
+          retention-days: 30

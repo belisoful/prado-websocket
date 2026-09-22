@@ -8,13 +8,13 @@ WebSockets for the [PRADO PHP Framework](https://github.com/pradosoft/prado) (ve
 
 A **clustering** layer (`TWebSocketModule` + pluggable backplanes) additionally lets many server processes act as one logical endpoint, so a publish or presence change on any node reaches clients on every node.
 
-The standalone `TWebSocketServer` owns its listening socket end to end, so it completes the upgrade and streams frames in its own process — and **auto-selects HTTP/1.1 or HTTP/2 per connection** by peeking the first bytes (it serves HTTP/1.1 only when HTTP/2 is unavailable). A typical web SAPI (PHP-FPM, mod_php) cannot do WebSockets: the web server owns the socket and FastCGI cannot hand it to PHP. Run this as a long-lived server process instead.
+The standalone `TWebSocketServer` owns its listening socket end to end, so it completes the upgrade and streams frames in its own process — and **auto-selects HTTP/1.1 or HTTP/2 per connection** from its first bytes (it serves HTTP/1.1 only when HTTP/2 is unavailable). Accepted connections stay non-blocking through the handshake, so a silent or slow client never stalls the loop. A typical web SAPI (PHP-FPM, mod_php) cannot do WebSockets: the web server owns the socket and FastCGI cannot hand it to PHP. Run this as a long-lived server process instead.
 
 ## Requirements
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.1 or higher | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO |
+| PHP 8.1 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.1 through 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
 | `belisoful/prado-http2` `^1.0` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
@@ -46,7 +46,7 @@ composer require belisoful/prado-websocket
 | `TWebSocketFrameCodec` | The wire codec: `encode()`, blocking `decode()` (from a stream), and non-blocking `tryDecode()` (from a buffer), with masking |
 | `TWebSocketOpcode` / `TWebSocketCloseCode` | Opcode and close-code enumerations, with `isControl()` / `isSendable()` |
 | `TWebSocketHandshake` | The HTTP/1.1 opening handshake: accept-key computation, request/response building, and end-to-end stream drivers (`acceptConnection()`, `openConnection()`) |
-| `TWebSocketConnection` | A connection: `send()`/`sendBinary()`/`ping()`/`pong()`/`close()`, blocking `receive()`/`receiveFrame()`, non-blocking `feed()`, and `onPing`/`onPong`/`onClose` events |
+| `TWebSocketConnection` | A connection: `send()`/`sendBinary()`/`ping()`/`pong()`/`close()`, blocking `receive()`/`receiveMessage()`/`receiveFrame()`, non-blocking `feed()`, and `onPing`/`onPong`/`onClose` events |
 | `TWebSocketMessage` | The `Stringable` message model (opcode + payload), with `getIsText()`/`getIsBinary()` |
 | `TWebSocketException` | A protocol/handshake failure carrying a `CloseCode`; extends `TIOException` |
 | `IWebSocketExtension` / `IWebSocketExtensionNegotiator` | The RFC 6455 extension seam: an extension transforms message payloads on the wire; its negotiator agrees terms during the handshake |
@@ -58,7 +58,8 @@ composer require belisoful/prado-websocket
 | `IWebSocketHandler` | The connection/message contract the server dispatches through (`onOpen`/`onMessage`/`onClose`/`onError`) |
 | `TWebSocketHandler` | The standalone handler: a `TComponent` raising the lifecycle events, used by `TWebSocketServer` |
 | `Prado\Web\Services\TWebSocketService` | A `TService` adapting the `IWebSocketHandler` role to a SAPI upgrade request in the PRADO service pipeline |
-| `TWebSocketModule` | The cluster module, making the server one node of a cluster over an `IWebSocketBackplane` (the `websocket_*` error codes and Prado3 class names are registered by Composer from `extra.prado`) |
+| `TWebSocketModule` | The server module (a PRADO `TSocketServerModule`): `prado-cli websocket/serve` runs a configured `TWebSocketServer`, and the module makes it one node of a cluster over an `IWebSocketBackplane` (the `websocket_*` error codes and Prado3 class names are registered by Composer from `extra.prado`) |
+| `TWebSocketServerAction` | The `websocket/serve` shell action the module registers |
 | `TWebSocketCluster` | The cluster coordinator: `subscribe()`/`publish()`/`broadcast()`/`sendToClient()`/`presence()` fanning across nodes |
 | `IWebSocketBackplane` | The transport seam a cluster relays through; `TWebSocketEnvelope` is its unit of exchange |
 | `TNullBackplane` | Single-node no-op backplane (the default) |
@@ -71,7 +72,7 @@ composer require belisoful/prado-websocket
 ```
    TWebSocketModule / TWebSocketCluster ──► IWebSocketBackplane  (Null / File / Redis / Mesh)
                                 │                    (fan a publish/presence across nodes)
-                         TWebSocketServer  (select() event loop; peeks preface, auto-selects)
+                         TWebSocketServer  (TSocketReactor event loop; non-blocking handshake, auto-selects)
                                 │
               ┌─────────────────┴─────────────────┐
    THttp1WebSocketProtocol               THttp2WebSocketProtocol  ──► prado-http2 (TH2Session)
@@ -90,7 +91,7 @@ The layers stack cleanly:
 
 - **Frames** — `TWebSocketFrame` + `TWebSocketFrameCodec` are the RFC 6455 model and wire format (FIN/RSV/opcode, 7/16/64-bit lengths, client masking). `decode()` reads one frame from a stream (blocking); `tryDecode()` parses one frame from an in-memory buffer (non-blocking, returns `null` until a full frame is present).
 - **Connection** — `TWebSocketConnection` reassembles fragments, auto-answers Pings, and completes the close handshake. It offers a **blocking** path (`receive()` for the next message) and a **non-blocking** path (`feed()` takes the bytes just read and returns the complete messages) for an event loop.
-- **Protocol stacks** — `IWebSocketProtocol` is the seam. HTTP/1.1 yields one connection per socket; HTTP/2 multiplexes many over one. The server picks the stack by peeking the connection's first bytes (the HTTP/2 preface starts with `PRI `).
+- **Protocol stacks** — `IWebSocketProtocol` is the seam. HTTP/1.1 yields one connection per socket; HTTP/2 multiplexes many over one. The server picks the stack from the connection's first bytes (the HTTP/2 preface starts with `PRI `), gathered without blocking.
 - **Server & handler** — `TWebSocketServer` owns the socket and pumps connections, dispatching through an `IWebSocketHandler` that raises lifecycle events with the connection as sender. `TWebSocketHandler` is the standalone handler (a `TComponent`); `TWebSocketService` is a `TService` implementing the same role for web-app request routing.
 
 ## Usage
@@ -106,17 +107,40 @@ $handler->attachEventHandler('onOpen', function ($connection) {
     // a client connected (over HTTP/1.1 or an HTTP/2 stream)
 });
 $handler->attachEventHandler('onMessage', function ($connection, $message) {
-    $connection->send("echo: $message");          // reply on the same connection
+    // $message is a TWebSocketMessage: getPayload(), getOpcode(), getIsText()/getIsBinary(); it stringifies to the payload
+    $message->getIsBinary()
+        ? $connection->sendBinary($message->getPayload())
+        : $connection->send("echo: $message");    // reply on the same connection
 });
 $handler->attachEventHandler('onClose', function ($connection) { /* gone */ });
 $handler->attachEventHandler('onError', function ($connection, $error) { /* protocol error */ });
 
 $server = TWebSocketServer::bind('tcp://0.0.0.0:8080');
 $server->setHandler($handler);                    // required (HTTP/2 dispatches through it)
-$server->serve();                                 // select()-driven loop; one process, many clients
+$server->serve();                                 // TSocketReactor-driven loop; one process, many clients
 ```
 
-On each accepted connection the server peeks the first bytes: the HTTP/2 preface starts an HTTP/2 session (one socket, many multiplexed WebSockets); otherwise the RFC 6455 upgrade handshake runs. Either way, complete messages dispatch to the handler, and `onConnection` is raised on the server per ready `TWebSocketConnection`.
+The loop is PRADO's `TSocketReactor`: the listener, every connection and the cluster backplane's sockets are multiplexed through one `select()`, transports are watched for writes only while output is queued, and the handshake, close and idle deadlines run as reactor timers. Pass your own reactor with `setReactor()` to run other sources in the same loop; `serveOnce()` runs one tick for tests.
+
+### As a daemon from prado-cli
+
+`TWebSocketModule` is a PRADO `TSocketServerModule`: configure it in the application and run it with the shell:
+
+```xml
+<modules>
+    <module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule"
+        Address="0.0.0.0" Port="8080" HandlerClass="Application\Chat\ChatHandler"
+        Subprotocols="chat" IdleTimeout="60" PermessageDeflate="true" />
+</modules>
+```
+
+```sh
+php protected/prado-cli.php websocket/serve            # or: --port 9000 --address 127.0.0.1
+```
+
+The module binds `Endpoint` (or `Scheme`/`Address`/`Port`; `tls://` with `SocketOptions` for the certificate), creates the `HandlerClass` handler (a `TWebSocketHandler` by default) and re-raises its `onOpen`/`onMessage`/`onClose`/`onError` as module events, applies `Subprotocols`, `Origins`, `AllowedHosts`, `PermessageDeflate` and the limits (`MaxMessageSize`, `HandshakeTimeout`, `IdleTimeout`, `CloseTimeout`, `MaxConnections`), and serves until SIGTERM or CTRL-C. Running it is gated by PRADO's `socket_server` permission.
+
+Each accepted connection stays non-blocking while its opening bytes arrive: the HTTP/2 preface starts an HTTP/2 session (one socket, many multiplexed WebSockets); otherwise the RFC 6455 upgrade handshake runs. A connection that has not completed its handshake within `HandshakeTimeout` is dropped, and the loop's wait is bounded by the nearest handshake deadline, idle scan, or cluster tick, so idle reaping runs on a quiet server too. Either way, complete messages dispatch to the handler, and `onConnection` is raised on the server per ready `TWebSocketConnection`.
 
 ### As a PRADO service (web app routing)
 
@@ -131,6 +155,8 @@ On each accepted connection the server peeks the first bytes: the HTTP/2 preface
     <service id="websocket" class="Prado\Web\Services\TWebSocketService" />
 </services>
 ```
+
+A web SAPI (PHP-FPM, mod_php) cannot hand its socket to PHP, so the service cannot complete an upgrade there: it validates the request and answers 400 (not an upgrade), 426 with `Sec-WebSocket-Version: 13` (wrong version), or 501 (a valid upgrade the SAPI cannot serve), so a client gets a definite refusal instead of an empty 200. Serve WebSockets with the standalone `TWebSocketServer`; the service runs a connection only when one is injected with `setConnection()` (a bridge or a test).
 
 ### Client connection
 
@@ -170,9 +196,11 @@ use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 $server->setExtensions([new TPermessageDeflateNegotiator()]);   // offer RFC 7692 permessage-deflate
 ```
 
+Negotiation runs on every accept path: the `serveOnce()` loop, the synchronous `serveConnection()`, and HTTP/2 streams. The protocol stacks carry the same settings themselves (`THttp1WebSocketProtocol` and `THttp2WebSocketProtocol` have `Subprotocols`/`Extensions` properties, and the HTTP/1.1 stack a `HandshakeTimeout`), and a protocol's `serve()` callback receives `(StreamInterface $stream, array $handshake)` with the negotiated `subprotocol` and `extensions`. Header fields split across lines (RFC 7230) are combined before negotiation. Close codes 1000–1003, 1007–1014 and 3000–4999 are valid to send and receive.
+
 ## Compression (RFC 7692 permessage-deflate)
 
-`TPermessageDeflateExtension` compresses message payloads with DEFLATE when both peers negotiate it; it is transparent to `onMessage`/`receive()`. Enable it by offering `TPermessageDeflateNegotiator` (above); the negotiator's constructor tunes the context-takeover and window-bits parameters, and inflation is **bounded** (chunked, output-capped) so a compression-bomb frame cannot exhaust memory. It needs `ext-zlib`.
+`TPermessageDeflateExtension` compresses message payloads with DEFLATE when both peers negotiate it; it is transparent to `onMessage`/`receive()`. Enable it by offering `TPermessageDeflateNegotiator` (above); the negotiator's constructor tunes the context-takeover and window-bits parameters, and inflation is **bounded**: each inflate step is sized against the remaining output budget, so a compression-bomb frame cannot materialize more than about 1 KiB beyond `MaxMessageSize`. A truncated compressed message closes with 1007. Offers and responses are checked per RFC 7692 §7.1: a malformed or duplicated parameter declines the offer (falling through to the client's next one), and a client is bound by the parameters it offered even when the server omits them. It needs `ext-zlib`.
 
 ## Hardening and limits
 
@@ -181,17 +209,19 @@ $server->setExtensions([new TPermessageDeflateNegotiator()]);   // offer RFC 769
 | Property | Default | Effect |
 |---|---|---|
 | `setMaxMessageSize($bytes)` | 10 MiB | Caps an inbound frame/message; a larger one is rejected (`MessageTooBig`) before buffering |
-| `setHandshakeTimeout($seconds)` | 10.0 | Deadline for the opening handshake; a slow client is dropped |
-| `setIdleTimeout($seconds)` | 0 (off) | Pings, then reaps, a connection idle this long |
-| `setMaxConnections($n)` | 0 (unlimited) | Concurrent-session cap; a further connection is accepted and shed with 503 |
+| `setHandshakeTimeout($seconds)` | 10.0 | Deadline for the opening handshake; a silent or dribbling client is dropped without ever blocking the loop |
+| `setIdleTimeout($seconds)` | 0 (off) | Pings, then reaps, a connection idle this long; runs on a quiet server too |
+| `setCloseTimeout($seconds)` | 5.0 | After the server sends Close, how long it waits for the peer's Close before ending the session; the queued Close is drained first |
+| `setMaxConnections($n)` | 0 (unlimited) | Bounds the load: every transport the server holds (sessions, pending handshakes, endpoint links, app-held connections) plus HTTP/2 streams; a further connection is accepted and shed with 503 |
+| `setReactor($reactor)` | own | The `TSocketReactor` the loop runs on; supply one to multiplex other sources or timers with the server |
 | `setOrigins([...])` | `[]` (any) | Allowed `Origin` values; a disallowed origin is refused with 403 before upgrading |
 | `setAllowedHosts([...])` | `[]` (any) | Allowed `Host` values; a disallowed host is refused with 400 |
 
-These apply on both the HTTP/1.1 and HTTP/2 paths.
+These apply on both the HTTP/1.1 and HTTP/2 paths. Binding `tls://host:port` (with `ssl` context options for the certificate) runs each accepted socket's TLS handshake without blocking, under the handshake deadline; an ALPN `h2` selects HTTP/2 without a preface. Every refused upgrade, shed connection, deadline, idle reap and swallowed handler error is logged through `Prado::log()` under the server's class.
 
 ## Clustering (multi-node)
 
-Several server processes act as one logical endpoint by relaying through an `IWebSocketBackplane`, so `publish()`/`broadcast()`/`sendToClient()` and presence on any node reach clients on every node. Configure `TWebSocketModule` with a `<backplane>` child; without one it runs a single node on `TNullBackplane`.
+Several server processes (each a `websocket/serve` daemon, or a `TWebSocketServer` handed the module's cluster with `prepareServer()`) act as one logical endpoint by relaying through an `IWebSocketBackplane`, so `publish()`/`broadcast()`/`sendToClient()` and presence on any node reach clients on every node. Each takes an optional `$binary` flag to deliver a Binary frame; any byte string crosses every backplane intact. A client whose send fails is closed and logged, and never blocks delivery to the others. Configure `TWebSocketModule` with a `<backplane>` child; without one it runs a single node on `TNullBackplane`.
 
 ```xml
 <modules>
@@ -207,13 +237,13 @@ Several server processes act as one logical endpoint by relaying through an `IWe
 Backplane choices:
 
 - **`TNullBackplane`** — single node, no relay (the default).
-- **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it or it is a symlink.
-- **`TRedisBackplane`** — Redis pub/sub + a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`); the driver for multi-host scaling. Needs `ext-redis`.
-- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving a shared `Secret` — a handshake HMAC plus a *mutual* post-upgrade nonce challenge, so each side proves the secret to the other and shows no state until it has; set it and prefer a `tls://` transport on any untrusted network.
+- **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it, any other user can access it, or it is a symlink. A crashed node's presence files go stale after `PresenceTtl` and its clients are dropped on every node.
+- **`TRedisBackplane`** — per-node inbox lists plus a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`/`InboxLimit`); the driver for multi-host scaling. Needs `ext-redis`. Redis pub/sub is not used (phpredis subscribe blocks); a node polls its inbox each tick. A dropped connection is retried every 5 s, and a reconnect re-declares the node's channel interest and presence from local state; a node that restarts under the same `NodeId` purges its previous incarnation's leftovers.
+- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. A relay through a third node that holds the secret is not prevented, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL.
 
 ## HTTP/2 multiplexing (RFC 8441)
 
-HTTP/2 is an optional capability, active only when the `prado-http2` package and `libnghttp2` are installed (see Requirements). When present, the server peeks the HTTP/2 connection preface on accept and runs an HTTP/2 session; when absent, `isHttp2Available()` is false and HTTP/2 connections are declined.
+HTTP/2 is an optional capability, active only when the `prado-http2` package and `libnghttp2` are installed (see Requirements). When present, the server recognizes the HTTP/2 connection preface in a connection's first bytes and runs an HTTP/2 session; when absent, `isHttp2Available()` is false and HTTP/2 connections are declined.
 
 Over HTTP/2, each WebSocket is an Extended CONNECT (`:method` CONNECT, `:protocol` websocket) on its own stream, and RFC 6455 frames flow as that stream's DATA. The HTTP/2 framing, HPACK, and per-stream flow control are handled by `libnghttp2` through the `prado-http2` extension; `THttp2WebSocketProtocol` bridges each stream to a `TWebSocketConnection` via the non-blocking `feed()` path, so many WebSockets share one socket. The server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accepts a CONNECT with `:status` 200.
 
@@ -229,10 +259,15 @@ The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazil
 
 ```sh
 composer install
-vendor/bin/phpunit --testsuite unit                  # tests
-vendor/bin/php-cs-fixer fix --dry-run src/           # code style
-vendor/bin/phpstan analyse src/ --memory-limit=512M  # static analysis
+composer unittest        # phpunit --testsuite unit
+composer fix             # php-cs-fixer on src/ and tests/
+composer stan            # phpstan (level 3, PHP 8.1 – 8.5)
+composer fulltest        # fix, stan, unittest in order
+composer coverage        # unit tests with a text coverage summary (needs Xdebug)
+composer coverage-html   # HTML coverage report in build/coverage
 ```
+
+Unit tests live under `tests/unit/` in the `Prado\Test\Unit\` namespace (Composer `autoload-dev`), mirroring the directory. CI runs the suite against the PRADO 4.4 development branch and the `prado-http2` main branch on PHP 8.1, 8.2, 8.3, 8.4, and 8.5; the Autobahn|TestSuite server-compliance run and the three Playwright browser jobs run on PHP 8.4.
 
 Tests cover the codec (round-trips, masking, fragmentation, control-frame rules), the handshake (RFC 6455 accept-key vector), the connection (blocking and `feed()` paths over socket pairs), the server (HTTP/1.1 over a real socket and HTTP/2 auto-selection), and the RFC 8441 round-trip end to end. HTTP/2 tests skip cleanly where `libnghttp2` is absent.
 

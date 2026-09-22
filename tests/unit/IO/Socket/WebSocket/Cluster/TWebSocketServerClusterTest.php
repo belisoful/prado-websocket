@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
@@ -8,6 +11,8 @@ use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
+use Prado\Prado;
+use Prado\Util\Log\TLogger;
 
 /** A backplane that counts how often the serve loop pumps it. */
 class CountingBackplane extends TNullBackplane
@@ -20,8 +25,57 @@ class CountingBackplane extends TNullBackplane
 	}
 }
 
-class TWebSocketServerClusterTest extends PHPUnit\Framework\TestCase
+/** A backplane whose presence drop fails, as a backplane whose store is down would. */
+class FailingDropBackplane extends TNullBackplane
 {
+	public int $drops = 0;
+
+	public function dropPresence(string $clientId): void
+	{
+		$this->drops++;
+		throw new \RuntimeException('backplane store is down');
+	}
+}
+
+class TWebSocketServerClusterTest extends TestCase
+{
+	public function testAThrowingBackplaneUnregisterDoesNotEscapeServeOnce()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$backplane = new FailingDropBackplane();
+		$cluster = new TWebSocketCluster('s1', $backplane);
+		$server->setCluster($cluster);
+		$closed = 0;
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onClose', function () use (&$closed): void {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		Prado::getLogger()->deleteLogs(null, TWebSocketServer::class);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
+		$server->serveOnce(0, 300000);
+		self::assertCount(1, $cluster->presence());
+		self::assertStringContainsString('101', $client->read(4096));
+
+		(new TWebSocketConnection($client, true))->close(1000);
+		$server->serveOnce(0, 300000);   // the unregister throws inside the backplane; the loop must survive it
+
+		self::assertSame(1, $backplane->drops, 'The backplane was asked to drop the presence.');
+		self::assertSame(1, $closed, 'The handler close ran.');
+		self::assertCount(0, $cluster->presence(), 'The local presence is gone although the backplane failed.');
+		self::assertSame(0, $server->getConnectionCount(), 'The transport is closed although the backplane failed.');
+		$client->read(16);   // the echoed Close
+		self::assertSame('', $client->read(16), 'The peer sees end of stream.');
+		$logs = Prado::getLogger()->getLogs(TLogger::WARNING, TWebSocketServer::class);
+		self::assertNotEmpty($logs, 'The swallowed backplane fault is logged.');
+		self::assertStringContainsString('backplane store is down', $logs[0][TLogger::LOG_MESSAGE]);
+		$server->serveOnce(0, 20000);   // the loop keeps serving
+		$client->close();
+		$server->close();
+	}
+
 	public function testClusterIsSettable()
 	{
 		$server = new TWebSocketServer();

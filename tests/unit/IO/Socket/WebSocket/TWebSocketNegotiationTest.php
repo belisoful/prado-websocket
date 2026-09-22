@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketExtension;
 use Prado\IO\Socket\WebSocket\IWebSocketExtensionNegotiator;
@@ -10,7 +13,7 @@ use Prado\IO\TStream;
 /**
  * Covers the handshake strictness (GET/Host/version) and subprotocol negotiation.
  */
-class TWebSocketNegotiationTest extends PHPUnit\Framework\TestCase
+class TWebSocketNegotiationTest extends TestCase
 {
 	private const KEY = 'dGhlIHNhbXBsZSBub25jZQ==';
 
@@ -176,6 +179,39 @@ class TWebSocketNegotiationTest extends PHPUnit\Framework\TestCase
 		self::assertStringNotContainsString('Sec-WebSocket-Protocol:', $response);
 	}
 
+	/** Inserts an extra header line before the blank line, so a field repeats. */
+	private function withExtraLine(string $request, string $line): string
+	{
+		return substr($request, 0, -2) . $line . "\r\n\r\n";
+	}
+
+	public function testSubprotocolOfferSplitAcrossHeaderLinesIsNegotiated()
+	{
+		$request = $this->withExtraLine($this->request(['Sec-WebSocket-Protocol' => 'chat']), 'Sec-WebSocket-Protocol: superchat');
+		[$result, $error, $response] = $this->accept($request, ['subprotocols' => ['superchat']]);
+		self::assertNull($error);
+		self::assertSame('superchat', $result['subprotocol'], 'A subprotocol offered on a second header line is seen (RFC 6455 §11.3.4).');
+		self::assertStringContainsString('Sec-WebSocket-Protocol: superchat', $response);
+	}
+
+	public function testConnectionUpgradeOnASecondHeaderLineIsAccepted()
+	{
+		$request = $this->withExtraLine($this->request(['Connection' => 'keep-alive']), 'Connection: Upgrade');
+		[, $error, $response] = $this->accept($request);
+		self::assertNull($error, 'Connection: Upgrade on its own line completes the upgrade request.');
+		self::assertStringContainsString('101 Switching Protocols', $response);
+	}
+
+	public function testExtensionOfferSplitAcrossHeaderLinesIsNegotiated()
+	{
+		$request = $this->withExtraLine($this->request(['Sec-WebSocket-Extensions' => 'x-other']), 'Sec-WebSocket-Extensions: x-key; key=7');
+		[$result, $error, $response] = $this->accept($request, ['extensions' => [new KeyNegotiator()]]);
+		self::assertNull($error);
+		self::assertCount(1, $result['extensions']);
+		self::assertSame(7, $result['extensions'][0]->getKey(), 'An extension offered on a second header line is negotiated.');
+		self::assertStringContainsString('Sec-WebSocket-Extensions: x-key; key=7', $response);
+	}
+
 	public function testClientWritesSubprotocolOffer()
 	{
 		// openConnection writes the request, then blocks reading the response; capture just the
@@ -288,6 +324,37 @@ class TWebSocketNegotiationTest extends PHPUnit\Framework\TestCase
 	{
 		$offers = TWebSocketHandshake::parseExtensionHeader('x-key; key=1, x-key; key=2');
 		self::assertSame(['1', '2'], [$offers[0]['params']['key'], $offers[1]['params']['key']]);
+		self::assertSame([], $offers[0]['duplicates'], 'Distinct offers are not duplicates of each other.');
+	}
+
+	public function testParseExtensionHeaderReportsDuplicateParameters()
+	{
+		$offers = TWebSocketHandshake::parseExtensionHeader('x-key; key=1; Key=2; flag; flag, x-other; a=1');
+		self::assertSame(['key', 'flag'], $offers[0]['duplicates'], 'Each repeated parameter is listed once, case-insensitively.');
+		self::assertSame('2', $offers[0]['params']['key'], 'The map keeps the last value.');
+		self::assertSame([], $offers[1]['duplicates']);
+	}
+
+	public function testNegotiateExtensionsDeclinesAnOfferWithDuplicateParametersAndTakesTheNext()
+	{
+		$headers = ['sec-websocket-extensions' => 'x-key; key=1; key=2, x-key; key=3'];
+		$result = TWebSocketHandshake::negotiateExtensions($headers, [new KeyNegotiator()]);
+		self::assertCount(1, $result['extensions']);
+		self::assertSame(3, $result['extensions'][0]->getKey(), 'The offer repeating a parameter is declined; the next offer is taken.');
+
+		$only = TWebSocketHandshake::negotiateExtensions(['sec-websocket-extensions' => 'x-key; key=1; key=2'], [new KeyNegotiator()]);
+		self::assertSame([], $only['extensions'], 'With no other offer the extension is not negotiated.');
+		self::assertSame('', $only['header']);
+	}
+
+	public function testResolveExtensionsRejectsDuplicateParameters()
+	{
+		try {
+			TWebSocketHandshake::resolveExtensions(['sec-websocket-extensions' => 'x-key; key=5; key=5'], [new KeyNegotiator()]);
+			self::fail('A response repeating a parameter fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_unacceptable', $e->getErrorCode());
+		}
 	}
 
 	public function testFormatExtension()

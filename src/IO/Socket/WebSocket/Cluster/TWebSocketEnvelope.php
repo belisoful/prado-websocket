@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\TComponent;
 
 /**
@@ -31,6 +32,10 @@ use Prado\TComponent;
  *
  * Each envelope carries OriginNode and a unique {@see getId() Id} so a coordinator drops its own
  * echo and a mesh backplane can suppress duplicate relays.
+ *
+ * The wire form is JSON.  A payload that is not valid UTF-8, or one flagged {@see getIsBinary()
+ * binary} (to reach clients as a Binary frame), travels base64-encoded, so any byte string crosses
+ * every backplane intact.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
@@ -60,7 +65,7 @@ class TWebSocketEnvelope extends TComponent
 	/** A mesh peer's anti-replay challenge: a fresh nonce each side of a new peer link asks the other to sign. */
 	public const AUTH_CHALLENGE = 'auth.challenge';
 
-	/** A mesh peer's answer to a challenge: the HMAC of the nonce under the shared secret. */
+	/** A mesh peer's answer to a challenge: the HMAC of the nonce and the answering node's id under the shared secret. */
 	public const AUTH_RESPONSE = 'auth.response';
 
 	/** @var string The routing type, one of the class constants. */
@@ -84,6 +89,9 @@ class TWebSocketEnvelope extends TComponent
 	/** @var string A unique id for echo and duplicate suppression. */
 	private string $_id;
 
+	/** @var bool Whether the payload is binary, delivered to clients as a Binary frame. */
+	private bool $_binary;
+
 	/**
 	 * @param string $type The routing type, one of the class constants.
 	 * @param string $originNode The originating node id.
@@ -92,9 +100,11 @@ class TWebSocketEnvelope extends TComponent
 	 * @param ?string $clientId The target/subject client id.
 	 * @param array<string, mixed> $meta Out-of-band attributes.
 	 * @param string $id A unique id; an empty value is replaced with a generated one.
+	 * @param bool $binary Whether the payload is binary (delivered as a Binary frame) rather than text.
 	 */
-	public function __construct(string $type, string $originNode, string $payload = '', ?string $channel = null, ?string $clientId = null, array $meta = [], string $id = '')
+	public function __construct(string $type, string $originNode, string $payload = '', ?string $channel = null, ?string $clientId = null, array $meta = [], string $id = '', bool $binary = false)
 	{
+		$this->_binary = $binary;
 		$this->_type = $type;
 		$this->_originNode = $originNode;
 		$this->_payload = $payload;
@@ -169,12 +179,24 @@ class TWebSocketEnvelope extends TComponent
 	}
 
 	/**
-	 * Serializes the envelope to a JSON string for transport.
+	 * Indicates whether the payload is binary, to be delivered to clients as a Binary frame.
+	 * @return bool Whether the payload is binary.
+	 */
+	public function getIsBinary(): bool
+	{
+		return $this->_binary;
+	}
+
+	/**
+	 * Serializes the envelope to a JSON string for transport.  A binary or non-UTF-8 payload is
+	 * base64-encoded (`e`), and a binary one is flagged (`b`); metadata that is not valid UTF-8 has
+	 * the offending bytes substituted.
+	 * @throws TWebSocketException When the envelope cannot be encoded (e.g. a non-finite float in the metadata).
 	 * @return string The encoded envelope.
 	 */
 	public function encode(): string
 	{
-		return json_encode([
+		$data = [
 			't' => $this->_type,
 			'o' => $this->_originNode,
 			'p' => $this->_payload,
@@ -182,7 +204,19 @@ class TWebSocketEnvelope extends TComponent
 			'k' => $this->_clientId,
 			'm' => $this->_meta,
 			'i' => $this->_id,
-		], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		];
+		if ($this->_binary || preg_match('//u', $this->_payload) !== 1) {
+			$data['p'] = base64_encode($this->_payload);
+			$data['e'] = 1;
+		}
+		if ($this->_binary) {
+			$data['b'] = 1;
+		}
+		$json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+		if ($json === false) {
+			throw new TWebSocketException('websocket_envelope_unencodable', json_last_error_msg());
+		}
+		return $json;
 	}
 
 	/**
@@ -196,19 +230,27 @@ class TWebSocketEnvelope extends TComponent
 		if (!is_array($data) || !isset($data['t'], $data['o']) || !is_scalar($data['t']) || !is_scalar($data['o'])) {
 			return null;
 		}
-		foreach (['p', 'c', 'k', 'i'] as $field) {
+		foreach (['p', 'c', 'k', 'i', 'e', 'b'] as $field) {
 			if (isset($data[$field]) && !is_scalar($data[$field])) {
 				return null;   // a non-scalar field would fatal on the string cast; reject the forged envelope instead
+			}
+		}
+		$payload = (string) ($data['p'] ?? '');
+		if (!empty($data['e'])) {
+			$payload = base64_decode($payload, true);
+			if ($payload === false) {
+				return null;   // flagged as base64 but not base64: a forged or corrupted envelope
 			}
 		}
 		return new self(
 			(string) $data['t'],
 			(string) $data['o'],
-			(string) ($data['p'] ?? ''),
+			$payload,
 			isset($data['c']) ? (string) $data['c'] : null,
 			isset($data['k']) ? (string) $data['k'] : null,
 			is_array($data['m'] ?? null) ? $data['m'] : [],
 			(string) ($data['i'] ?? ''),
+			!empty($data['b']),
 		);
 	}
 }

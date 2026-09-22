@@ -1,19 +1,28 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Http2\TH2Session;
+use Prado\IO\Http2\TH2Stream;
 use Prado\IO\Http2\TNgHttp2;
+use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\THttp2WebSocketProtocol;
+use Prado\IO\Socket\WebSocket\TPermessageDeflateExtension;
+use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
+use Psr\Http\Message\StreamInterface;
 
 /**
  * Drives the RFC 8441 WebSocket-over-HTTP/2 adapter against a raw client {@see TH2Session}
  * in-process: a client Extended CONNECT carries RFC 6455 frames as HTTP/2 DATA, the handler
  * echoes, and the echo decodes client-side. Skipped when libnghttp2 is unavailable.
  */
-class THttp2WebSocketProtocolTest extends PHPUnit\Framework\TestCase
+class THttp2WebSocketProtocolTest extends TestCase
 {
 	protected function setUp(): void
 	{
@@ -62,7 +71,7 @@ class THttp2WebSocketProtocolTest extends PHPUnit\Framework\TestCase
 
 		self::assertSame(1, $opened, 'The WebSocket opened over HTTP/2.');
 		self::assertSame('200', $status, 'The Extended CONNECT was accepted with 200.');
-		self::assertSame(['hi'], $received);
+		self::assertSame(['hi'], array_map('strval', $received), 'The handler raises each message as a TWebSocketMessage.');
 
 		$echo = $clientWs->feed($stream->getContents());     // decode the server's echo frame
 		self::assertSame(['echo:hi'], $echo);
@@ -200,6 +209,163 @@ class THttp2WebSocketProtocolTest extends PHPUnit\Framework\TestCase
 
 		$protocol->getSession()->close();
 		$client->close();
+	}
+
+	/**
+	 * Submits an Extended CONNECT with the given request headers against a configured protocol and
+	 * returns [opened-count, response headers, protocol].
+	 * @param THttp2WebSocketProtocol $protocol
+	 * @param array $headers
+	 */
+	private function connectWith(THttp2WebSocketProtocol $protocol, array $headers): array
+	{
+		$opened = 0;
+		$protocol->getSession();   // the protocol is live
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->request($headers);
+		$response = null;
+		$client->attachEventHandler('onResponse', function ($session, $s) use (&$response) {
+			$response = $s->getHeaders();
+		});
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+		$client->close();
+		return [count($protocol->getConnections()), $response];
+	}
+
+	/** @return array<string, string> The RFC 8441 Extended CONNECT headers; the pseudo-headers stay first, as HTTP/2 requires. */
+	private function connectHeaders(array $extra = []): array
+	{
+		return array_merge([
+			':method' => 'CONNECT',
+			':protocol' => 'websocket',
+			':scheme' => 'https',
+			':path' => '/chat',
+			':authority' => 'example.com',
+			'sec-websocket-version' => '13',
+		], $extra);
+	}
+
+	public function testSubprotocolAndExtensionsAreNegotiatedOverHttp2()
+	{
+		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+		$protocol->setSubprotocols(['superchat', 'chat']);
+		$protocol->setExtensions([new TPermessageDeflateNegotiator()]);
+		[$opened, $response] = $this->connectWith($protocol, $this->connectHeaders([
+			'sec-websocket-protocol' => 'chat, superchat',
+			'sec-websocket-extensions' => 'permessage-deflate; server_max_window_bits=10',
+		]));
+		self::assertSame(1, $opened);
+		self::assertSame('200', $response[':status']);
+		self::assertSame('superchat', $response['sec-websocket-protocol'], 'The selected subprotocol is echoed.');
+		self::assertSame('permessage-deflate; server_max_window_bits=10', $response['sec-websocket-extensions'], 'The agreed extension parameters are echoed.');
+		$connection = $protocol->getConnections()[0];
+		self::assertSame('superchat', $connection->getSubprotocol(), 'The per-stream connection carries the subprotocol.');
+		self::assertCount(1, $connection->getExtensions());
+		self::assertInstanceOf(TPermessageDeflateExtension::class, $connection->getExtensions()[0]);
+		self::assertSame(10, $connection->getExtensions()[0]->getDeflateWindowBits());
+		$protocol->getSession()->close();
+	}
+
+	public function testNothingIsNegotiatedWithoutPolicy()
+	{
+		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+		[$opened, $response] = $this->connectWith($protocol, $this->connectHeaders(['sec-websocket-protocol' => 'chat, superchat', 'sec-websocket-extensions' => 'permessage-deflate; client_max_window_bits']));
+		self::assertSame(1, $opened);
+		// The client stream merges response headers over its request headers, so an echo would replace the offered list with one token.
+		self::assertSame('chat, superchat', $response['sec-websocket-protocol'], 'No subprotocol is echoed.');
+		self::assertSame('permessage-deflate; client_max_window_bits', $response['sec-websocket-extensions'], 'No extension is echoed.');
+		self::assertNull($protocol->getConnections()[0]->getSubprotocol());
+		self::assertSame([], $protocol->getConnections()[0]->getExtensions());
+		$protocol->getSession()->close();
+	}
+
+	public function testWrongOrMissingVersionIsRejectedWith426()
+	{
+		foreach (['8', '13abc', null] as $version) {
+			$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+			$headers = $this->connectHeaders();
+			if ($version === null) {
+				unset($headers['sec-websocket-version']);
+			} else {
+				$headers['sec-websocket-version'] = $version;
+			}
+			[$opened, $response] = $this->connectWith($protocol, $headers);
+			self::assertSame(0, $opened, 'Version ' . var_export($version, true) . ' does not open a WebSocket.');
+			self::assertSame('426', $response[':status']);
+			self::assertSame('13', $response['sec-websocket-version'], 'The 426 advertises the supported version.');
+			$protocol->getSession()->close();
+		}
+	}
+
+	public function testMissingPseudoHeaderIsRejected()
+	{
+		foreach ([':scheme', ':path', ':authority'] as $pseudo) {
+			$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+			$headers = $this->connectHeaders();
+			unset($headers[$pseudo]);
+			[$opened, $response] = $this->connectWith($protocol, $headers);
+			self::assertSame(0, $opened, "A CONNECT without $pseudo does not open a WebSocket (RFC 8441 §5).");
+			self::assertTrue($response === null || $response[':status'] === '400', "A CONNECT without $pseudo is refused with 400, or reset by nghttp2's own validation.");
+			$protocol->getSession()->close();
+		}
+	}
+
+	public function testSetExtensionsRejectsANonNegotiator()
+	{
+		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+		try {
+			$protocol->setExtensions([new \stdClass()]);
+			self::fail('A non-negotiator is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_negotiator_invalid', $e->getErrorCode());
+		}
+		$protocol->setSubprotocols(['a', '', ' b ']);
+		self::assertSame(['a', 'b'], $protocol->getSubprotocols());
+		$protocol->getSession()->close();
+	}
+
+	public function testServeReportsAHandshakePerStream()
+	{
+		// The client's bytes are queued on a socket pair whose write side is then shut, so serve() accepts
+		// the stream, reports it, reads end-of-file, and returns.
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->request($this->connectHeaders(['sec-websocket-protocol' => 'chat']));
+		[$a, $b] = TSocketStream::pair();
+		$b->write($client->send());
+		stream_socket_shutdown($b->getResource(), STREAM_SHUT_WR);
+
+		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
+		$protocol->setSubprotocols(['chat']);
+		$closed = 0;
+		$protocol->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$seen = [];
+		$protocol->serve($a, function (StreamInterface $stream, array $handshake) use (&$seen) {
+			$seen[] = [$stream, $handshake];
+		});
+
+		self::assertCount(1, $seen);
+		[$stream, $handshake] = $seen[0];
+		self::assertInstanceOf(TH2Stream::class, $stream, 'The logical stream is the HTTP/2 stream.');
+		self::assertSame('chat', $handshake['subprotocol']);
+		self::assertSame([], $handshake['extensions']);
+		self::assertSame('/chat', $handshake['target']);
+		self::assertSame('CONNECT', $handshake['method']);
+		self::assertSame('HTTP/2', $handshake['protocol']);
+		self::assertSame('example.com', $handshake['headers'][':authority']);
+		self::assertSame('13', $handshake['headers']['sec-websocket-version']);
+		self::assertSame(1, $closed, 'The transport ending closes the stream.');
+
+		$client->receive($b->read(65536));   // the 200 travelled the pair
+		self::assertSame('chat', $client->getStream(1)->getHeader('sec-websocket-protocol'));
+		$protocol->getSession()->close();
+		$client->close();
+		$a->close();
+		$b->close();
 	}
 
 	public function testShutdownFiresOnCloseForLiveConnections()

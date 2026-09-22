@@ -18,6 +18,11 @@
 			"Prado\\": "src"
 		}
 	},
+	"autoload-dev": {
+		"psr-4": {
+			"Prado\\Test\\Unit\\": "tests/unit/"
+		}
+	},
 	"repositories": [
 		{
 			"type": "composer",
@@ -38,11 +43,11 @@
 		"ext-ffi": "Required by belisoful/prado-http2 to bind libnghttp2 for HTTP/2.",
 		"belisoful/prado-http2": "HTTP/2 (RFC 8441) WebSocket multiplexing; without it the server serves HTTP/1.1 only."
 	},
-	"require-dev" : {
-		"belisoful/prado-http2" : "^1.0",
-		"phpunit/phpunit" : "^10",
+	"require-dev": {
+		"belisoful/prado-http2": "^1.0",
+		"phpunit/phpunit": "^10",
 		"phpdocumentor/shim": "^3",
-		"friendsofphp/php-cs-fixer": "^3.94",
+		"friendsofphp/php-cs-fixer": "^3.95",
 		"phpstan/phpstan": "^2.1"
 	},
 	"config": {
@@ -54,7 +59,33 @@
 		}
 	},
 	"scripts": {
-		"unittest": "vendor/bin/phpunit --testsuite unit"
+		"fix": [
+			"vendor/bin/php-cs-fixer fix src",
+			"vendor/bin/php-cs-fixer fix tests"
+		],
+		"stan": "vendor/bin/phpstan analyse --memory-limit=1G",
+		"unittest": "vendor/bin/phpunit --testsuite unit",
+		"coverage": [
+			"@putenv XDEBUG_MODE=coverage",
+			"vendor/bin/phpunit --testsuite unit --coverage-text"
+		],
+		"coverage-html": [
+			"@putenv XDEBUG_MODE=coverage",
+			"vendor/bin/phpunit --testsuite unit --coverage-html build/coverage"
+		],
+		"fulltest": [
+			"@fix",
+			"@stan",
+			"@unittest"
+		],
+		"functest": [
+			"Composer\\Config::disableProcessTimeout",
+			"npx playwright test --project=chromium"
+		],
+		"functionaltest": [
+			"Composer\\Config::disableProcessTimeout",
+			"npx playwright test"
+		]
 	},
 	"extra": {
 		"prado": {

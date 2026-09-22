@@ -24,8 +24,9 @@ use Psr\Http\Message\StreamInterface;
  *
  * {@see encode()} masks when a 4-byte key is given.  {@see decode()} reads exactly one frame
  * (blocking on the stream), unmasks when needed, and enforces the control-frame rules (at most
- * 125 payload bytes, never fragmented).  It returns null on a clean end of stream before a
- * frame begins, and throws on a truncated frame.
+ * 125 payload bytes, never fragmented) and the minimal length encoding (RFC 6455 §5.2: a 16-bit
+ * length is 126 or more, a 64-bit length is 65536 or more).  It returns null on a clean end of
+ * stream before a frame begins, and throws on a truncated frame.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
@@ -55,6 +56,15 @@ class TWebSocketFrameCodec
 
 	/** @var int The maximum payload of a control frame. */
 	public const MAX_CONTROL_PAYLOAD = 125;
+
+	/** @var int The 7-bit length value that selects a 16-bit extended length. */
+	private const LENGTH_16 = 126;
+
+	/** @var int The 7-bit length value that selects a 64-bit extended length. */
+	private const LENGTH_64 = 127;
+
+	/** @var int The most bytes one stream read requests, so a large declared length is read in bounded steps. */
+	private const READ_CHUNK = 65536;
 
 	/**
 	 * Encodes a frame to its wire bytes, masking the payload when a key is given.
@@ -86,9 +96,9 @@ class TWebSocketFrameCodec
 		if ($length <= 125) {
 			$header = chr($byte0) . chr($maskBit | $length);
 		} elseif ($length <= 0xFFFF) {
-			$header = chr($byte0) . chr($maskBit | 126) . pack('n', $length);
+			$header = chr($byte0) . chr($maskBit | self::LENGTH_16) . pack('n', $length);
 		} else {
-			$header = chr($byte0) . chr($maskBit | 127) . pack('J', $length);
+			$header = chr($byte0) . chr($maskBit | self::LENGTH_64) . pack('J', $length);
 		}
 		if ($maskKey !== null) {
 			return $header . $maskKey . self::applyMask($payload, $maskKey);
@@ -103,8 +113,8 @@ class TWebSocketFrameCodec
 	 *   a client), false requires an unmasked frame (client reading a server), null skips the check.
 	 * @param int $maxPayloadLength The maximum data-frame payload length to accept, or 0 for unlimited.
 	 * @throws TWebSocketException When a frame is truncated, a control frame is malformed, the mask
-	 *   state is wrong, the declared length exceeds the maximum, or a 64-bit length exceeds the signed
-	 *   integer range.
+	 *   state is wrong, the declared length exceeds the maximum, a 64-bit length exceeds the signed
+	 *   integer range, or an extended length is not the minimal encoding.
 	 * @return ?TWebSocketFrame The frame, or null at a clean end of stream before any frame byte.
 	 */
 	public static function decode(StreamInterface $stream, ?bool $requireMask = null, int $maxPayloadLength = 0): ?TWebSocketFrame
@@ -120,22 +130,12 @@ class TWebSocketFrameCodec
 		$masked = ($byte1 & self::MASK) !== 0;
 		self::assertMask($masked, $requireMask);
 		$length = $byte1 & self::LENGTH_MASK;
-		if ($length === 126) {
-			$length = unpack('n', self::readExact($stream, 2))[1];
-		} elseif ($length === 127) {
-			$length = unpack('J', self::readExact($stream, 8))[1];
-			if ($length < 0) {
-				throw new TWebSocketException('websocket_frame_length_invalid');
-			}
+		if ($length === self::LENGTH_16) {
+			$length = self::extendedLength(self::LENGTH_16, self::readExact($stream, 2));
+		} elseif ($length === self::LENGTH_64) {
+			$length = self::extendedLength(self::LENGTH_64, self::readExact($stream, 8));
 		}
-		if (TWebSocketOpcode::isControl($opcode)) {
-			if ($length > self::MAX_CONTROL_PAYLOAD) {
-				throw new TWebSocketException('websocket_control_frame_too_long', $length);
-			}
-			if (!$fin) {
-				throw new TWebSocketException('websocket_control_frame_fragmented', $opcode);
-			}
-		}
+		self::assertControlFrame($opcode, $fin, $length);
 		self::assertPayloadLength($length, $maxPayloadLength);
 		$maskKey = $masked ? self::readExact($stream, 4) : null;
 		$payload = $length > 0 ? self::readExact($stream, $length) : '';
@@ -159,7 +159,7 @@ class TWebSocketFrameCodec
 	 * This is the non-blocking counterpart to {@see decode()}: it returns null when the buffer
 	 * does not yet hold a complete frame (the caller reads more bytes and retries), and the
 	 * consumed length when it does, so the caller can advance past the frame.  Protocol errors
-	 * (a malformed control frame, an out-of-range 64-bit length) throw as in {@see decode()}.
+	 * (a malformed control frame, an out-of-range or non-minimal length) throw as in {@see decode()}.
 	 *
 	 * @param string $buffer The accumulated bytes, positioned at a frame boundary.
 	 * @param ?bool $requireMask The expected mask state: true requires a masked frame (server reading
@@ -167,7 +167,7 @@ class TWebSocketFrameCodec
 	 * @param int $maxPayloadLength The maximum data-frame payload length to accept, or 0 for unlimited.
 	 *   Checked from the header alone, so an oversized frame is rejected before its payload is buffered.
 	 * @throws TWebSocketException When a control frame is malformed, the mask state is wrong, the
-	 *   declared length exceeds the maximum, or a 64-bit length is out of range.
+	 *   declared length exceeds the maximum, or a 64-bit length is out of range or not minimal.
 	 * @return ?array{frame: TWebSocketFrame, length: int} The frame and its byte length, or null when incomplete.
 	 */
 	public static function tryDecode(string $buffer, ?bool $requireMask = null, int $maxPayloadLength = 0): ?array
@@ -184,30 +184,20 @@ class TWebSocketFrameCodec
 		self::assertMask($masked, $requireMask);
 		$length = $byte1 & self::LENGTH_MASK;
 		$offset = 2;
-		if ($length === 126) {
+		if ($length === self::LENGTH_16) {
 			if ($available < $offset + 2) {
 				return null;
 			}
-			$length = unpack('n', substr($buffer, $offset, 2))[1];
+			$length = self::extendedLength(self::LENGTH_16, substr($buffer, $offset, 2));
 			$offset += 2;
-		} elseif ($length === 127) {
+		} elseif ($length === self::LENGTH_64) {
 			if ($available < $offset + 8) {
 				return null;
 			}
-			$length = unpack('J', substr($buffer, $offset, 8))[1];
-			if ($length < 0) {
-				throw new TWebSocketException('websocket_frame_length_invalid');
-			}
+			$length = self::extendedLength(self::LENGTH_64, substr($buffer, $offset, 8));
 			$offset += 8;
 		}
-		if (TWebSocketOpcode::isControl($opcode)) {
-			if ($length > self::MAX_CONTROL_PAYLOAD) {
-				throw new TWebSocketException('websocket_control_frame_too_long', $length);
-			}
-			if (!$fin) {
-				throw new TWebSocketException('websocket_control_frame_fragmented', $opcode);
-			}
-		}
+		self::assertControlFrame($opcode, $fin, $length);
 		self::assertPayloadLength($length, $maxPayloadLength);
 		$maskKey = null;
 		if ($masked) {
@@ -217,8 +207,8 @@ class TWebSocketFrameCodec
 			$maskKey = substr($buffer, $offset, 4);
 			$offset += 4;
 		}
-		if ($available < $offset + $length) {
-			return null;
+		if ($length > $available - $offset) {
+			return null;   // compared by subtraction, so a 64-bit length near PHP_INT_MAX cannot overflow the sum
 		}
 		$payload = $length > 0 ? substr($buffer, $offset, $length) : '';
 		$offset += $length;
@@ -235,6 +225,53 @@ class TWebSocketFrameCodec
 			($byte0 & self::RSV3) !== 0,
 		);
 		return ['frame' => $frame, 'length' => $offset];
+	}
+
+	/**
+	 * Decodes an extended payload length and checks it is the minimal encoding: a 16-bit length
+	 * must be at least 126 and a 64-bit length at least 65536 (RFC 6455 §5.2), and a 64-bit length
+	 * must have its most significant bit clear.
+	 * @param int $marker The 7-bit length marker that selected the encoding (126 or 127).
+	 * @param string $bytes The 2 or 8 network-order length bytes.
+	 * @throws TWebSocketException When the length is out of range or not minimally encoded.
+	 * @return int The payload length.
+	 */
+	private static function extendedLength(int $marker, string $bytes): int
+	{
+		if ($marker === self::LENGTH_16) {
+			$length = unpack('n', $bytes)[1];
+			$minimum = self::LENGTH_16;
+		} else {
+			$length = unpack('J', $bytes)[1];
+			if ($length < 0) {
+				throw new TWebSocketException('websocket_frame_length_invalid');
+			}
+			$minimum = 0x10000;
+		}
+		if ($length < $minimum) {
+			throw new TWebSocketException('websocket_frame_length_not_minimal', $length);
+		}
+		return $length;
+	}
+
+	/**
+	 * Asserts the control-frame rules: at most 125 payload bytes and never fragmented.
+	 * @param int $opcode The frame opcode.
+	 * @param bool $fin Whether the FIN bit is set.
+	 * @param int $length The declared payload length.
+	 * @throws TWebSocketException When a control frame is too long or fragmented.
+	 */
+	private static function assertControlFrame(int $opcode, bool $fin, int $length): void
+	{
+		if (!TWebSocketOpcode::isControl($opcode)) {
+			return;
+		}
+		if ($length > self::MAX_CONTROL_PAYLOAD) {
+			throw new TWebSocketException('websocket_control_frame_too_long', $length);
+		}
+		if (!$fin) {
+			throw new TWebSocketException('websocket_control_frame_fragmented', $opcode);
+		}
 	}
 
 	/**
@@ -286,7 +323,8 @@ class TWebSocketFrameCodec
 	}
 
 	/**
-	 * Reads exactly $count bytes, throwing when the stream ends first.
+	 * Reads exactly $count bytes in steps of at most {@see READ_CHUNK}, throwing when the stream
+	 * ends first.  The step bound keeps a large declared length from requesting one huge read.
 	 * @param StreamInterface $stream The stream to read.
 	 * @param int $count The number of bytes required.
 	 * @throws TWebSocketException When fewer than $count bytes are available.
@@ -296,7 +334,7 @@ class TWebSocketFrameCodec
 	{
 		$data = '';
 		while (strlen($data) < $count) {
-			$chunk = $stream->eof() ? '' : $stream->read($count - strlen($data));
+			$chunk = $stream->eof() ? '' : $stream->read(min(self::READ_CHUNK, $count - strlen($data)));
 			if ($chunk === '') {
 				throw new TWebSocketException('websocket_frame_incomplete', $count, strlen($data));
 			}

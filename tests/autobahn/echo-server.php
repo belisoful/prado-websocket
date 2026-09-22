@@ -18,9 +18,8 @@
 
 use Prado\Exceptions\TException;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
-use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
-use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
+use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
 
 $root = dirname(__DIR__, 2);
@@ -34,18 +33,17 @@ $server = TWebSocketServer::bind("tcp://{$host}:{$port}");
 $server->setMaxMessageSize(0);   // the conformance fuzzer sends large frames; run unbounded (not a production default)
 $server->setExtensions([new TPermessageDeflateNegotiator()]);
 
-$server->setHandler(new class () extends TWebSocketHandler {
-	// Echo each message under the opcode it arrived as; the suite's echo cases compare both, and a
-	// batch can mix them, so the per-message $opcode is read rather than the connection's last opcode.
-	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
-	{
-		if ($opcode === TWebSocketOpcode::Binary) {
-			$connection->sendBinary($message);
-		} else {
-			$connection->send($message);
-		}
+// Echo each message under the opcode it arrived as; the suite's echo cases compare both, and a batch
+// can mix them, so the event's TWebSocketMessage carries each message's own opcode.
+$handler = new TWebSocketHandler();
+$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message): void {
+	if ($message->getIsBinary()) {
+		$connection->sendBinary($message->getPayload());
+	} else {
+		$connection->send($message->getPayload());
 	}
 });
+$server->setHandler($handler);
 
 fwrite(STDERR, "Autobahn echo server listening on ws://{$host}:{$port}\n");
 $server->serve();

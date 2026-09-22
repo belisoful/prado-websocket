@@ -1,12 +1,17 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
+
+use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TConfigurationException;
 use Prado\IO\Socket\WebSocket\Cluster\TFileBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Stream\TBufferStream;
+use Prado\Util\Clock\TMockClock;
 
-class TFileBackplaneTest extends PHPUnit\Framework\TestCase
+class TFileBackplaneTest extends TestCase
 {
 	private string $dir;
 
@@ -115,6 +120,58 @@ class TFileBackplaneTest extends PHPUnit\Framework\TestCase
 
 		self::assertFileDoesNotExist($ghost, "A crashed node's stale presence file is reaped, not replayed.");
 		self::assertFileExists($this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . 'live', 'A recently written presence file survives.');
+	}
+
+	public function testARunningNodeForgetsACrashedNodesClientsWhenTheirPresenceGoesStale()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime(microtime(true));
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		$backplane->setClock($clock);
+		$cluster = new TWebSocketCluster('n1', $backplane);
+		$cluster->open();
+
+		// A remote node announced a client, then crashed without dropping it.
+		$cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'dead', '', null, 'ghost', ['node' => 'dead']));
+		$ghost = $this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . 'ghost';
+		file_put_contents($ghost, '{"node":"dead"}');
+		touch($ghost, $clock->time());
+		self::assertArrayHasKey('ghost', $cluster->presence());
+
+		$clock->setMicrotime($clock->microtime() + 2 * $backplane->getPresenceTtl() + 5);   // nobody refreshed the file
+		$cluster->tick();
+
+		self::assertFileDoesNotExist($ghost, 'The stale presence file is reaped.');
+		self::assertArrayNotHasKey('ghost', $cluster->presence(), 'The running node drops the crashed node\'s client from its mirror.');
+	}
+
+	public function testAGroupReadableSpoolIsRefused()
+	{
+		mkdir($this->dir, 0o750, true);   // group can list the spool: presence file names (client ids) would leak
+		chmod($this->dir, 0o750);
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('n1', $backplane);
+		$this->expectException(TConfigurationException::class);
+		$backplane->open();
+	}
+
+	public function testAFailedLocalDeliveryDoesNotDropTheRestOfTheBatch()
+	{
+		$node1 = $this->makeNode('node1');
+		$node2 = $this->makeNode('node2');
+		$dead = new TWebSocketConnection(new ThrowingBufferStream(), false);
+		[$live, $sink] = $this->makeConnection();
+		$node2->subscribe($node2->register($dead), 'news');
+		$node2->subscribe($node2->register($live), 'news');
+
+		$node1->publish('news', 'first');
+		$node1->publish('news', 'second');
+		$node2->tick();
+
+		self::assertStringContainsString('first', (string) $sink);
+		self::assertStringContainsString('second', (string) $sink, 'The envelope after the failing delivery is still delivered.');
 	}
 
 	public function testPublishCrossesNodesThroughTheFiles()

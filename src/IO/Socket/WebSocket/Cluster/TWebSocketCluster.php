@@ -10,8 +10,11 @@
 
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
+use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\Prado;
 use Prado\TComponent;
+use Prado\Util\Log\TLogger;
 
 /**
  * TWebSocketCluster class.
@@ -76,6 +79,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 
 	/**
 	 * Opens the backplane and joins the cluster.
+	 * @throws \Prado\Exceptions\TConfigurationException When the backplane is misconfigured or cannot connect.
 	 */
 	public function open(): void
 	{
@@ -221,21 +225,23 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	 * Publishes a payload to the subscribers of a channel across the cluster.
 	 * @param string $channel The channel name.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to deliver the payload as a Binary frame rather than Text.
 	 */
-	public function publish(string $channel, string $payload): void
+	public function publish(string $channel, string $payload, bool $binary = false): void
 	{
-		$this->deliverChannel($channel, $payload);
-		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, $this->_nodeId, $payload, $channel));
+		$this->deliverChannel($channel, $payload, $binary);
+		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, $this->_nodeId, $payload, $channel, null, [], '', $binary));
 	}
 
 	/**
 	 * Broadcasts a payload to every client in the cluster.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to deliver the payload as a Binary frame rather than Text.
 	 */
-	public function broadcast(string $payload): void
+	public function broadcast(string $payload, bool $binary = false): void
 	{
-		$this->deliverAll($payload);
-		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, $this->_nodeId, $payload));
+		$this->deliverAll($payload, $binary);
+		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, $this->_nodeId, $payload, null, null, [], '', $binary));
 	}
 
 	/**
@@ -243,16 +249,27 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	 * a remote one is routed through the backplane.
 	 * @param string $clientId The cluster client id.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to deliver the payload as a Binary frame rather than Text.
 	 * @return bool Whether the client is known (local, or present in the cluster mirror).
 	 */
-	public function sendToClient(string $clientId, string $payload): bool
+	public function sendToClient(string $clientId, string $payload, bool $binary = false): bool
 	{
 		if (isset($this->_clients[$clientId])) {
-			$this->sendLocal($clientId, $payload);
+			$this->sendLocal($clientId, $payload, $binary);
 			return true;
 		}
-		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::DIRECT, $this->_nodeId, $payload, null, $clientId));
+		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::DIRECT, $this->_nodeId, $payload, null, $clientId, [], '', $binary));
 		return isset($this->_presence[$clientId]);
+	}
+
+	/**
+	 * Returns the presence metadata of the clients connected to this node, the subset of the mirror a
+	 * backplane re-announces after it reconnects.
+	 * @return array<string, array<string, mixed>> The local clients' presence metadata, keyed by client id.
+	 */
+	public function getLocalPresence(): array
+	{
+		return array_intersect_key($this->_presence, $this->_clients);
 	}
 
 	/**
@@ -362,24 +379,24 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		switch ($envelope->getType()) {
 			case TWebSocketEnvelope::PUBLISH:
 				if (($channel = $envelope->getChannel()) !== null) {
-					$this->deliverChannel($channel, $envelope->getPayload());
+					$this->deliverChannel($channel, $envelope->getPayload(), $envelope->getIsBinary());
 				}
 				break;
 			case TWebSocketEnvelope::BROADCAST:
-				$this->deliverAll($envelope->getPayload());
+				$this->deliverAll($envelope->getPayload(), $envelope->getIsBinary());
 				break;
 			case TWebSocketEnvelope::DIRECT:
 				if ($clientId !== null && isset($this->_clients[$clientId])) {
-					$this->sendLocal($clientId, $envelope->getPayload());
+					$this->sendLocal($clientId, $envelope->getPayload(), $envelope->getIsBinary());
 				}
 				break;
 			case TWebSocketEnvelope::PRESENCE_SET:
-				if ($clientId !== null) {
-					$this->_presence[$clientId] = $envelope->getMeta();
+				if ($clientId !== null && !isset($this->_clients[$clientId])) {
+					$this->_presence[$clientId] = $envelope->getMeta();   // a local client's entry is this node's to keep; a remote claim on it is ignored
 				}
 				break;
 			case TWebSocketEnvelope::PRESENCE_DROP:
-				if ($clientId !== null) {
+				if ($clientId !== null && !isset($this->_clients[$clientId])) {
 					unset($this->_presence[$clientId]);
 				}
 				break;
@@ -441,35 +458,50 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	 * Delivers a payload to the local subscribers of a channel.
 	 * @param string $channel The channel name.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to send a Binary frame rather than Text.
 	 */
-	private function deliverChannel(string $channel, string $payload): void
+	private function deliverChannel(string $channel, string $payload, bool $binary = false): void
 	{
 		foreach (array_keys($this->_channels[$channel] ?? []) as $clientId) {
-			$this->sendLocal($clientId, $payload);
+			$this->sendLocal($clientId, $payload, $binary);
 		}
 	}
 
 	/**
 	 * Delivers a payload to every local client.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to send a Binary frame rather than Text.
 	 */
-	private function deliverAll(string $payload): void
+	private function deliverAll(string $payload, bool $binary = false): void
 	{
 		foreach (array_keys($this->_clients) as $clientId) {
-			$this->sendLocal($clientId, $payload);
+			$this->sendLocal($clientId, $payload, $binary);
 		}
 	}
 
 	/**
-	 * Sends a payload to a local client as a text frame, skipping a closed connection.
+	 * Sends a payload to a local client as a Text or Binary frame, skipping a closed connection.  A
+	 * send that fails (a dead socket, an overflowed send buffer) closes that connection and is logged;
+	 * it never aborts delivery to the other clients, and the server ends the session on its next pump.
 	 * @param string $clientId The cluster client id.
 	 * @param string $payload The message payload.
+	 * @param bool $binary Whether to send a Binary frame rather than Text.
 	 */
-	private function sendLocal(string $clientId, string $payload): void
+	private function sendLocal(string $clientId, string $payload, bool $binary = false): void
 	{
 		$connection = $this->_clients[$clientId] ?? null;
-		if ($connection !== null && !$connection->getIsClosed()) {
-			$connection->send($payload);
+		if ($connection === null || $connection->getIsClosed()) {
+			return;
+		}
+		try {
+			$binary ? $connection->sendBinary($payload) : $connection->send($payload);
+		} catch (\Throwable $e) {
+			Prado::log("Cluster delivery to client {$clientId} failed, closing it: " . $e->getMessage(), TLogger::WARNING, static::class);
+			try {
+				$connection->close(TWebSocketCloseCode::GoingAway);
+			} catch (\Throwable $inner) {
+				// The connection is already broken; the server reaps it on its next read.
+			}
 		}
 	}
 }

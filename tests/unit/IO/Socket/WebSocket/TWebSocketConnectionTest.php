@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -7,10 +10,11 @@ use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
+use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\TStream;
 
-class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
+class TWebSocketConnectionTest extends TestCase
 {
 	/** @return array{0: TWebSocketConnection, 1: TWebSocketConnection, 2: TSocketStream, 3: TSocketStream} */
 	private function pair(): array
@@ -23,12 +27,19 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 	{
 		[$client, $server, $a, $b] = $this->pair();
 		$client->send('hello server');
-		self::assertSame('hello server', $server->receive());
-		self::assertSame(TWebSocketOpcode::Text, $server->getLastOpcode());
+		$message = $server->receiveMessage();
+		self::assertInstanceOf(TWebSocketMessage::class, $message);
+		self::assertSame('hello server', $message->getPayload());
+		self::assertSame(TWebSocketOpcode::Text, $message->getOpcode());
+		self::assertTrue($message->getIsText());
 
 		$server->sendBinary('BIN');
-		self::assertSame('BIN', $client->receive());
-		self::assertSame(TWebSocketOpcode::Binary, $client->getLastOpcode());
+		$message = $client->receiveMessage();
+		self::assertSame('BIN', $message->getPayload());
+		self::assertTrue($message->getIsBinary());
+
+		$client->send('as string');
+		self::assertSame('as string', $server->receive(), 'receive() is the payload form of receiveMessage().');
 		$a->close();
 		$b->close();
 	}
@@ -91,13 +102,39 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		$b->close();
 	}
 
+	public function testCloseIsIdempotentAndNoFrameFollowsIt()
+	{
+		[$client, $server, $a, $b] = $this->pair();
+		$client->close(1000, 'done');
+		self::assertTrue($client->getIsClosing());
+		$client->close(1001, 'again');   // a second Close is a no-op
+		self::assertSame(0, $client->ping('late'), 'A Ping after Close is not sent.');
+		self::assertSame(0, $client->pong('late'), 'A Pong after Close is not sent.');
+		self::assertSame(0, $client->send('late'), 'A data frame after Close is not sent.');
+		self::assertSame(0, $client->sendFrame(TWebSocketFrame::text('late')), 'No frame at all follows a Close.');
+
+		$b->setBlocking(false);
+		$wire = $b->read(65536);
+		$decoded = TWebSocketFrameCodec::tryDecode($wire, true);
+		self::assertNotNull($decoded);
+		self::assertSame(TWebSocketOpcode::Close, $decoded['frame']->getOpcode());
+		self::assertSame(1000, $decoded['frame']->getCloseCode(), 'The first Close is the one on the wire.');
+		self::assertSame(strlen($wire), $decoded['length'], 'Exactly one frame was written.');
+
+		self::assertSame([], $server->feedMessages($wire), 'The peer completes the handshake from those bytes.');
+		self::assertTrue($server->getIsClosed());
+		$a->close();
+		$b->close();
+	}
+
 	public function testFragmentedMessageReassembled()
 	{
 		[$client, $server, $a, $b] = $this->pair();
 		$client->sendFrame(TWebSocketFrame::text('Hel', false));
 		$client->sendFrame(TWebSocketFrame::continuation('lo', true));
-		self::assertSame('Hello', $server->receive());
-		self::assertSame(TWebSocketOpcode::Text, $server->getLastOpcode());
+		$message = $server->receiveMessage();
+		self::assertSame('Hello', $message->getPayload());
+		self::assertSame(TWebSocketOpcode::Text, $message->getOpcode());
 		$a->close();
 		$b->close();
 	}
@@ -108,6 +145,24 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		$a->close();                                       // client gone, no Close frame
 		self::assertNull($server->receive());
 		self::assertTrue($server->getIsClosed());
+		$b->close();
+	}
+
+	public function testReceiveFrameOnANonBlockingStreamWithoutDataStaysOpen()
+	{
+		[$client, $server, $a, $b] = $this->pair();
+		$b->setBlocking(false);
+		self::assertNull($server->receiveFrame(), 'No frame is available yet.');
+		self::assertFalse($server->getIsClosed(), 'An empty non-blocking read is not end of stream.');
+		self::assertNull($server->receive(), 'receive() reports no message yet.');
+		self::assertFalse($server->getIsClosed());
+
+		$client->send('later');
+		self::assertSame('later', $server->receive(), 'The connection keeps serving once bytes arrive.');
+
+		$a->close();                                       // now the stream really ends
+		self::assertNull($server->receiveFrame());
+		self::assertTrue($server->getIsClosed(), 'End of file closes the connection.');
 		$b->close();
 	}
 
@@ -125,6 +180,32 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		$messages = $server->feed(substr($wire, 0, $half));
 		$messages = array_merge($messages, $server->feed(substr($wire, $half)));
 		self::assertSame(['foo', 'Hello'], $messages, 'feed() reassembles regardless of byte boundaries.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testFeedByteByByteYieldsEveryMessage()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$client = new TWebSocketConnection($a, true);
+		$server = new TWebSocketConnection($b, false);
+		$client->send('one');
+		$client->send(str_repeat('x', 300));   // a 16-bit extended length
+		$client->ping('p');
+		$client->sendBinary('two');
+		$wire = $b->read(8192);
+
+		$messages = [];
+		for ($i = 0; $i < strlen($wire); $i++) {
+			foreach ($server->feedMessages($wire[$i]) as $message) {
+				$messages[] = [$message->getOpcode(), $message->getPayload()];
+			}
+		}
+		self::assertSame([
+			[TWebSocketOpcode::Text, 'one'],
+			[TWebSocketOpcode::Text, str_repeat('x', 300)],
+			[TWebSocketOpcode::Binary, 'two'],
+		], $messages, 'A frame split at any byte is completed when its last byte arrives.');
 		$a->close();
 		$b->close();
 	}
@@ -165,10 +246,51 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		self::assertSame(TWebSocketOpcode::Binary, $messages[1]->getOpcode());
 		self::assertSame('b-binary', $messages[1]->getPayload());
 		self::assertTrue($messages[1]->getIsBinary());
+		self::assertSame('b-binary', (string) $messages[1], 'A message stringifies to its payload.');
+		$a->close();
+		$b->close();
+	}
 
-		// getLastOpcode() holds only the last message's opcode after the batch, which is exactly why a
-		// per-message handler reads each TWebSocketMessage's own opcode instead.
-		self::assertSame(TWebSocketOpcode::Binary, $server->getLastOpcode());
+	public function testFeedThousandsOfTinyFramesIsLinear()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$count = 20000;
+		$wire = '';
+		for ($i = 0; $i < $count; $i++) {
+			$frame = ($i % 5 === 4) ? TWebSocketFrame::ping('') : TWebSocketFrame::text(chr(65 + $i % 26));
+			$wire .= TWebSocketFrameCodec::encode($frame, "\x01\x02\x03\x04");   // 6-7 bytes each, masked
+		}
+		$b->setBlocking(false);
+		$a->setBlocking(false);
+		$start = microtime(true);
+		$messages = $server->feedMessages($wire);
+		$elapsed = microtime(true) - $start;
+
+		self::assertCount($count - intdiv($count, 5), $messages, 'Every data frame yields a message; the pings do not.');
+		self::assertSame('A', $messages[0]->getPayload());
+		self::assertSame(chr(65 + ($count - 2) % 26), $messages[count($messages) - 1]->getPayload(), 'The last data frame is decoded in order.');
+		self::assertLessThan(3.0, $elapsed, 'Decoding 20k small frames from one read must not be quadratic.');
+
+		// Consistency: the same wire in two halves yields the same messages, with the split mid-frame.
+		$server2 = new TWebSocketConnection($b, false);
+		$split = intdiv(strlen($wire), 2) + 3;
+		$again = array_merge($server2->feedMessages(substr($wire, 0, $split)), $server2->feedMessages(substr($wire, $split)));
+		self::assertSame(array_map(fn ($m) => $m->getPayload(), $messages), array_map(fn ($m) => $m->getPayload(), $again));
+		$a->close();
+		$b->close();
+	}
+
+	public function testFeedRejectsAMalformedHeaderBeforeItsPayloadArrives()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		try {
+			$server->feedMessages("\x89\xfe\x00\x80");   // a masked Ping declaring 128 bytes: too long for a control frame
+			self::fail('An oversized control frame is a protocol error from its header alone.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_control_frame_too_long', $e->getErrorCode());
+		}
 		$a->close();
 		$b->close();
 	}
@@ -181,20 +303,18 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		$client->send('first');         // Text
 		$client->sendBinary('second');  // Binary
 
-		$handler = new class () extends TWebSocketHandler {
-			/** @var array<int, array{0: int, 1: string}> */
-			public array $seen = [];
-			public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
-			{
-				$this->seen[] = [$opcode, $message];
-			}
-		};
+		$handler = new TWebSocketHandler();
+		$seen = [];
+		$handler->attachEventHandler('onMessage', function ($connection, $message) use (&$seen) {
+			self::assertInstanceOf(TWebSocketMessage::class, $message, 'The onMessage event carries the message object.');
+			$seen[] = [$message->getOpcode(), (string) $message];
+		});
 		foreach ($server->feedMessages($b->read(8192)) as $message) {
 			$handler->onMessage($server, $message->getPayload(), $message->getOpcode());
 		}
 		self::assertSame(
 			[[TWebSocketOpcode::Text, 'first'], [TWebSocketOpcode::Binary, 'second']],
-			$handler->seen,
+			$seen,
 			'Each message dispatches under its own opcode, not the batch last opcode.',
 		);
 		$a->close();
@@ -234,6 +354,26 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		} catch (TWebSocketException $e) {
 			self::assertSame(TWebSocketCloseCode::GoingAway, $e->getCloseCode(), 'An overflowing slow reader is dropped with 1001.');
 		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testSendBufferLimitIsCheckedBeforeTheBytesAreQueued()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		$sender = new TWebSocketConnection($a, false);
+		$sender->setMaxSendBufferBytes(64);
+
+		try {
+			$sender->sendBinary(str_repeat('x', 100));   // a single message past the limit
+			self::fail('A message larger than the send-buffer limit is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_send_buffer_overflow', $e->getErrorCode());
+		}
+		self::assertSame(0, $sender->getPendingOutboundLength(), 'The refused message was never copied into the queue.');
+		self::assertGreaterThan(0, $sender->send('small'), 'The connection still sends within the limit.');
+		self::assertSame('small', (new TWebSocketConnection($b, true))->receive());
 		$a->close();
 		$b->close();
 	}
@@ -288,6 +428,26 @@ class TWebSocketConnectionTest extends PHPUnit\Framework\TestCase
 		self::assertTrue($client->drainClose(1000, '', 0.2), 'drainClose returns at end of stream rather than hanging.');
 		self::assertTrue($client->getIsClosed());
 		$a->close();
+	}
+
+	public function testDrainCloseWaitsForItsTimeoutOnASilentNonBlockingPeer()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		$client = new TWebSocketConnection($a, true);
+		$start = microtime(true);
+		self::assertFalse($client->drainClose(1000, '', 0.2), 'A silent peer does not complete the close handshake.');
+		$elapsed = microtime(true) - $start;
+		self::assertGreaterThanOrEqual(0.15, $elapsed, 'The drain keeps waiting until its timeout instead of treating an empty read as end of stream.');
+		self::assertLessThan(2.0, $elapsed, 'The drain gives up at its timeout.');
+		self::assertFalse($client->getIsClosed(), 'The connection is still closing, not closed.');
+		self::assertTrue($client->getIsClosing());
+
+		$b->write(TWebSocketFrameCodec::encode(TWebSocketFrame::close(1000)));   // the peer answers late
+		self::assertTrue($client->drainClose(1000, '', 0.5), 'A later drain picks up the peer Close.');
+		self::assertTrue($client->getIsClosed());
+		$a->close();
+		$b->close();
 	}
 
 	public function testAcceptRunsServerHandshake()

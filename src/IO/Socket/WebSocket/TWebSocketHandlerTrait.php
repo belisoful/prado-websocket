@@ -10,6 +10,9 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Prado;
+use Prado\Util\Log\TLogger;
+
 /**
  * TWebSocketHandlerTrait trait.
  *
@@ -19,6 +22,10 @@ namespace Prado\IO\Socket\WebSocket;
  * server; {@see \Prado\Web\Services\TWebSocketService} mixes it into a {@see \Prado\TService} for
  * the SAPI request pipeline.  The using class must be a {@see \Prado\TComponent}, for
  * {@see \Prado\TComponent::raiseEvent()}.
+ *
+ * The `onMessage` event carries the {@see TWebSocketMessage}: its payload, its opcode, and
+ * {@see TWebSocketMessage::getIsText()}/{@see TWebSocketMessage::getIsBinary()}.  The message
+ * stringifies to its payload, so a handler that only needs the bytes uses it as a string.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
@@ -33,9 +40,8 @@ trait TWebSocketHandlerTrait
 	{
 		$this->onOpen($connection);
 		try {
-			while (($message = $connection->receive()) !== null) {
-				// receive() returns one message at a time, so getLastOpcode() is its opcode.
-				$this->onMessage($connection, $message, $connection->getLastOpcode() ?? TWebSocketOpcode::Text);
+			while (($message = $connection->receiveMessage()) !== null) {
+				$this->onMessage($connection, $message->getPayload(), $message->getOpcode());
 			}
 		} catch (\Throwable $e) {
 			$this->onError($connection, $e);
@@ -45,6 +51,7 @@ trait TWebSocketHandlerTrait
 					$connection->close($code);
 				} catch (\Throwable $inner) {
 					// A close on a broken pipe cannot be written; onClose still runs below.
+					Prado::log('WebSocket Close could not be written after an error: ' . $inner->getMessage(), TLogger::NOTICE, static::class);
 				}
 			}
 		}
@@ -61,15 +68,16 @@ trait TWebSocketHandlerTrait
 	}
 
 	/**
-	 * Raised when a complete message has been received.  A handler that overrides this reads
-	 * {@see $opcode} to tell a Text message from a Binary one; the event carries the payload string.
+	 * Raised when a complete message has been received.  The event parameter is the
+	 * {@see TWebSocketMessage} built from the payload and opcode, so an event handler tells a Text
+	 * message from a Binary one and still reads the payload as a string.
 	 * @param TWebSocketConnection $connection The connection (the event sender).
 	 * @param string $message The received message payload.
 	 * @param int $opcode The message's opcode (a {@see TWebSocketOpcode} value).
 	 */
 	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
 	{
-		$this->raiseEvent('onMessage', $connection, $message);
+		$this->raiseEvent('onMessage', $connection, new TWebSocketMessage($opcode, $message));
 	}
 
 	/**

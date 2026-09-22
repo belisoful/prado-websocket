@@ -1,8 +1,12 @@
 <?php
 
-use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
+namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 
-class TWebSocketEnvelopeTest extends PHPUnit\Framework\TestCase
+use PHPUnit\Framework\TestCase;
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
+
+class TWebSocketEnvelopeTest extends TestCase
 {
 	public function testEncodeDecodeRoundTrip()
 	{
@@ -56,5 +60,41 @@ class TWebSocketEnvelopeTest extends PHPUnit\Framework\TestCase
 		self::assertSame('', $decoded->getPayload());
 		self::assertNull($decoded->getChannel());
 		self::assertNull($decoded->getClientId());
+	}
+
+	public function testBinaryAndNonUtf8PayloadsSurviveTheWire()
+	{
+		$bytes = "\x00\xff\xfe\x80binary";
+		$binary = new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'n1', $bytes, null, null, [], 'id-1', true);
+		$decoded = TWebSocketEnvelope::decode($binary->encode());
+		self::assertNotNull($decoded);
+		self::assertSame($bytes, $decoded->getPayload(), 'A binary payload round-trips byte for byte.');
+		self::assertTrue($decoded->getIsBinary(), 'The binary flag travels with the payload.');
+
+		$text = new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'n1', "\xff\xfe not utf-8", 'room');
+		$decoded = TWebSocketEnvelope::decode($text->encode());
+		self::assertNotNull($decoded, 'A non-UTF-8 text payload does not break encoding.');
+		self::assertSame("\xff\xfe not utf-8", $decoded->getPayload());
+		self::assertFalse($decoded->getIsBinary(), 'A non-UTF-8 text payload stays text.');
+
+		$plain = new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'n1', 'héllo', 'room');
+		self::assertStringContainsString('"p":"héllo"', $plain->encode(), 'A UTF-8 text payload is not base64-encoded.');
+	}
+
+	public function testDecodeRejectsAMisflaggedBase64Payload()
+	{
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"broadcast","o":"n","p":"!!!not base64","e":1}'));
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"broadcast","o":"n","p":"YQ==","e":[1]}'), 'A non-scalar flag is rejected.');
+	}
+
+	public function testEncodeSubstitutesInvalidUtf8InMetaAndReportsTheUnencodable()
+	{
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'n1', '', null, 'c1', ['name' => "bad\xff"]);
+		$decoded = TWebSocketEnvelope::decode($envelope->encode());
+		self::assertNotNull($decoded);
+		self::assertSame("bad\u{FFFD}", $decoded->getMeta()['name'], 'Invalid UTF-8 in metadata is substituted rather than failing the envelope.');
+
+		$this->expectException(TWebSocketException::class);
+		(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'n1', '', null, 'c1', ['ratio' => INF]))->encode();
 	}
 }

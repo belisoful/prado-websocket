@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
@@ -12,7 +15,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketHandler;
  * protocol's {@see THttp2WebSocketProtocol::onConnection}/{@see THttp2WebSocketProtocol::onClose}
  * events the server wires to the cluster.  Skipped when libnghttp2 is unavailable.
  */
-class TWebSocketHttp2ClusterTest extends PHPUnit\Framework\TestCase
+class TWebSocketHttp2ClusterTest extends TestCase
 {
 	protected function setUp(): void
 	{

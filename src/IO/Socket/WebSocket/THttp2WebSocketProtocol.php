@@ -16,6 +16,7 @@ use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketStream;
 use Prado\Prado;
 use Prado\TComponent;
+use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -27,12 +28,19 @@ use Psr\Http\Message\StreamInterface;
  * {@see TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL}; nghttp2 handles the HTTP/2 framing, HPACK,
  * and per-stream flow control.
  *
+ * An Extended CONNECT must carry `:scheme`, `:path`, `:authority`, and `sec-websocket-version: 13`
+ * (RFC 8441 §5); one that does not is refused with `400`, or `426` for another version.  The
+ * origin and `:authority` allowlists apply as on HTTP/1.1, and the subprotocol and extensions
+ * ({@see setSubprotocols()}, {@see setExtensions()}) are negotiated from the stream's headers and
+ * echoed in the `200` response.
+ *
  * Each accepted CONNECT stream becomes a {@see TH2Stream} (a {@see StreamInterface}) wrapped in a
- * server {@see TWebSocketConnection}; the RFC 6455 frames flow as that stream's DATA.  Because
- * HTTP/2 multiplexes, the bridge is event driven: incoming DATA is fed to the connection's
- * {@see TWebSocketConnection::feed()} and complete messages dispatch to the handler, rather than
- * a per-connection blocking loop.  {@see receive()} and {@see send()} move bytes to and from the
- * transport, so an event-loop server pumps the one socket while many WebSockets run on it.
+ * server {@see TWebSocketConnection} configured with the negotiated subprotocol and extensions;
+ * the RFC 6455 frames flow as that stream's DATA.  Because HTTP/2 multiplexes, the bridge is event
+ * driven: incoming DATA is fed to the connection's {@see TWebSocketConnection::feed()} and complete
+ * messages dispatch to the handler, rather than a per-connection blocking loop.  {@see receive()}
+ * and {@see send()} move bytes to and from the transport, so an event-loop server pumps the one
+ * socket while many WebSockets run on it.
  *
  * Events ('on' prefix), raised per multiplexed WebSocket so several observers can react (e.g. an
  * event-loop server and a cluster coordinator):
@@ -44,6 +52,9 @@ use Psr\Http\Message\StreamInterface;
  */
 class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 {
+	/** @var int The maximum bytes read from the transport per pump. */
+	public const READ_CHUNK = 65536;
+
 	/** @var IWebSocketHandler The handler each WebSocket stream is run through. */
 	private IWebSocketHandler $_handler;
 
@@ -58,6 +69,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/** @var string[] The `:authority` hosts allowed to open a stream, empty to allow any. */
 	private array $_allowedHosts = [];
+
+	/** @var string[] The subprotocols supported, in preference order. */
+	private array $_subprotocols = [];
+
+	/** @var IWebSocketExtensionNegotiator[] The extension negotiators offered, in preference order. */
+	private array $_extensions = [];
 
 	/** @var int The maximum message size applied to each stream's connection, or 0 for unlimited. */
 	private int $_maxMessageSize = 0;
@@ -122,6 +139,49 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	public function setAllowedHosts(array $value): void
 	{
 		$this->_allowedHosts = array_values($value);
+	}
+
+	/**
+	 * Returns the subprotocols supported.
+	 * @return string[] The supported subprotocols, in preference order.
+	 */
+	public function getSubprotocols(): array
+	{
+		return $this->_subprotocols;
+	}
+
+	/**
+	 * Sets the subprotocols supported; the first one a stream offers is selected and echoed in
+	 * `sec-websocket-protocol`.
+	 * @param string[] $value The supported subprotocols, in preference order.
+	 */
+	public function setSubprotocols(array $value): void
+	{
+		$this->_subprotocols = array_values(array_filter(array_map('trim', $value), fn ($p) => $p !== ''));
+	}
+
+	/**
+	 * Returns the extension negotiators offered during each stream's handshake.
+	 * @return IWebSocketExtensionNegotiator[] The negotiators, in preference order.
+	 */
+	public function getExtensions(): array
+	{
+		return $this->_extensions;
+	}
+
+	/**
+	 * Sets the extension negotiators offered during each stream's handshake, in preference order.
+	 * @param IWebSocketExtensionNegotiator[] $value The extension negotiators.
+	 * @throws TWebSocketException When a value does not implement {@see IWebSocketExtensionNegotiator}.
+	 */
+	public function setExtensions(array $value): void
+	{
+		foreach ($value as $negotiator) {
+			if (!$negotiator instanceof IWebSocketExtensionNegotiator) {
+				throw new TWebSocketException('websocket_extension_negotiator_invalid');
+			}
+		}
+		$this->_extensions = array_values($value);
 	}
 
 	/**
@@ -190,9 +250,11 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Drives the HTTP/2 connection over a transport, dispatching each multiplexed WebSocket.
+	 * Drives the HTTP/2 connection over a transport, dispatching each multiplexed WebSocket with
+	 * its accepted handshake.
 	 * @param TSocketStream $connection The accepted transport connection.
-	 * @param callable(StreamInterface): void $onStream Invoked per WebSocket-ready logical stream.
+	 * @param callable(StreamInterface, array{headers: array<string, string>, target: ?string, subprotocol: ?string, extensions: IWebSocketExtension[]}): void $onStream
+	 *   Invoked per WebSocket-ready logical stream with its accepted handshake.
 	 */
 	public function serve(TSocketStream $connection, callable $onStream): void
 	{
@@ -214,36 +276,64 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		$this->shutdown();   // the transport ended; fire onClose for any streams still open
 	}
 
-	/** @var int The maximum bytes read from the transport per pump. */
-	public const READ_CHUNK = 65536;
-
 	/**
-	 * Accepts an Extended CONNECT WebSocket request, or rejects a non-WebSocket request.
+	 * Accepts an Extended CONNECT WebSocket request, negotiating the subprotocol and extensions, or
+	 * rejects a request that is not a complete WebSocket handshake (RFC 8441 §5).
 	 * @param TH2Stream $stream The request stream.
 	 */
 	protected function acceptStream(TH2Stream $stream): void
 	{
-		if ($stream->getHeader(':method') !== 'CONNECT' || $stream->getHeader(':protocol') !== 'websocket') {
+		$headers = $stream->getHeaders();
+		if (($headers[':method'] ?? null) !== 'CONNECT' || ($headers[':protocol'] ?? null) !== 'websocket') {
 			$this->rejectStream($stream, '400');
 			return;
 		}
-		$origin = $stream->getHeader('origin');
-		if (!TWebSocketHandshake::isOriginAllowed($origin === null ? [] : ['origin' => $origin], $this->_origins ?: null)) {
+		foreach ([':scheme', ':path', ':authority'] as $pseudo) {
+			if (($headers[$pseudo] ?? '') === '') {
+				$this->rejectStream($stream, '400');   // RFC 8441 s5 requires the three pseudo-headers
+				return;
+			}
+		}
+		if (!TWebSocketHandshake::isSupportedVersion($headers[strtolower(THttpHeaderName::SecWebSocketVersion)] ?? null)) {
+			$this->rejectStream($stream, '426', [strtolower(THttpHeaderName::SecWebSocketVersion) => (string) TWebSocketHandshake::VERSION]);
+			return;
+		}
+		if (!TWebSocketHandshake::isOriginAllowed($headers, $this->_origins ?: null)) {
 			$this->rejectStream($stream, '403');   // refuse a disallowed origin before upgrading
 			return;
 		}
-		$authority = $stream->getHeader(':authority');
-		if (!TWebSocketHandshake::isHostAllowed($authority === null ? [] : ['host' => $authority], $this->_allowedHosts ?: null)) {
+		if (!TWebSocketHandshake::isHostAllowed(['host' => $headers[':authority']], $this->_allowedHosts ?: null)) {
 			$this->rejectStream($stream, '400');   // refuse a disallowed :authority
 			return;
 		}
-		$this->_session->respond($stream, [':status' => '200']);
+		$subprotocol = TWebSocketHandshake::negotiateSubprotocol($headers, $this->_subprotocols);
+		$negotiated = TWebSocketHandshake::negotiateExtensions($headers, $this->_extensions);
+		$response = [':status' => '200'];
+		if ($subprotocol !== null) {
+			$response[strtolower(THttpHeaderName::SecWebSocketProtocol)] = $subprotocol;
+		}
+		if ($negotiated['header'] !== '') {
+			$response[strtolower(THttpHeaderName::SecWebSocketExtensions)] = $negotiated['header'];
+		}
+		$this->_session->respond($stream, $response);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
 		$connection->setValidateMasking(false);   // RFC 8441 carries WebSocket DATA without RFC 6455 masking
 		$connection->setMaxMessageSize($this->_maxMessageSize);
+		$connection->setSubprotocol($subprotocol);
+		$connection->setExtensions($negotiated['extensions']);
 		$this->_connections[$stream->getStreamId()] = $connection;
 		if ($this->_onStream !== null) {
-			($this->_onStream)($stream);
+			($this->_onStream)($stream, [
+				'requestLine' => 'CONNECT ' . $headers[':path'] . ' HTTP/2',
+				'method' => 'CONNECT',
+				'target' => $headers[':path'],
+				'protocol' => 'HTTP/2',
+				'statusCode' => null,
+				'headers' => $headers,
+				'body' => '',
+				'subprotocol' => $subprotocol,
+				'extensions' => $negotiated['extensions'],
+			]);
 		}
 		$this->onConnection($connection);
 		$this->_handler->onOpen($connection);
@@ -280,10 +370,11 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	 * linger half-open (the deferred data provider otherwise keeps the stream alive indefinitely).
 	 * @param TH2Stream $stream The request stream to reject.
 	 * @param string $status The HTTP/2 status to respond with.
+	 * @param array<string, string> $headers Extra response headers (e.g. `sec-websocket-version` on a 426).
 	 */
-	protected function rejectStream(TH2Stream $stream, string $status): void
+	protected function rejectStream(TH2Stream $stream, string $status, array $headers = []): void
 	{
-		$this->_session->respond($stream, [':status' => $status]);
+		$this->_session->respond($stream, [':status' => $status] + $headers);
 		$this->endLocalStream($stream);
 	}
 

@@ -4,15 +4,17 @@
  * TWebSocketConnection class file.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado
+ * @link https://github.com/belisoful/prado-websocket
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\IO\Socket\TSocketServer;
 use Prado\IO\TResource;
 use Prado\Prado;
 use Prado\TComponent;
+use Prado\Util\Clock\TApplicationClockAwareTrait;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -27,11 +29,16 @@ use Psr\Http\Message\StreamInterface;
  *
  * {@see receive()} handles control frames inline: a Ping is auto-answered with a Pong, a Close
  * completes the close handshake (echoing a Close when the peer initiated), and a clean end of
- * stream returns null.  Use {@see getLastOpcode()} to tell a text message from a binary one.
+ * stream returns null.  {@see receiveMessage()} returns the same message as a
+ * {@see TWebSocketMessage}, which carries its opcode, so a Text message is told from a Binary one.
  *
- * {@see receive()} blocks for the next message; {@see feed()} is its non-blocking counterpart for
- * a {@see TWebSocketServer} event loop, taking the bytes just read and returning the complete
- * messages they yield.
+ * {@see receive()} blocks for the next message on a blocking stream; on a non-blocking stream it
+ * returns null when no frame is available yet, without closing.  {@see feedMessages()} is the
+ * event-loop counterpart for a {@see TWebSocketServer}: it takes the bytes just read and returns
+ * the complete messages they yield.
+ *
+ * Once a Close frame has been sent no further frame is written: {@see send()}, {@see ping()} and
+ * {@see pong()} return 0 and a second {@see close()} is a no-op.
  *
  * Events ('on' prefix).  Each is a real method taking a single mixed $param:
  *  - onPing: raised with the Ping payload (a Pong is sent automatically afterward).
@@ -43,11 +50,16 @@ use Psr\Http\Message\StreamInterface;
  */
 class TWebSocketConnection extends TComponent
 {
+	use TApplicationClockAwareTrait;
+
 	/** The default maximum reassembled message size in bytes (10 MiB); bounds memory by default. */
 	public const DEFAULT_MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
 
 	/** The default maximum queued outbound bytes before a slow reader is dropped (16 MiB). */
 	public const DEFAULT_MAX_SEND_BUFFER = 16 * 1024 * 1024;
+
+	/** @var float The longest single wait, in seconds, of {@see drainClose()} between polls of the clock. */
+	public const DRAIN_POLL_INTERVAL = 0.05;
 
 	/** @var StreamInterface The transport stream. */
 	private StreamInterface $_stream;
@@ -60,9 +72,6 @@ class TWebSocketConnection extends TComponent
 
 	/** @var bool Whether the connection is closed (Close exchanged or stream ended). */
 	private bool $_closed = false;
-
-	/** @var ?int The opcode of the most recently received data message (Text or Binary). */
-	private ?int $_lastOpcode = null;
 
 	/** @var string Unparsed bytes carried between {@see feed()} calls. */
 	private string $_readBuffer = '';
@@ -191,46 +200,49 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Returns the opcode of the most recently received data message, the right opcode after a
-	 * single {@see receive()}.  A per-message handler over {@see feedMessages()} reads each
-	 * message's own {@see TWebSocketMessage::getOpcode()} instead, as a batch leaves this holding
-	 * only the last message's opcode.
-	 * @return ?int A {@see TWebSocketOpcode} value, or null before any data message.
-	 */
-	public function getLastOpcode(): ?int
-	{
-		return $this->_lastOpcode;
-	}
-
-	/**
-	 * Encodes a frame, masking it on the client side, and queues it for the wire.
+	 * Encodes a frame, masking it on the client side, and queues it for the wire.  A frame after a
+	 * Close is not sent (RFC 6455 section 5.5.1: the Close frame is the last one written).
 	 * @param TWebSocketFrame $frame The frame to send.
-	 * @return int The number of bytes queued.
+	 * @return int The number of bytes queued, or 0 when the connection is closing.
 	 */
 	public function sendFrame(TWebSocketFrame $frame): int
 	{
-		$maskKey = $this->_isClient ? random_bytes(4) : null;
-		return $this->writeAll(TWebSocketFrameCodec::encode($frame, $maskKey));
+		if ($this->_closing) {
+			return 0;
+		}
+		return $this->writeAll($this->encodeFrame($frame));
+	}
+
+	/**
+	 * Encodes a frame for this side of the connection, masking it on the client side.
+	 * @param TWebSocketFrame $frame The frame to encode.
+	 * @return string The wire bytes.
+	 */
+	private function encodeFrame(TWebSocketFrame $frame): string
+	{
+		return TWebSocketFrameCodec::encode($frame, $this->_isClient ? random_bytes(4) : null);
 	}
 
 	/**
 	 * Queues bytes for the wire and drains what the socket accepts now, without blocking.  On a
 	 * non-blocking socket whose send buffer is full, the unwritten tail stays queued for the event
 	 * loop to flush once the socket is {@see hasPendingOutbound() writable}; on a blocking socket the
-	 * write completes here.  A reader too slow to drain the queue past {@see getMaxSendBufferBytes()}
-	 * is dropped rather than allowed to grow the buffer without bound.
+	 * write completes here.  The queue is bounded by {@see getMaxSendBufferBytes()}: a write that
+	 * would push the backlog past the limit is refused before the bytes are copied, so a reader too
+	 * slow to drain the queue (or a single oversized message) is dropped rather than allowed to grow
+	 * the buffer without bound.
 	 * @param string $data The bytes to queue.
-	 * @throws TWebSocketException When the queued backlog exceeds the send-buffer limit, or the write fails.
+	 * @throws TWebSocketException When the backlog would exceed the send-buffer limit, or the write fails.
 	 * @return int The number of bytes queued.
 	 */
 	private function writeAll(string $data): int
 	{
-		$this->_outbound .= $data;
-		$this->flushOutbound();
-		if ($this->_maxSendBufferBytes > 0 && strlen($this->_outbound) > $this->_maxSendBufferBytes) {
+		if ($this->_maxSendBufferBytes > 0 && strlen($this->_outbound) + strlen($data) > $this->_maxSendBufferBytes) {
 			throw (new TWebSocketException('websocket_send_buffer_overflow', $this->_maxSendBufferBytes))
 				->setCloseCode(TWebSocketCloseCode::GoingAway);
 		}
+		$this->_outbound .= $data;
+		$this->flushOutbound();
 		return strlen($data);
 	}
 
@@ -324,20 +336,31 @@ class TWebSocketConnection extends TComponent
 		));
 	}
 
-	/** Sends a Ping. @param string $data The application data (<=125 bytes). @return int Bytes written. */
+	/**
+	 * Sends a Ping.  A no-op once a Close has been sent.
+	 * @param string $data The application data (at most 125 bytes).
+	 * @return int The bytes written, or 0 when the connection is closing.
+	 */
 	public function ping(string $data = ''): int
 	{
 		return $this->sendFrame(TWebSocketFrame::ping($data));
 	}
 
-	/** Sends a Pong. @param string $data The application data (<=125 bytes). @return int Bytes written. */
+	/**
+	 * Sends a Pong.  A no-op once a Close has been sent.
+	 * @param string $data The application data (at most 125 bytes).
+	 * @return int The bytes written, or 0 when the connection is closing.
+	 */
 	public function pong(string $data = ''): int
 	{
 		return $this->sendFrame(TWebSocketFrame::pong($data));
 	}
 
 	/**
-	 * Sends a Close frame, beginning the close handshake.  A second call is a no-op.
+	 * Sends a Close frame, beginning the close handshake.  The connection is
+	 * {@see getIsClosing() closing} from here: no further frame is written, and it becomes
+	 * {@see getIsClosed() closed} when the peer's Close arrives or the stream ends.  A second call is
+	 * a no-op.
 	 * @param int $code A {@see TWebSocketCloseCode} value. Default Normal.
 	 * @param string $reason A reason phrase. Default ''.
 	 */
@@ -347,14 +370,15 @@ class TWebSocketConnection extends TComponent
 			return;
 		}
 		$this->_closing = true;
-		$this->sendFrame(TWebSocketFrame::close($code, $reason));
+		$this->writeAll($this->encodeFrame(TWebSocketFrame::close($code, $reason)));
 	}
 
 	/**
-	 * Completes the close handshake on a blocking connection: sends a Close (when not already closing),
-	 * then reads and discards frames until the peer's Close arrives or the stream ends.  When the
-	 * transport supports it, a read timeout bounds the wait so a peer that never answers cannot block
-	 * the caller forever.
+	 * Completes the close handshake: sends a Close (when not already closing), then reads and
+	 * discards frames until the peer's Close arrives, the stream ends, or the timeout passes.  The
+	 * timeout is measured on {@see getClock() the clock}; a blocking transport also gets it as its
+	 * read timeout, and a non-blocking socket is waited on with select between reads, so a peer that
+	 * never answers cannot hold the caller past the timeout.
 	 * @param int $code A {@see TWebSocketCloseCode} value. Default Normal.
 	 * @param string $reason A reason phrase. Default ''.
 	 * @param ?float $timeout The seconds to wait for the peer's Close, or null for an unbounded wait.
@@ -364,12 +388,18 @@ class TWebSocketConnection extends TComponent
 	{
 		try {
 			$this->close($code, $reason);
+			$deadline = $timeout === null ? null : $this->getClock()->microtime() + $timeout;
 			if ($timeout !== null && $this->_stream instanceof TResource) {
 				$seconds = (int) $timeout;
 				$this->_stream->setTimeout($seconds, (int) (($timeout - $seconds) * 1000000));
 			}
-			while (!$this->_closed && $this->receiveFrame() !== null) {
-				// receiveFrame() handles the peer's Close inline, marking the connection closed.
+			while (!$this->_closed) {
+				if ($this->receiveFrame() !== null) {
+					continue;   // receiveFrame() handles the peer's Close inline, marking the connection closed
+				}
+				if ($this->_closed || !$this->awaitReadable($deadline)) {
+					break;
+				}
 			}
 		} catch (\Throwable $e) {
 			// The peer is gone or unresponsive (a broken pipe, a read timeout, a protocol error);
@@ -380,16 +410,43 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
+	 * Waits for the transport to become readable, until the deadline on {@see getClock() the clock}.
+	 * Only a socket transport can be waited on; any other stream reports nothing more to wait for.
+	 * @param ?float $deadline The clock time to give up at, or null to wait until readable.
+	 * @return bool Whether more may be read (true), or the wait ended without data (false).
+	 */
+	private function awaitReadable(?float $deadline): bool
+	{
+		if (!$this->_stream instanceof TResource || $this->_stream->eof()) {
+			return false;
+		}
+		$remaining = $deadline === null ? self::DRAIN_POLL_INTERVAL : $deadline - $this->getClock()->microtime();
+		if ($remaining <= 0) {
+			return false;
+		}
+		$wait = min($remaining, self::DRAIN_POLL_INTERVAL);
+		$read = [$this->_stream];
+		$write = null;
+		$except = null;
+		TSocketServer::select($read, $write, $except, (int) $wait, (int) (($wait - (int) $wait) * 1000000));
+		return true;
+	}
+
+	/**
 	 * Reads and returns the next single frame, handling control frames inline (auto-Pong,
 	 * close handshake).  Useful for an event loop that pumps one frame at a time; the
-	 * message-level {@see receive()} builds on it.
-	 * @return ?TWebSocketFrame The frame, or null at a clean end of stream.
+	 * message-level {@see receive()} builds on it.  The connection is marked closed only when the
+	 * stream reports end of file; a non-blocking stream with no frame available yet returns null and
+	 * stays open.
+	 * @return ?TWebSocketFrame The frame, or null at end of stream or when no frame is available yet.
 	 */
 	public function receiveFrame(): ?TWebSocketFrame
 	{
 		$frame = TWebSocketFrameCodec::decode($this->_stream, $this->expectedMask(), $this->_maxMessageSize);
 		if ($frame === null) {
-			$this->_closed = true;
+			if ($this->_stream->eof()) {
+				$this->_closed = true;
+			}
 			return null;
 		}
 		$this->validateFrame($frame);
@@ -400,11 +457,13 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Reads the next complete data message, reassembling fragments and handling control frames
-	 * transparently (a lone Ping is answered and the wait continues for the next data message).
-	 * @return ?string The message payload, or null when the connection closes or the stream ends.
+	 * Reads the next complete data message with its opcode, reassembling fragments and handling
+	 * control frames transparently (a lone Ping is answered and the wait continues for the next data
+	 * message).
+	 * @return ?TWebSocketMessage The message, or null when the connection closes, the stream ends, or
+	 *   (on a non-blocking stream) no frame is available yet.
 	 */
-	public function receive(): ?string
+	public function receiveMessage(): ?TWebSocketMessage
 	{
 		while (!$this->_closed) {
 			$frame = $this->receiveFrame();
@@ -423,6 +482,16 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
+	 * Reads the next complete data message's payload; the string form of {@see receiveMessage()}.
+	 * @return ?string The message payload, or null when the connection closes, the stream ends, or
+	 *   (on a non-blocking stream) no frame is available yet.
+	 */
+	public function receive(): ?string
+	{
+		return $this->receiveMessage()?->getPayload();
+	}
+
+	/**
 	 * Feeds received bytes and returns the complete data messages they yield (non-blocking), each
 	 * paired with its opcode.
 	 *
@@ -432,9 +501,8 @@ class TWebSocketConnection extends TComponent
 	 * (auto-Pong, close handshake), and fragmented messages are reassembled.  A Close frame marks
 	 * the connection {@see getIsClosed() closed}.
 	 *
-	 * One read can yield several messages of different kinds, so each {@see TWebSocketMessage} carries
-	 * its own opcode; a per-message handler reads that rather than {@see getLastOpcode()}, which holds
-	 * only the last message's opcode after the batch.
+	 * The frames are decoded at an advancing offset and the buffer is compacted once per call, so a
+	 * read holding thousands of small frames costs time linear in its size.
 	 *
 	 * @param string $bytes The bytes just read from the transport.
 	 * @throws TWebSocketException When a frame is malformed (the caller should close).
@@ -442,24 +510,76 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function feedMessages(string $bytes): array
 	{
-		$this->_readBuffer .= $bytes;
+		$buffer = $this->_readBuffer . $bytes;
+		$this->_readBuffer = '';
+		$available = strlen($buffer);
+		$offset = 0;
 		$messages = [];
-		while (!$this->_closed && ($decoded = TWebSocketFrameCodec::tryDecode($this->_readBuffer, $this->expectedMask(), $this->_maxMessageSize)) !== null) {
-			$this->_readBuffer = substr($this->_readBuffer, $decoded['length']);
-			$frame = $decoded['frame'];
-			$this->validateFrame($frame);
-			if ($frame->getIsControl()) {
-				$this->handleControlFrame($frame);
-				continue;
+		try {
+			while (!$this->_closed && $offset < $available) {
+				$length = self::frameLengthAt($buffer, $offset);
+				if ($length === null || $offset + $length > $available) {
+					// The header or payload is still arriving: tryDecode() on the tail applies the
+					// header checks (mask state, control-frame rules, the size limit) that fail early.
+					TWebSocketFrameCodec::tryDecode(substr($buffer, $offset), $this->expectedMask(), $this->_maxMessageSize);
+					break;
+				}
+				$decoded = TWebSocketFrameCodec::tryDecode(substr($buffer, $offset, $length), $this->expectedMask(), $this->_maxMessageSize);
+				if ($decoded === null) {
+					break;
+				}
+				$offset += $decoded['length'];
+				$frame = $decoded['frame'];
+				$this->validateFrame($frame);
+				if ($frame->getIsControl()) {
+					$this->handleControlFrame($frame);
+					continue;
+				}
+				$message = $this->ingestDataFrame($frame);
+				if ($message !== null) {
+					$messages[] = $message;
+				}
 			}
-			$message = $this->ingestDataFrame($frame);
-			if ($message !== null) {
-				// _lastOpcode holds this message's opcode here: it was set on the message's first
-				// frame and is not overwritten until the next message begins.
-				$messages[] = new TWebSocketMessage($this->_lastOpcode ?? TWebSocketOpcode::Text, $message);
-			}
+		} finally {
+			$this->_readBuffer = $offset === 0 ? $buffer : (string) substr($buffer, $offset);
 		}
 		return $messages;
+	}
+
+	/**
+	 * Returns the wire length of the frame starting at an offset, computed from its header alone,
+	 * or null when the header is not yet complete.  A 64-bit length past the signed range reports
+	 * null too, leaving the rejection to the codec.
+	 * @param string $buffer The buffered bytes.
+	 * @param int $offset The frame's first byte.
+	 * @return ?int The frame length in bytes (header, mask key, and payload), or null when unknown.
+	 */
+	private static function frameLengthAt(string $buffer, int $offset): ?int
+	{
+		$available = strlen($buffer) - $offset;
+		if ($available < 2) {
+			return null;
+		}
+		$byte1 = ord($buffer[$offset + 1]);
+		$header = 2 + ((($byte1 & TWebSocketFrameCodec::MASK) !== 0) ? 4 : 0);
+		$length = $byte1 & TWebSocketFrameCodec::LENGTH_MASK;
+		if ($length === 126) {
+			if ($available < 4) {
+				return null;
+			}
+			$length = unpack('n', $buffer, $offset + 2)[1];
+			$header += 2;
+		} elseif ($length === 127) {
+			if ($available < 10) {
+				return null;
+			}
+			$length = unpack('J', $buffer, $offset + 2)[1];
+			if ($length < 0 || $length > PHP_INT_MAX - $header) {
+				return null;
+			}
+			$header += 8;
+		}
+		return $header + $length;
 	}
 
 	/**
@@ -497,7 +617,7 @@ class TWebSocketConnection extends TComponent
 					$this->_closing = true;
 					$code = $frame->getCloseCode();
 					$echo = ($code !== null && TWebSocketCloseCode::isSendable($code)) ? $code : TWebSocketCloseCode::Normal;
-					$this->sendFrame(TWebSocketFrame::close($echo));
+					$this->writeAll($this->encodeFrame(TWebSocketFrame::close($echo)));   // the echoed Close is the last frame written
 				}
 				$this->_closed = true;
 				break;
@@ -565,9 +685,9 @@ class TWebSocketConnection extends TComponent
 	 * error.  On the final frame it enforces the size limit and validates UTF-8 for a Text message.
 	 * @param TWebSocketFrame $frame The data frame (Text, Binary, or Continuation).
 	 * @throws TWebSocketException On a fragmentation error, an oversized message, or invalid UTF-8.
-	 * @return ?string The completed message, or null while the message is still being reassembled.
+	 * @return ?TWebSocketMessage The completed message, or null while the message is still being reassembled.
 	 */
-	private function ingestDataFrame(TWebSocketFrame $frame): ?string
+	private function ingestDataFrame(TWebSocketFrame $frame): ?TWebSocketMessage
 	{
 		$opcode = $frame->getOpcode();
 		if ($opcode === TWebSocketOpcode::Continuation) {
@@ -580,7 +700,6 @@ class TWebSocketConnection extends TComponent
 			}
 			$this->_fragmentOpcode = $opcode;
 			$this->_fragmentRsv = self::frameRsv($frame);
-			$this->_lastOpcode = $opcode;
 		}
 		$this->_messageBuffer .= $frame->getPayload();
 		if ($this->_maxMessageSize > 0 && strlen($this->_messageBuffer) > $this->_maxMessageSize) {
@@ -592,7 +711,7 @@ class TWebSocketConnection extends TComponent
 			return null;
 		}
 		$message = $this->_messageBuffer;
-		$isText = $this->_fragmentOpcode === TWebSocketOpcode::Text;
+		$messageOpcode = $this->_fragmentOpcode ?? TWebSocketOpcode::Text;
 		$rsv = $this->_fragmentRsv;
 		$this->resetMessage();
 		foreach (array_reverse($this->_extensions) as $extension) {
@@ -602,11 +721,11 @@ class TWebSocketConnection extends TComponent
 			throw (new TWebSocketException('websocket_message_too_big', $this->_maxMessageSize))
 				->setCloseCode(TWebSocketCloseCode::MessageTooBig);
 		}
-		if ($isText && !self::isValidUtf8($message)) {
+		if ($messageOpcode === TWebSocketOpcode::Text && !self::isValidUtf8($message)) {
 			throw (new TWebSocketException('websocket_text_not_utf8'))
 				->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);
 		}
-		return $message;
+		return new TWebSocketMessage($messageOpcode, $message);
 	}
 
 	/**

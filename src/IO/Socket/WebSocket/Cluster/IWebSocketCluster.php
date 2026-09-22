@@ -49,4 +49,11 @@ interface IWebSocketCluster
 	 * @param string $node The dead node id.
 	 */
 	public function dropNodePresence(string $node): void;
+
+	/**
+	 * Returns the presence metadata of the clients connected to this node, so a backplane can
+	 * re-announce them after it reconnects.
+	 * @return array<string, array<string, mixed>> The local clients' presence metadata, keyed by client id.
+	 */
+	public function getLocalPresence(): array;
 }

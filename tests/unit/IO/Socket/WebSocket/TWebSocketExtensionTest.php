@@ -1,5 +1,8 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketExtension;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -68,7 +71,7 @@ class ReverseExtension implements IWebSocketExtension
 	}
 }
 
-class TWebSocketExtensionTest extends PHPUnit\Framework\TestCase
+class TWebSocketExtensionTest extends TestCase
 {
 	/** @return array{0: TWebSocketConnection, 1: TWebSocketConnection, 2: TSocketStream, 3: TSocketStream} */
 	private function pair(array $clientExtensions, array $serverExtensions): array
@@ -174,7 +177,7 @@ class TWebSocketExtensionTest extends PHPUnit\Framework\TestCase
 		$conn = new TWebSocketConnection($a, false);
 		$this->expectException(TWebSocketException::class);
 		try {
-			$conn->setExtensions([new stdClass()]);
+			$conn->setExtensions([new \stdClass()]);
 		} finally {
 			$a->close();
 			$b->close();

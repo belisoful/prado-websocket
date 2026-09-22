@@ -12,7 +12,10 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\Exceptions\TConfigurationException;
 use Prado\TComponent;
+use Prado\Prado;
 use Prado\TPropertyValue;
+use Prado\Util\Log\TLogger;
+use Prado\Util\Clock\TApplicationClockAwareTrait;
 
 /**
  * TRedisBackplane class.
@@ -26,11 +29,18 @@ use Prado\TPropertyValue;
  *  - Each node drains its own inbox list `{prefix}inbox:{node}` with non-blocking pops.
  *  - {@see publish()} routes by envelope type: a publish reaches the nodes in the channel-interest
  *    set `{prefix}ch:{channel}`, a direct reaches the node the presence hash maps the client to, and
- *    a broadcast reaches every node in `{prefix}nodes`.
+ *    a broadcast reaches every node in `{prefix}nodes`.  The pushes for one envelope go out in a
+ *    single pipeline, and each inbox is capped at {@see getInboxLimit() InboxLimit} entries so a
+ *    slow consumer cannot grow it without bound.
  *  - Presence lives in the hash `{prefix}presence` (client id to metadata), seeded into a joining
  *    node in {@see open()} and kept live as changes fan out as presence envelopes.
  *  - Discovery is dynamic: a node refreshes a TTL heartbeat key `{prefix}node:{node}`, and a stale
- *    member of `{prefix}nodes` (its heartbeat expired) is pruned.
+ *    member of `{prefix}nodes` (its heartbeat expired) is reaped, its clients dropped from every
+ *    node's presence mirror.
+ *  - A dropped connection degrades the backplane rather than the serve loop; {@see tick()} retries it
+ *    every {@see RECONNECT_INTERVAL} seconds, and a reconnect rebuilds the node's registry entry,
+ *    channel interest, and presence from local state, so nothing declared during the outage is lost.
+ *    Opening under a node id purges what a previous incarnation of that id left behind.
  *
  * Requires ext-redis at runtime.  Configure {@see setHost() Host}, {@see setPort() Port}, and
  * optionally {@see setPassword() Password}, {@see setDatabase() Database}, {@see setPrefix() Prefix},
@@ -40,19 +50,30 @@ use Prado\TPropertyValue;
  */
 class TRedisBackplane extends TComponent implements IWebSocketBackplane
 {
+	use TApplicationClockAwareTrait;
+
 	/** The maximum envelopes drained from the inbox per {@see tick()}. */
 	public const DRAIN_LIMIT = 1000;
 
 	/** The seconds between reconnect attempts after the Redis connection drops. */
 	public const RECONNECT_INTERVAL = 5.0;
 
+	/** The phpredis `\Redis::OPT_READ_TIMEOUT` option, spelled out so it resolves without ext-redis loaded. */
+	private const OPT_READ_TIMEOUT = 3;
+
+	/** The phpredis `\Redis::PIPELINE` mode for {@see \Redis::multi()}, spelled out for the same reason. */
+	private const PIPELINE = 2;
+
+	/** @var int The most envelopes an inbox holds; older ones are discarded first. 0 for unlimited. */
+	private int $_inboxLimit = 10000;
+
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
 	/** @var ?\Redis The Redis connection, while open. */
-	private ?\Redis $_redis = null;
+	private ?object $_redis = null;
 
-	/** @var float The earliest {@see microtime()} a reconnect may be attempted after a drop. */
+	/** @var float The earliest {@see \Prado\Util\Clock\IClock::microtime()} a reconnect may be attempted after a drop. */
 	private float $_reconnectAt = 0.0;
 
 	/** @var string The Redis host. */
@@ -99,20 +120,19 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	// =========================================================================
 
 	/**
-	 * Connects to Redis, joins the node registry, and seeds the presence mirror.
+	 * Connects to Redis, purges what a previous incarnation of this node id left behind, joins the node
+	 * registry, re-declares the local channel interest and presence, and seeds the presence mirror.
+	 * The same sequence serves a reconnect, so state declared while disconnected is not lost.
 	 * @throws TConfigurationException When ext-redis is missing or the connection fails.
 	 */
 	public function open(): void
 	{
-		if (!class_exists('Redis')) {
-			throw new TConfigurationException('websocket_backplane_redis_missing');
-		}
 		try {
-			$redis = new \Redis();
+			$redis = $this->createRedis();
 			if (!$redis->connect($this->_host, $this->_port, $this->_timeout)) {
 				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
-			$redis->setOption(\Redis::OPT_READ_TIMEOUT, $this->_timeout > 0 ? $this->_timeout : self::RECONNECT_INTERVAL);   // a stalled Redis must not block the serve loop forever
+			$redis->setOption(self::OPT_READ_TIMEOUT, $this->_timeout > 0 ? $this->_timeout : self::RECONNECT_INTERVAL);   // a stalled Redis must not block the serve loop forever
 			if (($this->_password !== null && $this->_password !== '') && !$redis->auth($this->_password)) {
 				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
@@ -120,8 +140,9 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 				throw new TConfigurationException('websocket_backplane_redis_connect_failed', $this->_host . ':' . $this->_port);
 			}
 			$this->_redis = $redis;
-			$this->_channels = [];
+			$this->reapNode($this->nodeId(), false);   // a prior incarnation's (or the pre-drop) interest and presence, rebuilt below from local state; the inbox is kept and drained
 			$this->heartbeat(true);   // the first registry write can fail too, so it stays inside the guard
+			$this->resync();
 			$this->seedPresence();
 		} catch (TConfigurationException $e) {
 			$this->_redis = null;
@@ -179,7 +200,12 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 				$this->_redis->lTrim($inbox, count($lines), -1);   // remove exactly what was read (this node is the sole consumer of its inbox)
 				foreach ($lines as $line) {
 					if (is_string($line) && ($envelope = TWebSocketEnvelope::decode($line)) !== null) {
-						$this->_cluster->receiveEnvelope($envelope);
+						try {
+							$this->_cluster->receiveEnvelope($envelope);
+						} catch (\Throwable $e) {
+							// A delivery failure (one client's dead socket) is not a Redis fault: log it and keep draining the batch.
+							Prado::log('Redis backplane delivery of a ' . $envelope->getType() . ' envelope failed: ' . $e->getMessage(), TLogger::WARNING, static::class);
+						}
 					}
 				}
 			}
@@ -201,6 +227,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 		try {
 			$op();
 		} catch (\Throwable $e) {
+			Prado::log('Redis backplane fault, disconnecting for ' . self::RECONNECT_INTERVAL . 's: ' . $e->getMessage(), TLogger::WARNING, static::class);
 			$this->disconnect();
 		}
 	}
@@ -218,7 +245,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			}
 			$this->_redis = null;
 		}
-		$this->_reconnectAt = microtime(true) + self::RECONNECT_INTERVAL;
+		$this->_reconnectAt = $this->getClock()->microtime() + self::RECONNECT_INTERVAL;
 	}
 
 	/**
@@ -227,14 +254,49 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	private function reconnect(): void
 	{
-		if (microtime(true) < $this->_reconnectAt) {
+		if ($this->getClock()->microtime() < $this->_reconnectAt) {
 			return;
 		}
-		$this->_reconnectAt = microtime(true) + self::RECONNECT_INTERVAL;
+		$this->_reconnectAt = $this->getClock()->microtime() + self::RECONNECT_INTERVAL;
 		try {
 			$this->open();
+			Prado::log('Redis backplane reconnected to ' . $this->_host . ':' . $this->_port, TLogger::INFO, static::class);
 		} catch (\Throwable $e) {
+			Prado::log('Redis backplane reconnect failed: ' . $e->getMessage(), TLogger::NOTICE, static::class);
 			$this->disconnect();
+		}
+	}
+
+	/**
+	 * Creates the Redis client {@see open()} connects.  Isolated so a test can substitute a fake.
+	 * @throws TConfigurationException When ext-redis is missing.
+	 * @return \Redis The unconnected client.
+	 */
+	protected function createRedis(): object
+	{
+		if (!class_exists('Redis')) {
+			throw new TConfigurationException('websocket_backplane_redis_missing');
+		}
+		return new \Redis();
+	}
+
+	/**
+	 * Re-declares this node's channel interest and its local clients' presence after a (re)connect,
+	 * announcing the presence to the other nodes as on first registration.
+	 */
+	private function resync(): void
+	{
+		if ($this->_redis === null) {
+			return;
+		}
+		$node = $this->nodeId();
+		foreach (array_keys($this->_channels) as $channel) {
+			$this->_redis->sAdd($this->_prefix . 'ch:' . $channel, $node);
+			$this->_redis->sAdd($this->_prefix . 'nodech:' . $node, $channel);
+		}
+		foreach ($this->_cluster?->getLocalPresence() ?? [] as $clientId => $meta) {
+			$this->_redis->hSet($this->_prefix . 'presence', (string) $clientId, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, (string) $clientId, $meta));
 		}
 	}
 
@@ -335,7 +397,8 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	// =========================================================================
 
 	/**
-	 * Pushes an envelope onto each target node's inbox, skipping the local node.
+	 * Pushes an envelope onto each target node's inbox, skipping the local node.  All pushes go in one
+	 * pipeline (one round trip), and each inbox is trimmed to {@see getInboxLimit() InboxLimit}.
 	 * @param string[] $nodes The target node ids.
 	 * @param TWebSocketEnvelope $envelope The envelope to deliver.
 	 */
@@ -345,12 +408,19 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		$self = $this->nodeId();
+		$targets = array_filter($nodes, fn ($node) => $node !== $self && $node !== '');
+		if ($targets === []) {
+			return;
+		}
 		$line = $envelope->encode();
-		foreach ($nodes as $node) {
-			if ($node !== $self && $node !== '') {
-				$this->_redis->rPush($this->_prefix . 'inbox:' . $node, $line);
+		$pipe = $this->_redis->multi(self::PIPELINE);
+		foreach ($targets as $node) {
+			$pipe->rPush($this->_prefix . 'inbox:' . $node, $line);
+			if ($this->_inboxLimit > 0) {
+				$pipe->lTrim($this->_prefix . 'inbox:' . $node, -$this->_inboxLimit, -1);   // keep the newest entries; a stalled consumer loses its oldest
 			}
 		}
+		$pipe->exec();
 	}
 
 	/**
@@ -401,7 +471,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 		if ($this->_redis === null) {
 			return;
 		}
-		$now = microtime(true);
+		$now = $this->getClock()->microtime();
 		if (!$force && ($now - $this->_lastBeat) < ($this->_nodeTtl / 3)) {
 			return;
 		}
@@ -419,7 +489,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 		if ($this->_redis === null) {
 			return;
 		}
-		$now = microtime(true);
+		$now = $this->getClock()->microtime();
 		if (($now - $this->_lastPrune) < $this->_nodeTtl) {
 			return;
 		}
@@ -433,13 +503,15 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	}
 
 	/**
-	 * Reclaims all state a crashed node left behind: its registry membership, its channel interest
-	 * (so publishes stop re-creating its inbox), its inbox list (which has no TTL of its own), and its
-	 * clients' presence entries.  Without this a node that dies ungracefully leaks unbounded Redis
-	 * memory and leaves phantom clients advertised cluster-wide.
-	 * @param string $node The expired node id.
+	 * Reclaims all state a dead node left behind: its registry membership, its channel interest (so
+	 * publishes stop re-creating its inbox), its inbox list (which has no TTL of its own), and its
+	 * clients' presence entries, which are also dropped from the local presence mirror.  Without this
+	 * a node that dies ungracefully leaks unbounded Redis memory and leaves phantom clients advertised
+	 * cluster-wide.
+	 * @param string $node The dead node id.
+	 * @param bool $inbox Whether to delete the node's inbox too (kept when the node is this one, reopening).
 	 */
-	private function reapNode(string $node): void
+	private function reapNode(string $node, bool $inbox = true): void
 	{
 		$this->_redis->sRem($this->_prefix . 'nodes', $node);
 		$channels = $this->_redis->sMembers($this->_prefix . 'nodech:' . $node);
@@ -449,7 +521,9 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			}
 		}
 		$this->_redis->del($this->_prefix . 'nodech:' . $node);
-		$this->_redis->del($this->_prefix . 'inbox:' . $node);
+		if ($inbox) {
+			$this->_redis->del($this->_prefix . 'inbox:' . $node);
+		}
 		$presence = $this->_redis->hGetAll($this->_prefix . 'presence');
 		if (is_array($presence)) {
 			foreach ($presence as $clientId => $json) {
@@ -458,6 +532,10 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 					$this->_redis->hDel($this->_prefix . 'presence', (string) $clientId);
 				}
 			}
+		}
+		if ($node !== $this->nodeId()) {
+			Prado::log("Redis backplane reaped node {$node}: its heartbeat expired", TLogger::WARNING, static::class);
+			$this->_cluster?->dropNodePresence($node);   // the running nodes forget the dead node's clients too, not only a late joiner
 		}
 	}
 
@@ -493,6 +571,27 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	// =========================================================================
 	// Properties
 	// =========================================================================
+
+	/**
+	 * Returns the most envelopes a node's inbox holds.
+	 * @return int The inbox limit, or 0 for unlimited.
+	 */
+	public function getInboxLimit(): int
+	{
+		return $this->_inboxLimit;
+	}
+
+	/**
+	 * Sets the most envelopes a node's inbox holds; a push beyond it discards the oldest, so a node that
+	 * stalls (or is slow to drain) cannot grow its inbox without bound.  Default 10000; 0 for unlimited.
+	 * @param int|string $value The inbox limit.
+	 * @return static The current backplane.
+	 */
+	public function setInboxLimit($value): static
+	{
+		$this->_inboxLimit = max(0, TPropertyValue::ensureInteger($value));
+		return $this;
+	}
 
 	/**
 	 * Returns the Redis host.

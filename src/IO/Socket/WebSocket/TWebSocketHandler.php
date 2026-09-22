@@ -22,9 +22,17 @@ use Prado\TComponent;
  *
  * Events ('on' prefix), each raised with the connection as sender:
  *  - onOpen: the connection is ready (param null).
- *  - onMessage: a complete message arrived (param the message string).
+ *  - onMessage: a complete message arrived (param the {@see TWebSocketMessage}: payload, opcode,
+ *    {@see TWebSocketMessage::getIsText()}/{@see TWebSocketMessage::getIsBinary()}; it
+ *    stringifies to the payload).
  *  - onClose: the connection closed (param null).
  *  - onError: a protocol error occurred (param the {@see \Throwable}).
+ *
+ * ```php
+ * $handler->attachEventHandler('onMessage', function ($connection, $message) {
+ *     $message->getIsBinary() ? $connection->sendBinary($message->getPayload()) : $connection->send("echo: $message");
+ * });
+ * ```
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc6455.html

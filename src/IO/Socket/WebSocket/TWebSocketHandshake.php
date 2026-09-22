@@ -40,6 +40,9 @@ class TWebSocketHandshake
 	/** @var int The maximum handshake head size read from a stream. */
 	public const MAX_HANDSHAKE_BYTES = 16384;
 
+	/** @var string The pattern a `Sec-WebSocket-Key` must match: 16 random bytes as one 24-character base64 token. */
+	private const KEY_PATTERN = '#^[A-Za-z0-9+/]{22}==$#';
+
 	/**
 	 * Computes the Sec-WebSocket-Accept value for a client's Sec-WebSocket-Key.
 	 * @param string $key The client's Sec-WebSocket-Key.
@@ -63,16 +66,16 @@ class TWebSocketHandshake
 	 * Parses a `ws://` or `wss://` URL into the components a client handshake needs: the request
 	 * target (`path`, including any query) and the `Host` header value, plus the `secure` flag the
 	 * caller uses to choose a TLS transport.  A missing port defaults to 80 (`ws`) or 443 (`wss`),
-	 * and the `Host` header omits a default port.
+	 * and the `Host` header omits a default port.  A URL with a fragment is invalid (RFC 6455 §3).
 	 * @param string $url The WebSocket URL.
-	 * @throws TWebSocketException When the URL is malformed or its scheme is not `ws`/`wss`.
+	 * @throws TWebSocketException When the URL is malformed, carries a fragment, or its scheme is not `ws`/`wss`.
 	 * @return array{scheme: string, secure: bool, host: string, port: int, path: string, hostHeader: string}
 	 *   The parsed components.
 	 */
 	public static function parseUrl(string $url): array
 	{
 		$parts = parse_url($url);
-		if (!is_array($parts) || !isset($parts['host'])) {
+		if (!is_array($parts) || !isset($parts['host']) || isset($parts['fragment'])) {
 			throw new TWebSocketException('websocket_url_invalid', $url);
 		}
 		$scheme = strtolower($parts['scheme'] ?? '');
@@ -98,7 +101,10 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Parses an HTTP request or response head into its line, headers, and body.
+	 * Parses an HTTP request or response head into its line, headers, and body.  A header field
+	 * that repeats is combined into one value joined with `, ` (RFC 7230 §3.2.2), so a
+	 * `Sec-WebSocket-Protocol`, `Sec-WebSocket-Extensions`, or `Connection` split across lines
+	 * reads as its full list.
 	 * @param string $data The HTTP head (and optional body) text.
 	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string}
 	 *   The parsed message; header keys are lower-cased.
@@ -135,32 +141,46 @@ class TWebSocketHandshake
 				continue;
 			}
 			[$name, $value] = explode(':', $line, 2);
-			$result['headers'][strtolower(trim($name))] = trim($value);
+			$name = strtolower(trim($name));
+			$value = trim($value);
+			$result['headers'][$name] = isset($result['headers'][$name]) ? $result['headers'][$name] . ', ' . $value : $value;
 		}
 		return $result;
 	}
 
 	/**
-	 * Indicates whether parsed request headers form a valid WebSocket upgrade: an `Upgrade: websocket`
-	 * with `Connection: Upgrade` and a `Sec-WebSocket-Key` that decodes to 16 bytes.
+	 * Splits a header's comma-separated list into lower-cased, trimmed tokens.
+	 * @param array<string, string> $headers The lower-cased headers.
+	 * @param string $name The header name (any case).
+	 * @return string[] The tokens, empty when the header is absent.
+	 */
+	private static function headerTokens(array $headers, string $name): array
+	{
+		$value = $headers[strtolower($name)] ?? '';
+		return array_values(array_filter(array_map('trim', explode(',', strtolower($value))), fn ($token) => $token !== ''));
+	}
+
+	/**
+	 * Indicates whether parsed request headers form a valid WebSocket upgrade: an `Upgrade` list
+	 * containing `websocket`, a `Connection` list containing `Upgrade`, and a `Sec-WebSocket-Key`
+	 * that is one 24-character base64 token encoding 16 bytes.
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @return bool Whether the request is a WebSocket upgrade with a valid key.
 	 */
 	public static function isUpgradeRequest(array $headers): bool
 	{
-		$connection = array_map('trim', explode(',', strtolower($headers[strtolower(THttpHeaderName::Connection)] ?? '')));
-		$key = $headers[strtolower(THttpHeaderName::SecWebSocketKey)] ?? null;
-		$decoded = $key === null ? false : base64_decode($key, true);
-		return in_array('upgrade', $connection, true)
-			&& strtolower($headers[strtolower(THttpHeaderName::Upgrade)] ?? '') === 'websocket'
-			&& is_string($decoded) && strlen($decoded) === 16;
+		$key = $headers[strtolower(THttpHeaderName::SecWebSocketKey)] ?? '';
+		return in_array('upgrade', self::headerTokens($headers, THttpHeaderName::Connection), true)
+			&& in_array('websocket', self::headerTokens($headers, THttpHeaderName::Upgrade), true)
+			&& preg_match(self::KEY_PATTERN, $key) === 1
+			&& strlen((string) base64_decode($key, true)) === 16;
 	}
 
 	/**
 	 * Validates a parsed request as a WebSocket upgrade, returning the HTTP rejection to send when it
 	 * is not.  A request that is not an HTTP/1.1-or-higher `GET`, omits `Host`, or is not an
 	 * `Upgrade: websocket` with a valid key is a `400`; a request whose `Sec-WebSocket-Version` is not
-	 * 13 is a `426` advertising the supported version.
+	 * exactly the token `13` is a `426` advertising the supported version.
 	 * @param array{method: ?string, protocol?: string, headers: array<string, string>} $request The parsed request.
 	 * @return ?string The rejection response to write, or null when the request is a valid upgrade.
 	 */
@@ -179,10 +199,21 @@ class TWebSocketHandshake
 		if (!self::isUpgradeRequest($headers)) {
 			return self::buildRejection(400, 'Bad Request');
 		}
-		if ((int) ($headers[strtolower(THttpHeaderName::SecWebSocketVersion)] ?? 0) !== self::VERSION) {
+		if (!self::isSupportedVersion($headers[strtolower(THttpHeaderName::SecWebSocketVersion)] ?? null)) {
 			return self::buildVersionRejection();
 		}
 		return null;
+	}
+
+	/**
+	 * Indicates whether a `Sec-WebSocket-Version` value is exactly the supported version token.
+	 * `13abc` and `13, 8` are not.
+	 * @param ?string $version The header value, or null when absent.
+	 * @return bool Whether the version is {@see VERSION}.
+	 */
+	public static function isSupportedVersion(?string $version): bool
+	{
+		return $version !== null && trim($version) === (string) self::VERSION;
 	}
 
 	/**
@@ -202,6 +233,8 @@ class TWebSocketHandshake
 	/**
 	 * Indicates whether a request's `Origin` is allowed by the configured allowlist.  A null or empty
 	 * allowlist permits any origin; otherwise the request must carry an `Origin` the list contains.
+	 * The comparison ignores ASCII case, since an RFC 6454 serialized origin is a lower-case scheme
+	 * and host.
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @param ?string[] $allowed The allowed origins, or null to allow any.
 	 * @return bool Whether the origin is allowed.
@@ -212,7 +245,7 @@ class TWebSocketHandshake
 			return true;
 		}
 		$origin = $headers[strtolower(THttpHeaderName::Origin)] ?? null;
-		return $origin !== null && in_array($origin, $allowed, true);
+		return $origin !== null && in_array(strtolower($origin), array_map('strtolower', $allowed), true);
 	}
 
 	/**
@@ -254,9 +287,11 @@ class TWebSocketHandshake
 	/**
 	 * Parses a `Sec-WebSocket-Extensions` header into its offers, each a name and its parameters.
 	 * A parameter with no value is `true`; a quoted value is unwrapped.  Names and parameter keys are
-	 * lower-cased, and a repeated extension keeps every offer in order.
+	 * lower-cased, and a repeated extension keeps every offer in order.  A parameter that repeats
+	 * within one offer keeps its last value in `params` and is listed in `duplicates`, so a caller
+	 * can decline the offer (RFC 7692 §7.1 requires it for `permessage-deflate`).
 	 * @param string $value The header value.
-	 * @return array<int, array{name: string, params: array<string, bool|string>}> The parsed offers.
+	 * @return array<int, array{name: string, params: array<string, bool|string>, duplicates: string[]}> The parsed offers.
 	 */
 	public static function parseExtensionHeader(string $value): array
 	{
@@ -268,6 +303,7 @@ class TWebSocketHandshake
 				continue;
 			}
 			$params = [];
+			$duplicates = [];
 			foreach ($parts as $part) {
 				$part = trim($part);
 				if ($part === '') {
@@ -279,12 +315,17 @@ class TWebSocketHandshake
 					if (strlen($val) >= 2 && $val[0] === '"' && $val[-1] === '"') {
 						$val = (string) preg_replace('/\\\\(.)/', '$1', substr($val, 1, -1));   // unwrap the quoted-string and undo backslash escapes
 					}
-					$params[strtolower(trim($key))] = $val;
+					$key = strtolower(trim($key));
 				} else {
-					$params[strtolower($part)] = true;
+					$key = strtolower($part);
+					$val = true;
 				}
+				if (isset($params[$key]) && !in_array($key, $duplicates, true)) {
+					$duplicates[] = $key;
+				}
+				$params[$key] = $val;
 			}
-			$offers[] = ['name' => $name, 'params' => $params];
+			$offers[] = ['name' => $name, 'params' => $params, 'duplicates' => $duplicates];
 		}
 		return $offers;
 	}
@@ -338,8 +379,9 @@ class TWebSocketHandshake
 
 	/**
 	 * Server side: negotiates the extensions from the client's offer against the supported negotiators,
-	 * in the server's preference order.  An accepted extension whose reserved bit a prior one already
-	 * took is skipped, so the agreed list never reserves a bit twice.
+	 * in the server's preference order.  An offer that repeats a parameter is declined before the
+	 * negotiator sees it, since a parameter map cannot carry it.  An accepted extension whose
+	 * reserved bit a prior one already took is skipped, so the agreed list never reserves a bit twice.
 	 * @param array<string, string> $requestHeaders The lower-cased request headers.
 	 * @param IWebSocketExtensionNegotiator[] $negotiators The supported negotiators, in preference order.
 	 * @return array{extensions: IWebSocketExtension[], header: string} The agreed extensions and the
@@ -358,7 +400,7 @@ class TWebSocketHandshake
 			$name = strtolower($negotiator->getName());
 			$matching = [];
 			foreach ($offers as $offer) {
-				if ($offer['name'] === $name) {
+				if ($offer['name'] === $name && $offer['duplicates'] === []) {
 					$matching[] = $offer['params'];
 				}
 			}
@@ -398,8 +440,8 @@ class TWebSocketHandshake
 
 	/**
 	 * Client side: resolves the server's accepted extensions into configured extensions, in the
-	 * server's response order.  An accepted extension that was not offered, or whose parameters the
-	 * negotiator rejects, fails the handshake.
+	 * server's response order.  An accepted extension that was not offered, that repeats a parameter,
+	 * or whose parameters the negotiator rejects, fails the handshake.
 	 * @param array<string, string> $responseHeaders The lower-cased response headers.
 	 * @param IWebSocketExtensionNegotiator[] $negotiators The negotiators that were offered.
 	 * @throws TWebSocketException When the server accepted an unoffered or unacceptable extension.
@@ -420,6 +462,9 @@ class TWebSocketHandshake
 			$negotiator = $byName[$offer['name']] ?? null;
 			if ($negotiator === null) {
 				throw new TWebSocketException('websocket_extension_not_offered', $offer['name']);
+			}
+			if ($offer['duplicates'] !== []) {
+				throw new TWebSocketException('websocket_extension_unacceptable', $offer['name']);   // a repeated parameter fails the handshake
 			}
 			$extension = $negotiator->fromResponse($offer['params']);
 			if ($extension === null) {
@@ -475,7 +520,8 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Verifies a parsed server response against the key the client sent.
+	 * Verifies a parsed server response against the key the client sent: a 101 whose `Upgrade` list
+	 * contains `websocket`, whose `Connection` list contains `Upgrade`, and whose accept value matches.
 	 * @param array{statusCode: ?int, headers: array<string, string>} $response The parsed response.
 	 * @param string $sentKey The Sec-WebSocket-Key the client sent.
 	 * @return bool Whether the response is a valid 101 with the matching accept value.
@@ -483,10 +529,9 @@ class TWebSocketHandshake
 	public static function verifyServerResponse(array $response, string $sentKey): bool
 	{
 		$headers = $response['headers'] ?? [];
-		$connection = array_map('trim', explode(',', strtolower($headers[strtolower(THttpHeaderName::Connection)] ?? '')));
 		return ($response['statusCode'] ?? 0) === 101
-			&& strtolower($headers[strtolower(THttpHeaderName::Upgrade)] ?? '') === 'websocket'
-			&& in_array('upgrade', $connection, true)
+			&& in_array('websocket', self::headerTokens($headers, THttpHeaderName::Upgrade), true)
+			&& in_array('upgrade', self::headerTokens($headers, THttpHeaderName::Connection), true)
 			&& ($headers[strtolower(THttpHeaderName::SecWebSocketAccept)] ?? '') === self::acceptKey($sentKey);
 	}
 
@@ -502,7 +547,7 @@ class TWebSocketHandshake
 	{
 		$deadline = ($timeout !== null && $timeout > 0) ? microtime(true) + $timeout : null;
 		$data = '';
-		while (!str_contains($data, "\r\n\r\n")) {
+		while (!str_ends_with($data, "\r\n\r\n")) {   // one byte is appended per pass, so the blank line can only complete at the tail
 			if (strlen($data) >= self::MAX_HANDSHAKE_BYTES) {
 				throw new TWebSocketException('websocket_handshake_too_large', self::MAX_HANDSHAKE_BYTES);
 			}
@@ -520,20 +565,21 @@ class TWebSocketHandshake
 
 	/**
 	 * Performs the server side: reads the upgrade request, validates it strictly, negotiates the
-	 * subprotocol, and writes the 101.  An invalid request is answered with the matching HTTP
-	 * rejection (`400`, or `426` for a version mismatch) before the exception.
+	 * subprotocol and extensions, and writes the 101.  An invalid request is answered with the
+	 * matching HTTP rejection (`400`, or `426` for a version mismatch) before the exception.
 	 * When `origins` is set, the request's `Origin` must be in the list or the upgrade is refused with
-	 * a `403`.  An unset or empty `origins` allows any origin.
+	 * a `403`.  An unset or empty `origins` allows any origin.  A `timeout` bounds the request read.
 	 * @param StreamInterface $stream The accepted transport stream.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>} $options
-	 *   The supported subprotocols, extension negotiators, allowed origins, and extra response headers.
-	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade or the origin is rejected.
-	 * @return array{method: ?string, target: ?string, headers: array<string, string>, subprotocol: ?string, extensions: IWebSocketExtension[]}
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>, timeout?: ?float} $options
+	 *   The supported subprotocols, extension negotiators, allowed origins and hosts, extra response
+	 *   headers, and the seconds allowed to read the request head (null or 0 for no deadline).
+	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade, is not read in time, or the origin is rejected.
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, subprotocol: ?string, extensions: IWebSocketExtension[]}
 	 *   The parsed request with the negotiated subprotocol and extensions.
 	 */
 	public static function acceptConnection(StreamInterface $stream, array $options = []): array
 	{
-		$request = self::parseHttpMessage(self::readHandshake($stream));
+		$request = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null));
 		$error = self::upgradeError($request);
 		if ($error !== null) {
 			$stream->write($error);
@@ -604,15 +650,16 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Performs the client side: sends the upgrade request (offering subprotocols) and verifies the
-	 * server's 101, reading back what was selected.
+	 * Performs the client side: sends the upgrade request (offering subprotocols and extensions) and
+	 * verifies the server's 101, reading back what was selected.  A `timeout` bounds the response read.
 	 * @param StreamInterface $stream The connected transport stream.
 	 * @param string $host The Host header value.
 	 * @param string $path The request target. Default '/'.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>} $options
-	 *   The subprotocols to offer, extension negotiators, and extra request headers.
-	 * @throws TWebSocketException When the server does not complete the handshake.
-	 * @return array{statusCode: ?int, headers: array<string, string>, subprotocol: ?string, extensions: IWebSocketExtension[]}
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>, timeout?: ?float} $options
+	 *   The subprotocols to offer, extension negotiators, extra request headers, and the seconds
+	 *   allowed to read the response head (null or 0 for no deadline).
+	 * @throws TWebSocketException When the server does not complete the handshake in time or acceptably.
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, subprotocol: ?string, extensions: IWebSocketExtension[]}
 	 *   The parsed response with the selected subprotocol and extensions.
 	 */
 	public static function openConnection(StreamInterface $stream, string $host, string $path = '/', array $options = []): array
@@ -629,7 +676,7 @@ class TWebSocketHandshake
 			$requestHeaders[THttpHeaderName::SecWebSocketExtensions] = $offer;
 		}
 		$stream->write(self::buildClientRequest($host, $path, $key, $requestHeaders));
-		$response = self::parseHttpMessage(self::readHandshake($stream));
+		$response = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null));
 		if (!self::verifyServerResponse($response, $key)) {
 			throw new TWebSocketException('websocket_handshake_rejected', $response['statusCode'] ?? 0);
 		}

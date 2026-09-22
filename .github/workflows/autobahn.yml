@@ -32,7 +32,7 @@ jobs:
       - name: Setup PHP, with composer and extensions
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.3'
+          php-version: '8.4'
           extensions: ctype, dom, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
 
       - name: Register the sibling PRADO 4.4 checkout as a Composer path repository

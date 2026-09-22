@@ -1,7 +1,11 @@
 <?php
 
+namespace Prado\Test\Unit\IO\Socket\WebSocket;
+
+use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
+use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -15,6 +19,9 @@ class RecordingEndpoint implements IWebSocketEndpoint
 {
 	public int $authCalls = 0;
 	public ?TWebSocketConnection $accepted = null;
+	public ?TSocketStream $transport = null;
+	/** @var array<string, mixed> */
+	public array $request = [];
 
 	public function __construct(private string $path = '/admin', private bool $authorized = true)
 	{
@@ -34,10 +41,12 @@ class RecordingEndpoint implements IWebSocketEndpoint
 	public function accept(TWebSocketConnection $connection, TSocketStream $transport, array $request): void
 	{
 		$this->accepted = $connection;
+		$this->transport = $transport;
+		$this->request = $request;
 	}
 }
 
-class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
+class TWebSocketEndpointTest extends TestCase
 {
 	private function upgrade(TWebSocketServer $server, string $path): TSocketStream
 	{
@@ -50,6 +59,7 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxMessageSize(4096);
 		$endpoint = new RecordingEndpoint('/admin');
 		$server->addEndpoint($endpoint);
 
@@ -64,12 +74,19 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 		self::assertSame(1, $endpoint->authCalls, 'The endpoint authenticated the upgrade.');
 		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted, 'The endpoint took over the upgraded connection.');
 		self::assertSame(0, $opened, 'An internal endpoint upgrade is not a normal client.');
+		self::assertSame(4096, $endpoint->accepted->getMaxMessageSize(), 'The server MaxMessageSize applies to an endpoint connection.');
+		self::assertFalse($endpoint->accepted->getIsClient());
+		self::assertSame('/admin', $endpoint->request['target'], 'The endpoint receives the parsed request.');
+		self::assertSame('host', $endpoint->request['headers']['host']);
+		self::assertInstanceOf(TSocketStream::class, $endpoint->transport);
+		self::assertFalse($endpoint->transport->getBlocking(), 'The endpoint transport is non-blocking.');
+		self::assertStringContainsString('101 Switching Protocols', $client->read(4096), 'The server wrote the 101 before handing over.');
 
 		$client->close();
 		$server->close();
 	}
 
-	public function testCustomEndpointRejectsWhenAuthenticationFails()
+	public function testCustomEndpointRejectsWhenAuthenticationFailsWith403()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$server->setHandler(new TWebSocketHandler());
@@ -81,6 +98,10 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 
 		self::assertSame(1, $endpoint->authCalls);
 		self::assertNull($endpoint->accepted, 'A rejected upgrade is refused, not accepted.');
+		$response = $client->read(4096);
+		self::assertStringStartsWith('HTTP/1.1 403', $response, 'The refusal is written as a 403 before the transport closes.');
+		self::assertSame('', $client->read(16), 'The transport is then closed.');
+		self::assertSame(0, $server->getConnectionCount());
 
 		$client->close();
 		$server->close();
@@ -89,7 +110,7 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 	public function testANonMatchingPathFallsThroughToTheClientPath()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$cluster = new TWebSocketCluster('n1', new \Prado\IO\Socket\WebSocket\Cluster\TNullBackplane());
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
 		$server->setCluster($cluster);
 		$server->setHandler(new TWebSocketHandler());
 		$endpoint = new RecordingEndpoint('/admin');
@@ -102,6 +123,35 @@ class TWebSocketEndpointTest extends PHPUnit\Framework\TestCase
 		self::assertCount(1, $cluster->presence(), 'A non-matching path is a normal client.');
 
 		$client->close();
+		$server->close();
+	}
+
+	public function testEndpointLinksCountTowardMaxConnections()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxConnections(1);
+		$endpoint = new RecordingEndpoint('/admin');
+		$server->addEndpoint($endpoint);
+
+		$link = $this->upgrade($server, '/admin');
+		$server->serveOnce(0, 300000);
+		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted);
+		self::assertSame(1, $server->getLoad(), 'A connection an endpoint took over is still load.');
+
+		$second = $this->upgrade($server, '/admin');
+		$server->serveOnce(0, 300000);
+		self::assertStringContainsString('503', $second->read(4096), 'A further endpoint upgrade is shed at the cap.');
+
+		$endpoint->transport->close();   // the endpoint releases its link
+		self::assertSame(0, $server->getLoad(), 'A closed endpoint link leaves the load.');
+		$third = $this->upgrade($server, '/chat');
+		$server->serveOnce(0, 300000);
+		self::assertStringContainsString('101', $third->read(4096), 'The freed slot admits a client.');
+
+		$link->close();
+		$second->close();
+		$third->close();
 		$server->close();
 	}
 
