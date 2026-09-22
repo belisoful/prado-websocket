@@ -55,7 +55,7 @@
   - `@method` for dynamic events with prefix 'dy-'; which are called (on "$this->dy-") but not defined.
 - Inline comments should be in English and start with `//`
 - Use `?` for single nullable types and in doc blocks
-- Do NOT add `@since` tags: the extension is at its initial release (v1.0.0), so every symbol is "since 1.0.0" and the tag carries no information.
+- `@since`: symbols released through v1.1.0 carry none; a public symbol added after v1.1.0 gets `@since` with the version it ships in.
 - Method Doc Blocks must be **tight**, and have at minimum one sentence in the description.
 - Documentation additions/changes/removals should be integrated into the whole, at each level (of detail).
 
@@ -114,10 +114,11 @@ Docblocks inform and describe; it is not persuasive writing.
 - All UI controls should have proper template support and state management
 - Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to `TNativeClock`.
 - Logging goes through `Prado::log()` with `\Prado\Util\Log\TLogger` levels (the logger moved to `Prado\Util\Log` in PRADO 4.4).
-- This is a new, pre-release extension with no published API to preserve, so backward compatibility is NOT a constraint; prefer the better design over a compatible one
+- The public API is published (v1.0.0 onward): prefer compatible changes, and document any breaking change under "Upgrading" in `CHANGELOG.md`
+- Record every user-visible change under `## [Unreleased]` in `CHANGELOG.md` (Keep a Changelog format) as it lands
 - A full check consists of the 4 checks (in order): `php -l` compile, php-cs-fixer, phpstan, phpunit (all checks must pass successfully)
 - A full check must be done for code to be ready for git commit.
-- The current version of this extension is **v1.0.0** (initial release). It targets PRADO 4.4+ (the `pradosoft/prado` `master` branch, aliased `4.4.x-dev`). Because it is the initial release, source docblocks carry no `@since` tags.
+- The current version of this extension is **v1.1.0** (released 2026-09-22). It targets PRADO 4.4+ (the `pradosoft/prado` `master` branch, aliased `4.4.x-dev`). Release history and upgrade notes are in `CHANGELOG.md`.
 - This extension namespaces its classes under `Prado\IO\Socket\WebSocket\` (PSR-4 `Prado\` → `src/`); extensions do NOT update the framework's `classes.php`. Prado3 short class names are supplied via `config/classMap.json`, registered by Composer from `composer.json` `extra.prado.class-map`.
 - Error codes (keys) and their messages live in `config/errorMessages.txt`, registered by Composer from `composer.json` `extra.prado.error-messages` (not loaded by `TWebSocketModule`); the framework's `messages.txt` is not used.
 - HTTP/2 (RFC 8441) support comes from `belisoful/prado-http2` (`Prado\IO\Http2\`), which binds the system `libnghttp2` through FFI; it is a `require-dev` dependency and a runtime `suggest`. HTTP/2 tests skip when `libnghttp2` is absent.

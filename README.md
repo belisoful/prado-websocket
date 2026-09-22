@@ -38,6 +38,10 @@ composer require belisoful/prado-http2        # then: brew install libnghttp2  (
 composer require belisoful/prado-websocket
 ```
 
+PRADO 4.4 is not yet released, so the extension depends on its development branch (`^4.4@dev`). Composer applies stability flags only from the root project, so allow it there, for example with `"minimum-stability": "dev"` and `"prefer-stable": true`, or by requiring `pradosoft/prado:^4.4@dev` yourself.
+
+Release notes and upgrade steps between versions are in [CHANGELOG.md](CHANGELOG.md).
+
 ## What it provides
 
 | Class | Role |
@@ -254,6 +258,7 @@ The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazil
 - **Web SAPIs cannot host WebSockets.** Under PHP-FPM/mod_php the web server owns the socket and FastCGI cannot tunnel the upgrade to PHP. Run the standalone `TWebSocketServer` in its own process. (The PRADO `websocket` service is the dispatch target; the socket is supplied by the server.)
 - **HTTP/3 (RFC 9220) is out of scope** — QUIC needs TLS key hooks PHP does not expose.
 - **TLS** (`wss://`, `h2`) is terminated on the socket; HTTP/2 over TLS needs ALPN negotiating `h2` before the bytes reach the server.
+- **`MaxConnections` and HTTP/2**: streams count when their session is accepted; a new stream on an existing session past the cap is not refused.
 
 ## Development
 

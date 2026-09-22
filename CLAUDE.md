@@ -4,8 +4,9 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 
 ## Version
 
-- **Current version: v1.0.0** (initial release). Targets PRADO 4.4 (`pradosoft/prado` `master`, aliased `4.4.x-dev`).
-- Because this is the initial release, source docblocks carry **no `@since` tags** — do not add them.
+- **Current version: v1.1.0** (released 2026-09-22; v1.0.0 and v1.0.1 before it). Targets PRADO 4.4 (`pradosoft/prado` `master`, aliased `4.4.x-dev`). Release notes live in [CHANGELOG.md](CHANGELOG.md).
+- Symbols released through v1.1.0 carry **no `@since` tags**. A public symbol added after v1.1.0 gets `@since` with the version it ships in.
+- Record every user-visible change under an `## [Unreleased]` heading in `CHANGELOG.md` as it lands.
 - Supported and CI-tested PHP: **8.1, 8.2, 8.3, 8.4, 8.5**.
 
 ## Key facts
@@ -14,7 +15,7 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 - Error codes (keys) and messages live in `config/errorMessages.txt`. Both it and the class map are registered by **Composer** from `composer.json` `extra.prado` — not by `TWebSocketModule`.
 - Unit tests are namespaced `Prado\Test\Unit\…` mirroring `tests/unit/` (Composer `autoload-dev`).
 - Time is read through PRADO's clock seam (`TApplicationClockAwareTrait`, `$this->getClock()`); tests inject `TMockClock`.
-- This is a new, pre-release codebase with no published API to preserve: **backward compatibility is not a constraint** — prefer the better design.
+- The public API is published (v1.0.0 onward). Prefer compatible changes. A breaking change needs an entry under "Upgrading" in `CHANGELOG.md`.
 
 ## Checks (all must pass before commit)
 
