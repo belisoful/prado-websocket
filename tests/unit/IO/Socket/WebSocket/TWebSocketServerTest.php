@@ -509,6 +509,32 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testMaxSendBufferBytesIsAppliedToAcceptedConnections()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER, $server->getMaxSendBufferBytes(), 'The server keeps the connection default.');
+		$server->setMaxSendBufferBytes('0');
+		self::assertSame(0, $server->getMaxSendBufferBytes(), 'A string value is coerced; 0 is unlimited.');
+		$server->setMaxSendBufferBytes(-5);
+		self::assertSame(0, $server->getMaxSendBufferBytes(), 'A negative value clamps to unlimited.');
+		$server->setMaxSendBufferBytes(32 * 1024 * 1024);
+		$server->setHandler(new TWebSocketHandler());
+		$accepted = null;
+		$server->attachEventHandler('onConnection', function ($sender, $connection) use (&$accepted) {
+			$accepted = $connection;
+		});
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		for ($i = 0; $i < 10 && $accepted === null; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		self::assertInstanceOf(TWebSocketConnection::class, $accepted);
+		self::assertSame(32 * 1024 * 1024, $accepted->getMaxSendBufferBytes(), 'The server MaxSendBufferBytes applies to each accepted connection.');
+		$client->close();
+		$server->close();
+	}
+
 	public function testMaxMessageSizeIsEnforcedThroughTheServer()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');

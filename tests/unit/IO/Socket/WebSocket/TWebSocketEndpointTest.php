@@ -60,6 +60,7 @@ class TWebSocketEndpointTest extends TestCase
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$server->setHandler(new TWebSocketHandler());
 		$server->setMaxMessageSize(4096);
+		$server->setMaxSendBufferBytes(8192);
 		$endpoint = new RecordingEndpoint('/admin');
 		$server->addEndpoint($endpoint);
 
@@ -75,6 +76,7 @@ class TWebSocketEndpointTest extends TestCase
 		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted, 'The endpoint took over the upgraded connection.');
 		self::assertSame(0, $opened, 'An internal endpoint upgrade is not a normal client.');
 		self::assertSame(4096, $endpoint->accepted->getMaxMessageSize(), 'The server MaxMessageSize applies to an endpoint connection.');
+		self::assertSame(8192, $endpoint->accepted->getMaxSendBufferBytes(), 'The server MaxSendBufferBytes applies to an endpoint connection.');
 		self::assertFalse($endpoint->accepted->getIsClient());
 		self::assertSame('/admin', $endpoint->request['target'], 'The endpoint receives the parsed request.');
 		self::assertSame('host', $endpoint->request['headers']['host']);

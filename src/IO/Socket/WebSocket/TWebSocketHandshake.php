@@ -10,6 +10,8 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Util\Clock\IClock;
+use Prado\Util\Clock\TNativeClock;
 use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
@@ -536,22 +538,25 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Reads the HTTP handshake head (through the blank line) from a stream.  A total read deadline
-	 * bounds how long a slow or dribbling peer can hold the read, so it cannot stall a serve loop.
+	 * Reads the HTTP handshake head (through the blank line) from a stream.  A total read deadline,
+	 * measured on the given clock, bounds how long a slow or dribbling peer can hold the read, so it
+	 * cannot stall a serve loop.
 	 * @param StreamInterface $stream The transport stream.
 	 * @param ?float $timeout The total seconds to read the head, or null for no deadline.
+	 * @param ?IClock $clock The clock the deadline is measured on; the real clock when null.
 	 * @throws TWebSocketException When the head exceeds the limit, the deadline passes, or the stream ends first.
 	 * @return string The handshake head, including the terminating blank line.
 	 */
-	public static function readHandshake(StreamInterface $stream, ?float $timeout = null): string
+	public static function readHandshake(StreamInterface $stream, ?float $timeout = null, ?IClock $clock = null): string
 	{
-		$deadline = ($timeout !== null && $timeout > 0) ? microtime(true) + $timeout : null;
+		$clock ??= new TNativeClock();
+		$deadline = ($timeout !== null && $timeout > 0) ? $clock->microtime() + $timeout : null;
 		$data = '';
 		while (!str_ends_with($data, "\r\n\r\n")) {   // one byte is appended per pass, so the blank line can only complete at the tail
 			if (strlen($data) >= self::MAX_HANDSHAKE_BYTES) {
 				throw new TWebSocketException('websocket_handshake_too_large', self::MAX_HANDSHAKE_BYTES);
 			}
-			if ($deadline !== null && microtime(true) >= $deadline) {
+			if ($deadline !== null && $clock->microtime() >= $deadline) {
 				throw new TWebSocketException('websocket_handshake_incomplete');   // a slow/dribbling peer past the deadline
 			}
 			$byte = $stream->eof() ? '' : $stream->read(1);
@@ -570,7 +575,7 @@ class TWebSocketHandshake
 	 * When `origins` is set, the request's `Origin` must be in the list or the upgrade is refused with
 	 * a `403`.  An unset or empty `origins` allows any origin.  A `timeout` bounds the request read.
 	 * @param StreamInterface $stream The accepted transport stream.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>, timeout?: ?float} $options
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>, timeout?: ?float, clock?: IClock} $options
 	 *   The supported subprotocols, extension negotiators, allowed origins and hosts, extra response
 	 *   headers, and the seconds allowed to read the request head (null or 0 for no deadline).
 	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade, is not read in time, or the origin is rejected.
@@ -579,7 +584,7 @@ class TWebSocketHandshake
 	 */
 	public static function acceptConnection(StreamInterface $stream, array $options = []): array
 	{
-		$request = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null));
+		$request = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null, $options['clock'] ?? null));
 		$error = self::upgradeError($request);
 		if ($error !== null) {
 			$stream->write($error);
@@ -614,13 +619,14 @@ class TWebSocketHandshake
 	 * {@see buildRejection()} / {@see upgradeError()} to refuse.
 	 * @param StreamInterface $stream The accepted transport stream.
 	 * @param ?float $timeout The total seconds to read the request head, or null for no deadline.
+	 * @param ?IClock $clock The clock the deadline is measured on; the real clock when null.
 	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade.
 	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string}
 	 *   The parsed request.
 	 */
-	public static function receiveRequest(StreamInterface $stream, ?float $timeout = null): array
+	public static function receiveRequest(StreamInterface $stream, ?float $timeout = null, ?IClock $clock = null): array
 	{
-		$request = self::parseHttpMessage(self::readHandshake($stream, $timeout));
+		$request = self::parseHttpMessage(self::readHandshake($stream, $timeout, $clock));
 		if (self::upgradeError($request) !== null) {
 			throw new TWebSocketException('websocket_handshake_not_upgrade');
 		}
@@ -655,7 +661,7 @@ class TWebSocketHandshake
 	 * @param StreamInterface $stream The connected transport stream.
 	 * @param string $host The Host header value.
 	 * @param string $path The request target. Default '/'.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>, timeout?: ?float} $options
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>, timeout?: ?float, clock?: IClock} $options
 	 *   The subprotocols to offer, extension negotiators, extra request headers, and the seconds
 	 *   allowed to read the response head (null or 0 for no deadline).
 	 * @throws TWebSocketException When the server does not complete the handshake in time or acceptably.
@@ -676,7 +682,7 @@ class TWebSocketHandshake
 			$requestHeaders[THttpHeaderName::SecWebSocketExtensions] = $offer;
 		}
 		$stream->write(self::buildClientRequest($host, $path, $key, $requestHeaders));
-		$response = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null));
+		$response = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null, $options['clock'] ?? null));
 		if (!self::verifyServerResponse($response, $key)) {
 			throw new TWebSocketException('websocket_handshake_rejected', $response['statusCode'] ?? 0);
 		}

@@ -7,6 +7,7 @@ use Prado\Exceptions\TIOException;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\TStream;
+use Prado\Util\Clock\TMockClock;
 use Psr\Http\Message\StreamInterface;
 
 /** A stream that yields one byte per read, each after a short pause, so a read deadline can be observed. */
@@ -101,8 +102,46 @@ class DribblingStream implements StreamInterface
 	}
 }
 
+/** A dribbling stream that advances a mock clock by a fixed step on every read, so a deadline is deterministic. */
+class ClockedDribblingStream extends DribblingStream
+{
+	public function __construct(private TMockClock $clock, private float $step)
+	{
+		parent::__construct(0);
+	}
+
+	public function read(int $length): string
+	{
+		$this->clock->setMicrotime($this->clock->microtime() + $this->step);
+		return parent::read($length);
+	}
+}
+
 class TWebSocketHandshakeTest extends TestCase
 {
+	public function testReadHandshakeMeasuresItsDeadlineOnTheGivenClock()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		$stream = new ClockedDribblingStream($clock, 0.01);   // every byte costs 10 ms of mock time
+		try {
+			TWebSocketHandshake::readHandshake($stream, 0.05, $clock);
+			self::fail('The deadline passes on the mock clock.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode());
+		}
+		self::assertSame(5, $stream->reads, 'Exactly five 10 ms reads fit before a 50 ms deadline measured on the injected clock.');
+
+		$clock->setMicrotime(1000.0);
+		$stream = new ClockedDribblingStream($clock, 0.01);
+		try {
+			TWebSocketHandshake::acceptConnection($stream, ['timeout' => 0.03, 'clock' => $clock]);
+			self::fail('acceptConnection() forwards the clock option.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(3, $stream->reads, 'The clock option bounds acceptConnection() the same way.');
+		}
+	}
+
 	private const SAMPLE_KEY = 'dGhlIHNhbXBsZSBub25jZQ==';
 	private const SAMPLE_ACCEPT = 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=';
 

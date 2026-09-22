@@ -40,7 +40,8 @@ use Prado\Xml\TXmlElement;
  *    `OnMessage="Application.Chat.onMessage"` receives them);
  *  - {@see setSubprotocols() Subprotocols}, {@see setOrigins() Origins},
  *    {@see setAllowedHosts() AllowedHosts}, {@see setPermessageDeflate() PermessageDeflate};
- *  - the limits {@see setMaxMessageSize() MaxMessageSize}, {@see setHandshakeTimeout() HandshakeTimeout},
+ *  - the limits {@see setMaxMessageSize() MaxMessageSize}, {@see setMaxSendBufferBytes() MaxSendBufferBytes},
+ *    {@see setHandshakeTimeout() HandshakeTimeout},
  *    {@see setIdleTimeout() IdleTimeout}, {@see setCloseTimeout() CloseTimeout} and
  *    {@see setMaxConnections() MaxConnections} (unset ones keep the server's defaults);
  *  - the {@see getCluster() cluster coordinator}, which makes the server one node of a cluster over
@@ -105,6 +106,9 @@ class TWebSocketModule extends TSocketServerModule
 
 	/** @var ?int The maximum message size, or null for the server default. */
 	private ?int $_maxMessageSize = null;
+
+	/** @var ?int The maximum queued outbound bytes per connection, or null for the server default. */
+	private ?int $_maxSendBufferBytes = null;
 
 	/** @var ?float The handshake timeout, or null for the server default. */
 	private ?float $_handshakeTimeout = null;
@@ -219,6 +223,9 @@ class TWebSocketModule extends TSocketServerModule
 		}
 		if ($this->_maxMessageSize !== null) {
 			$server->setMaxMessageSize($this->_maxMessageSize);
+		}
+		if ($this->_maxSendBufferBytes !== null) {
+			$server->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		}
 		if ($this->_handshakeTimeout !== null) {
 			$server->setHandshakeTimeout($this->_handshakeTimeout);
@@ -480,6 +487,27 @@ class TWebSocketModule extends TSocketServerModule
 	public function setMaxMessageSize($value): static
 	{
 		$this->_maxMessageSize = ($value === null || $value === '') ? null : TPropertyValue::ensureInteger($value);
+		return $this;
+	}
+
+	/**
+	 * Returns the maximum queued outbound bytes per connection applied to the server.
+	 * @return ?int The size in bytes, or null for the server default.
+	 */
+	public function getMaxSendBufferBytes(): ?int
+	{
+		return $this->_maxSendBufferBytes;
+	}
+
+	/**
+	 * Sets the maximum queued outbound bytes per connection applied to the server
+	 * ({@see TWebSocketServer::setMaxSendBufferBytes()}).
+	 * @param null|int|string $value The size in bytes, 0 for unlimited, or null for the server default.
+	 * @return static The current module.
+	 */
+	public function setMaxSendBufferBytes($value): static
+	{
+		$this->_maxSendBufferBytes = ($value === null || $value === '') ? null : TPropertyValue::ensureInteger($value);
 		return $this;
 	}
 

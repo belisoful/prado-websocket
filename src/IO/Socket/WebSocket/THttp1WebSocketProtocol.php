@@ -11,6 +11,7 @@
 namespace Prado\IO\Socket\WebSocket;
 
 use Prado\IO\Socket\TSocketStream;
+use Prado\Util\Clock\TApplicationClockAwareTrait;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -33,6 +34,8 @@ use Psr\Http\Message\StreamInterface;
  */
 class THttp1WebSocketProtocol implements IWebSocketProtocol
 {
+	use TApplicationClockAwareTrait;
+
 	/** @var array<string, string> Extra headers added to the 101 response. */
 	private array $_responseHeaders = [];
 
@@ -185,6 +188,7 @@ class THttp1WebSocketProtocol implements IWebSocketProtocol
 			'allowedHosts' => $this->_allowedHosts,
 			'headers' => $this->_responseHeaders,
 			'timeout' => $this->_handshakeTimeout > 0 ? $this->_handshakeTimeout : null,
+			'clock' => $this->getClock(),
 		]);
 		$onStream($connection, $handshake);
 	}

@@ -31,6 +31,7 @@ $port = (int) (getenv('AUTOBAHN_PORT') ?: 9001);
 
 $server = TWebSocketServer::bind("tcp://{$host}:{$port}");
 $server->setMaxMessageSize(0);   // the conformance fuzzer sends large frames; run unbounded (not a production default)
+$server->setMaxSendBufferBytes(0);   // and echoes them back (9.x sends 16 MiB messages, past the default send buffer)
 $server->setExtensions([new TPermessageDeflateNegotiator()]);
 
 // Echo each message under the opcode it arrived as; the suite's echo cases compare both, and a batch

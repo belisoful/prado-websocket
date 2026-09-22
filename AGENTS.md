@@ -112,7 +112,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - UI Portlets are PHP classes with a ".tpl" TTemplate file with the same base name
 - Data components should support `TActiveRecord` pattern
 - All UI controls should have proper template support and state management
-- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. Exception: static helpers with a blocking I/O deadline (`TWebSocketHandshake::readHandshake()`).
+- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to `TNativeClock`.
 - Logging goes through `Prado::log()` with `\Prado\Util\Log\TLogger` levels (the logger moved to `Prado\Util\Log` in PRADO 4.4).
 - This is a new, pre-release extension with no published API to preserve, so backward compatibility is NOT a constraint; prefer the better design over a compatible one
 - A full check consists of the 4 checks (in order): `php -l` compile, php-cs-fixer, phpstan, phpunit (all checks must pass successfully)

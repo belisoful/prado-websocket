@@ -79,6 +79,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var int The maximum message size applied to each stream's connection, or 0 for unlimited. */
 	private int $_maxMessageSize = 0;
 
+	/** @var int The maximum queued outbound bytes applied to each stream's connection, or 0 for unlimited. */
+	private int $_maxSendBufferBytes = TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER;
+
 	/** @var ?callable The per-stream notification callback set during {@see serve()}. */
 	private $_onStream;
 
@@ -203,6 +206,25 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
+	 * Returns the maximum queued outbound bytes applied to each stream's connection.
+	 * @return int The maximum queued bytes, or 0 for unlimited.
+	 */
+	public function getMaxSendBufferBytes(): int
+	{
+		return $this->_maxSendBufferBytes;
+	}
+
+	/**
+	 * Sets the maximum queued outbound bytes applied to each multiplexed stream's connection
+	 * ({@see TWebSocketConnection::setMaxSendBufferBytes()}).
+	 * @param int $value The maximum queued bytes, or 0 for unlimited.
+	 */
+	public function setMaxSendBufferBytes(int $value): void
+	{
+		$this->_maxSendBufferBytes = max(0, $value);
+	}
+
+	/**
 	 * Raised after a multiplexed stream's Extended CONNECT is accepted, since HTTP/2 surfaces
 	 * connections per stream rather than per transport.
 	 * @param mixed $param The accepted {@see TWebSocketConnection}.
@@ -319,6 +341,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
 		$connection->setValidateMasking(false);   // RFC 8441 carries WebSocket DATA without RFC 6455 masking
 		$connection->setMaxMessageSize($this->_maxMessageSize);
+		$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
 		$this->_connections[$stream->getStreamId()] = $connection;
@@ -411,14 +434,21 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/**
 	 * Shuts the session down, raising the service close for every still-live multiplexed connection so
-	 * a transport that ends abruptly does not skip {@see onClose}.  Called on session exit.
+	 * a transport that ends abruptly does not skip {@see onClose}, then closes the HTTP/2 session.
+	 * Closing frees the nghttp2 session now rather than when the protocol is collected, and marks every
+	 * stream closed, so a later write on one of its connections fails instead of queuing bytes that are
+	 * never sent.  Called on session exit; idempotent.
 	 */
 	public function shutdown(): void
 	{
-		foreach ($this->_connections as $streamId => $connection) {
-			unset($this->_connections[$streamId]);
-			$this->_handler->onClose($connection);
-			$this->onClose($connection);
+		try {
+			foreach ($this->_connections as $streamId => $connection) {
+				unset($this->_connections[$streamId]);
+				$this->_handler->onClose($connection);
+				$this->onClose($connection);
+			}
+		} finally {
+			$this->_session->close();
 		}
 	}
 }

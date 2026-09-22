@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 use PHPUnit\Framework\TestCase;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TH2Stream;
+use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\THttp2WebSocketProtocol;
@@ -383,8 +384,38 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$protocol->shutdown();
 		self::assertSame(1, $closed, 'shutdown fires onClose for the still-live connection.');
 		self::assertCount(0, $protocol->getConnections(), 'shutdown clears the connection registry.');
+		self::assertFalse($protocol->getSession()->wantsIo(), 'shutdown closes the HTTP/2 session.');
+		$protocol->shutdown();
+		self::assertSame(1, $closed, 'A second shutdown does not fire onClose again.');
 
-		$protocol->getSession()->close();
+		$client->close();
+	}
+
+	public function testShutdownFailsLaterWritesOnItsConnections()
+	{
+		$handler = new TWebSocketHandler();
+		$connection = null;
+		$handler->attachEventHandler('onOpen', function ($c) use (&$connection) {
+			$connection = $c;
+		});
+		[$protocol, $client] = $this->establish($handler);
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+		self::assertInstanceOf(TWebSocketConnection::class, $connection);
+
+		$protocol->shutdown();
+		try {
+			$connection->send('late');
+			self::fail('A write after shutdown fails rather than queuing bytes that are never sent.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_write_failed', $e->getErrorCode());
+		}
+		try {
+			$protocol->receive('');
+			self::fail('The closed session refuses further input.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_closed', $e->getErrorCode());
+		}
 		$client->close();
 	}
 }

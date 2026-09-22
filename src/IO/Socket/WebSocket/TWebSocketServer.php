@@ -93,6 +93,9 @@ class TWebSocketServer extends TSocketServer
 	/** @var int The maximum message size in bytes applied to accepted connections, or 0 for unlimited. */
 	private int $_maxMessageSize = TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE;
 
+	/** @var int The maximum queued outbound bytes applied to accepted connections, or 0 for unlimited. */
+	private int $_maxSendBufferBytes = TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER;
+
 	/** @var float The seconds a peer has to complete the opening handshake before the accept is dropped. */
 	private float $_handshakeTimeout = 10.0;
 
@@ -289,6 +292,28 @@ class TWebSocketServer extends TSocketServer
 	public function setMaxMessageSize($value): void
 	{
 		$this->_maxMessageSize = max(0, (int) $value);
+	}
+
+	/**
+	 * Returns the maximum queued outbound bytes applied to accepted connections.
+	 * @return int The maximum queued bytes, or 0 for unlimited.
+	 */
+	public function getMaxSendBufferBytes(): int
+	{
+		return $this->_maxSendBufferBytes;
+	}
+
+	/**
+	 * Sets the maximum queued outbound bytes applied to every accepted connection
+	 * ({@see TWebSocketConnection::setMaxSendBufferBytes()}).  It bounds the backlog a slow reader can
+	 * hold and, as a frame is refused before it is queued, also the largest single frame a connection
+	 * sends; raise it with {@see setMaxMessageSize() MaxMessageSize} when echoing or relaying large
+	 * messages.  Default {@see TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER}; 0 is unlimited.
+	 * @param int|string $value The maximum queued bytes.
+	 */
+	public function setMaxSendBufferBytes($value): void
+	{
+		$this->_maxSendBufferBytes = max(0, (int) $value);
 	}
 
 	/**
@@ -1174,6 +1199,7 @@ class TWebSocketServer extends TSocketServer
 			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // an internal endpoint does not negotiate
 			$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
 			$connection->setMaxMessageSize($this->_maxMessageSize);
+			$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 			$endpoint->accept($connection, $transport, $request);
 			return;
 		}
@@ -1203,6 +1229,7 @@ class TWebSocketServer extends TSocketServer
 		$transport->write(TWebSocketHandshake::buildServerResponse($key, $responseHeaders));
 		$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
 		$connection->setMaxMessageSize($this->_maxMessageSize);
+		$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
 		$this->trackSession($transport, ['transport' => $transport, 'connection' => $connection, 'active' => $this->getClock()->microtime()]);
@@ -1249,6 +1276,7 @@ class TWebSocketServer extends TSocketServer
 		$protocol->setSubprotocols($this->_subprotocols);
 		$protocol->setExtensions($this->_extensions);
 		$protocol->setMaxMessageSize($this->_maxMessageSize);
+		$protocol->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
 		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
@@ -1651,6 +1679,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
 		$connection->setMaxMessageSize($this->_maxMessageSize);
+		$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$connection->setSubprotocol($handshake['subprotocol'] ?? null);
 		$connection->setExtensions($handshake['extensions'] ?? []);
 		$this->onConnection($connection);

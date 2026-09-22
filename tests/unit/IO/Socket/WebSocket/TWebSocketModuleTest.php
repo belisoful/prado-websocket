@@ -84,6 +84,7 @@ class TWebSocketModuleTest extends TestCase
 		$module->setAllowedHosts('app.example.com');
 		$module->setPermessageDeflate('true');
 		$module->setMaxMessageSize('65536');
+		$module->setMaxSendBufferBytes('0');
 		$module->setHandshakeTimeout('2.5');
 		$module->setIdleTimeout(30);
 		$module->setCloseTimeout('1');
@@ -102,6 +103,8 @@ class TWebSocketModuleTest extends TestCase
 			self::assertSame(['app.example.com'], $server->getAllowedHosts());
 			self::assertInstanceOf(TPermessageDeflateNegotiator::class, $server->getExtensions()[0]);
 			self::assertSame(65536, $server->getMaxMessageSize());
+			self::assertSame(0, $module->getMaxSendBufferBytes());
+			self::assertSame(0, $server->getMaxSendBufferBytes());
 			self::assertSame(2.5, $server->getHandshakeTimeout());
 			self::assertSame(30.0, $server->getIdleTimeout());
 			self::assertSame(1.0, $server->getCloseTimeout());
@@ -125,6 +128,7 @@ class TWebSocketModuleTest extends TestCase
 		$server = $module->createServerPublic();
 		try {
 			self::assertSame($defaults->getMaxMessageSize(), $server->getMaxMessageSize());
+			self::assertSame($defaults->getMaxSendBufferBytes(), $server->getMaxSendBufferBytes());
 			self::assertSame($defaults->getHandshakeTimeout(), $server->getHandshakeTimeout());
 			self::assertSame($defaults->getIdleTimeout(), $server->getIdleTimeout());
 			self::assertSame($defaults->getCloseTimeout(), $server->getCloseTimeout());
