@@ -92,11 +92,17 @@ test('stops delivering after unsubscribe', async ({ page }) => {
 		const sub = new PubSub(url);
 		const pub = new PubSub(url);
 		const got = [];
-		const leave = await sub.subscribe('room:2', (d) => got.push(d));
+		let delivered;
+		const before = new Promise((r) => { delivered = r; });
+		const leave = await sub.subscribe('room:2', (d) => {
+			got.push(d);
+			delivered();
+		});
 		let resolve;
 		const marker = new Promise((r) => { resolve = r; });
 		await sub.subscribe('room:3', resolve);
 		await pub.publish('room:2', 'before');
+		await before;   // the publisher's ack and the subscriber's delivery travel on different sockets
 		leave();
 		await sub.call('echo', null);   // the unsubscribe is processed before the next publish
 		await pub.publish('room:2', 'after');

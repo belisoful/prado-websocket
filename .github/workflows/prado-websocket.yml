@@ -7,6 +7,7 @@ jobs:
   composerext:
     name: WebSocket (PHP ${{ matrix.php-versions }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
@@ -38,6 +39,7 @@ jobs:
           path: prado-http2
 
       - name: Install libnghttp2
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev
 
       - name: Setup PHP, with composer and extensions
@@ -84,6 +86,7 @@ jobs:
   playwright:
     name: WebSocket Playwright (${{ matrix.browser_name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +123,7 @@ jobs:
           path: prado-http2
 
       - name: Install libnghttp2
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev
 
       - name: Setup PHP, with composer and extensions
