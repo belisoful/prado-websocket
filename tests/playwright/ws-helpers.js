@@ -25,13 +25,13 @@ function portOpen(port, host = '127.0.0.1') {
 }
 
 /**
- * Spawns the PHP echo WebSocket server ({@link ./ws-server.php}) and returns a
- * handle to await its readiness and stop it.
- * @param {{ port: number, subprotocols?: string, deflate?: boolean }} options
+ * Spawns a PHP process that listens on a port, and returns a handle to await its readiness
+ * and stop it.
+ * @param {{ args: string[], port: number, env?: Record<string, string> }} options
  */
-export function startWsServer({ port, subprotocols = '', deflate = false }) {
-	const child = spawn('php', [SERVER], {
-		env: { ...process.env, WS_HOST: '127.0.0.1', WS_PORT: String(port), WS_SUBPROTOCOLS: subprotocols, WS_DEFLATE: deflate ? '1' : '0' },
+export function startPhp({ args, port, env = {} }) {
+	const child = spawn('php', args, {
+		env: { ...process.env, ...env },
 		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 	const errors = [];
@@ -41,21 +41,21 @@ export function startWsServer({ port, subprotocols = '', deflate = false }) {
 	return {
 		child,
 		port,
-		/** Resolves once the server accepts connections, or throws with captured stderr. */
+		/** Resolves once the process accepts connections, or throws with captured stderr. */
 		async ready(timeoutMs = 10_000) {
 			const deadline = Date.now() + timeoutMs;
 			while (Date.now() < deadline) {
 				if (child.exitCode !== null) {
-					throw new Error(`WS server (port ${port}) exited early (code ${child.exitCode}). stderr:\n${errors.join('')}`);
+					throw new Error(`PHP (port ${port}) exited early (code ${child.exitCode}). stderr:\n${errors.join('')}`);
 				}
 				if (await portOpen(port)) {
 					return;
 				}
 				await sleep(100);
 			}
-			throw new Error(`WS server (port ${port}) did not open within ${timeoutMs}ms. stderr:\n${errors.join('')}`);
+			throw new Error(`PHP (port ${port}) did not open within ${timeoutMs}ms. stderr:\n${errors.join('')}`);
 		},
-		/** Stops the server (SIGTERM, then SIGKILL). */
+		/** Stops the process (SIGTERM, then SIGKILL). */
 		stop() {
 			return new Promise((resolve) => {
 				if (child.exitCode !== null) {
@@ -68,4 +68,24 @@ export function startWsServer({ port, subprotocols = '', deflate = false }) {
 			});
 		},
 	};
+}
+
+/**
+ * Spawns the PHP echo WebSocket server ({@link ./ws-server.php}) and returns a
+ * handle to await its readiness and stop it.
+ * @param {{ port: number, subprotocols?: string, deflate?: boolean, pubsub?: boolean, heartbeat?: number }} options
+ */
+export function startWsServer({ port, subprotocols = '', deflate = false, pubsub = false, heartbeat = 0 }) {
+	return startPhp({
+		args: [SERVER],
+		port,
+		env: {
+			WS_HOST: '127.0.0.1',
+			WS_PORT: String(port),
+			WS_SUBPROTOCOLS: subprotocols,
+			WS_DEFLATE: deflate ? '1' : '0',
+			WS_PUBSUB: pubsub ? '1' : '0',
+			WS_HEARTBEAT: heartbeat ? String(heartbeat) : '',
+		},
+	});
 }

@@ -1,6 +1,6 @@
 # prado-websocket
 
-A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2 (via `belisoful/prado-http2` + `libnghttp2`), RFC 7692 permessage-deflate, and a multi-node clustering layer (`TWebSocketModule` + pluggable backplanes).
+A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2 (via `belisoful/prado-http2` + `libnghttp2`), RFC 7692 permessage-deflate, a multi-node clustering layer (`TWebSocketModule` + pluggable backplanes), and the `prado.pubsub.v1` browser pub/sub subprotocol (`TWebSocketPubSubHandler` + `prado-pubsub.js`).
 
 ## Version
 

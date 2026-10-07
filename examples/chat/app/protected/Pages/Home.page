@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<com:THead Title="PRADO Chat">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+</com:THead>
+<body data-ws-url="<%= $this->WebSocketUrl %>">
+	<main class="app">
+		<header class="bar">
+			<h1>PRADO Chat</h1>
+			<span id="room-label" class="room-label"></span>
+			<span id="status" class="status" data-state="offline">offline</span>
+			<button id="leave" type="button" hidden>Leave</button>
+		</header>
+
+		<form id="join" class="join">
+			<label>Nickname
+				<input id="nick" maxlength="24" pattern="\S{1,24}" required autocomplete="nickname" placeholder="ada">
+			</label>
+			<label>Room
+				<input id="room" value="lobby" maxlength="32" pattern="[a-z0-9_\-]{1,32}" required>
+			</label>
+			<button type="submit">Join</button>
+			<p id="join-error" class="error" role="alert"></p>
+		</form>
+
+		<section id="chat" class="chat" hidden>
+			<ol id="log" class="log" aria-live="polite"></ol>
+			<aside class="members">
+				<h2>In the room</h2>
+				<ul id="members"></ul>
+			</aside>
+			<form id="compose" class="compose">
+				<input id="text" maxlength="500" autocomplete="off" placeholder="Message, or /w nick text to whisper" aria-label="Message">
+				<button type="submit">Send</button>
+			</form>
+		</section>
+	</main>
+</body>
+</html>

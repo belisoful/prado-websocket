@@ -3,6 +3,16 @@
 All notable changes to `belisoful/prado-websocket` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Pub/sub messaging for browsers: the `prado.pubsub.v1` subprotocol, served by `TWebSocketPubSubHandler` (`Prado\IO\Socket\WebSocket\PubSub\`). Clients `subscribe`, `unsubscribe`, `publish`, `send` (direct message), `call` (application RPC) and `ping` over JSON text frames, routed through the cluster. The handler raises `onSubscribe`, `onPublish`, `onSend` and `onCall` with a `TWebSocketPubSubEventParameter`; client publish and send are denied unless `AllowClientPublish`/`AllowClientSend` or an event handler allows them. `MaxSubscriptions` (default 64) and `Heartbeat` (default 25 s) configure it; `publish()`, `sendTo()`, `broadcast()`, `subscribe()` and `encodeMessage()` serve application code. A request is refused with a `TWebSocketPubSubException` reply code.
+- `prado-pubsub.js`, the dependency-free browser client (`TWebSocketPubSubHandler::getClientScriptPath()`): promise-based requests with timeouts, reconnection with exponential backoff and jitter, re-subscription, an offline queue, and a heartbeat that detects a stalled connection.
+- `IWebSocketClusterAware`. `TWebSocketModule` gives its cluster to a cluster-aware handler and re-raises the pub/sub request events as its own `onSubscribe`, `onPublish`, `onSend` and `onCall`.
+- Error codes: `websocket_pubsub_frame_malformed`, `websocket_pubsub_type_unknown`, `websocket_pubsub_channel_invalid`, `websocket_pubsub_field_required`, `websocket_pubsub_subscription_limit`, `websocket_pubsub_forbidden`, `websocket_pubsub_client_unknown`, `websocket_pubsub_method_unknown`, `websocket_pubsub_internal_error`.
+- Playwright specs for the browser client against the pub/sub handler (`tests/playwright/pubsub.spec.js`); `ws-server.php` serves pub/sub with `WS_PUBSUB=1`.
+- `examples/chat`: a multi-room chat on `TWebSocketPubSubHandler` and `prado-pubsub.js`, with history, whispers and reconnection. It runs as a standalone server or as a PRADO application (`websocket/serve`), and `tests/playwright/chat-example.spec.js` covers both versions.
+
 ## [1.1.0] - 2026-09-22
 
 This release resyncs the extension with PRADO 4.4 development HEAD and lands a full audit and hardening pass. It changes some public API; see [Upgrading from 1.0.x](#upgrading-from-10x).

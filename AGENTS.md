@@ -39,7 +39,7 @@
 - Class Constants: `SCREAMING_SNAKE_CASE` (eg. `MAX_RETRY_COUNT`)
 - Enumerated Constants: `PascalCase` (eg. `TWebSocketOpcode::Binary`)
 - Class properties: `_camelCase` (eg. `_idleTimeout`, `_sessions`)
-- Namespace: `Prado\IO\Socket\WebSocket` and `Prado\IO\Socket\WebSocket\Cluster` (PSR-4 `Prado\` → `src/`); the service lives at `Prado\Web\Services\TWebSocketService`
+- Namespace: `Prado\IO\Socket\WebSocket`, `Prado\IO\Socket\WebSocket\Cluster` and `Prado\IO\Socket\WebSocket\PubSub` (PSR-4 `Prado\` → `src/`); the service lives at `Prado\Web\Services\TWebSocketService`
 - Unit test namespace: `Prado\Test\Unit\{Directory}` mirroring `tests/unit/` (eg. `Prado\Test\Unit\IO\Socket\WebSocket\TWebSocketServerTest`)
 - Template file extension: ".tpl"
 - Web Page template file extension: ".page"
@@ -160,9 +160,12 @@ Docblocks inform and describe; it is not persuasive writing.
 ├── config/
 │   ├── classMap.json           # Prado3 short class names → fully qualified names (composer extra.prado.class-map)
 │   └── errorMessages.txt       # Error codes and messages (composer extra.prado.error-messages)
+├── examples/
+│   └── chat/                   # Runnable pub/sub chat: standalone server.php + router.php, and a PRADO app (app/); see its README
 ├── src/                        # PSR-4 root for Prado\
 │   ├── IO/Socket/WebSocket/    # Protocol: frames, codec, handshake, connection, server, handler, HTTP/1.1 and HTTP/2 protocols, permessage-deflate
-│   │   └── Cluster/            # Clustering: TWebSocketCluster, TWebSocketEnvelope, backplanes (Null, File, Mesh, Redis)
+│   │   ├── Cluster/            # Clustering: TWebSocketCluster, TWebSocketEnvelope, backplanes (Null, File, Mesh, Redis)
+│   │   └── PubSub/             # prado.pubsub.v1: TWebSocketPubSubHandler, its event parameter and exception; assets/prado-pubsub.js browser client
 │   └── Web/Services/           # TWebSocketService (PRADO service routing to the server)
 ├── tests/
 │   ├── autobahn/               # Autobahn|TestSuite echo server, fuzzingclient config, and report gate

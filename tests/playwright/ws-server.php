@@ -13,12 +13,21 @@
  *   WS_PORT         bind port           (default 8378)
  *   WS_SUBPROTOCOLS comma-separated subprotocols the server will negotiate
  *   WS_DEFLATE      "1" to offer RFC 7692 permessage-deflate
+ *   WS_PUBSUB       "1" to serve prado.pubsub.v1 with TWebSocketPubSubHandler instead of echoing
+ *   WS_HEARTBEAT    the pub/sub heartbeat in seconds (default 25)
+ *
+ * In pub/sub mode, clients may publish to `room:*` channels, and the `echo` call returns its
+ * params while `kick` closes the caller with 4401.
  *
  * The process runs until killed (SIGTERM/SIGINT); the Playwright harness
  * spawns it before the suite and stops it after.
  */
 
+use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
+use Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubEventParameter;
+use Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubHandler;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
+use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
@@ -30,18 +39,40 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 $host = getenv('WS_HOST') ?: '127.0.0.1';
 $port = (int) (getenv('WS_PORT') ?: 8378);
 
-$handler = new TWebSocketHandler();
-$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message): void {
-	// Echo the message back in the mode it arrived in; the event carries each message's own opcode.
-	if ($message->getIsBinary()) {
-		$connection->sendBinary($message->getPayload());
-	} else {
-		$connection->send($message->getPayload());
-	}
-});
-
 $server = TWebSocketServer::bind("tcp://{$host}:{$port}");
-$server->setHandler($handler);
+
+if (getenv('WS_PUBSUB') === '1') {
+	// The server and the handler share one cluster, so the handler sees the server's registrations.
+	$cluster = new TWebSocketCluster();
+	$handler = new TWebSocketPubSubHandler();
+	$handler->setCluster($cluster);
+	$handler->setHeartbeat(getenv('WS_HEARTBEAT') ?: TWebSocketPubSubHandler::DEFAULT_HEARTBEAT);
+	$handler->attachEventHandler('onPublish', function ($connection, TWebSocketPubSubEventParameter $param): void {
+		$param->setAllowed(str_starts_with($param->getChannel(), 'room:'));
+	});
+	$handler->attachEventHandler('onCall', function (TWebSocketConnection $connection, TWebSocketPubSubEventParameter $param): void {
+		if ($param->getMethod() === 'echo') {
+			$param->setResult($param->getData());
+		} elseif ($param->getMethod() === 'kick') {
+			$connection->close(4401, 'kicked');
+			$param->setResult(true);
+		}
+	});
+	$server->setCluster($cluster);
+	$server->setHandler($handler);
+	$server->setSubprotocols([TWebSocketPubSubHandler::SUBPROTOCOL]);
+} else {
+	$handler = new TWebSocketHandler();
+	$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message): void {
+		// Echo the message back in the mode it arrived in; the event carries each message's own opcode.
+		if ($message->getIsBinary()) {
+			$connection->sendBinary($message->getPayload());
+		} else {
+			$connection->send($message->getPayload());
+		}
+	});
+	$server->setHandler($handler);
+}
 
 if (($subprotocols = getenv('WS_SUBPROTOCOLS')) !== false && $subprotocols !== '') {
 	$server->setSubprotocols(array_map('trim', explode(',', $subprotocols)));

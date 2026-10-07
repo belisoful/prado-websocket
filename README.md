@@ -70,6 +70,10 @@ Release notes and upgrade steps between versions are in [CHANGELOG.md](CHANGELOG
 | `TFileBackplane` | Shared-directory backplane for one host or a shared filesystem (dev/small clusters); owner-only spool |
 | `TRedisBackplane` | Redis pub/sub + presence backplane for multi-host scaling (needs `ext-redis`) |
 | `TMeshBackplane` | Peer-to-peer gossip backplane over server-to-server WebSocket links; shared-secret authenticated |
+| `IWebSocketClusterAware` | A handler the module hands its cluster to |
+| `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster |
+| `TWebSocketPubSubEventParameter` / `TWebSocketPubSubException` | The pub/sub request event parameter, and the rejection carrying the reply code |
+| `prado-pubsub.js` | The dependency-free browser client of `prado.pubsub.v1` |
 
 ## Architecture
 
@@ -245,6 +249,56 @@ Backplane choices:
 - **`TRedisBackplane`** — per-node inbox lists plus a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`/`InboxLimit`); the driver for multi-host scaling. Needs `ext-redis`. Redis pub/sub is not used (phpredis subscribe blocks); a node polls its inbox each tick. A dropped connection is retried every 5 s, and a reconnect re-declares the node's channel interest and presence from local state; a node that restarts under the same `NodeId` purges its previous incarnation's leftovers.
 - **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. A relay through a third node that holds the secret is not prevented, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL.
 
+## Pub/sub for browsers (`prado.pubsub.v1`)
+
+A browser needs no library to open a WebSocket, but the cluster's `subscribe()`/`publish()` are server-side calls. `TWebSocketPubSubHandler` defines a small JSON subprotocol over them, and `prado-pubsub.js` is its browser client.
+
+Each message is one JSON object with a `type`. A request with an `id` gets exactly one `ack` (with `data` for a call) or `error` (`code`, `message`); a request without one is answered only when it fails.
+
+| Client → server | Fields | Server → client | Fields |
+|---|---|---|---|
+| `subscribe` / `unsubscribe` | `channel` | `welcome` | `clientId`, `heartbeat` |
+| `publish` | `channel`, `data` | `message` | `data`, `channel`?, `from`? |
+| `send` | `to`, `data` | `ack` | `id`, `data`? |
+| `call` | `method`, `params` | `error` | `id`?, `code`, `message` |
+| `ping` | | `pong` | |
+
+Channels match `[A-Za-z0-9_.:/-]{1,128}`. Error codes are `bad_request`, `unknown_type`, `forbidden`, `limit`, `not_found` and `internal`. Delivery is at-most-once: a client that is reconnecting misses what is published meanwhile.
+
+```xml
+<module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule" Port="8080"
+    Subprotocols="prado.pubsub.v1" IdleTimeout="60"
+    HandlerClass="Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubHandler"
+    OnPublish="Application.Chat.authorizePublish" OnCall="Application.Chat.call" />
+```
+
+Authorization runs through events, each with a `TWebSocketPubSubEventParameter`:
+
+- `onSubscribe` → allowed unless a handler calls `setAllowed(false)`.
+- `onPublish` / `onSend` → denied unless `AllowClientPublish` / `AllowClientSend` is set or a handler allows it; a handler may also `setData()`.
+- `onCall` → a handler answers with `setResult()`, or throws a `TWebSocketPubSubException`; an unanswered call is `not_found`.
+- `onOpen` is raised before the `welcome`, so it can authenticate the client (close with 4401 or 4403 to stop the browser from reconnecting) or `subscribe()` it to its own channels.
+
+`MaxSubscriptions` (default 64) bounds each client, and `Heartbeat` (default 25 s; keep it below `IdleTimeout`) sets the client ping interval. Application code reaches clients with `publish()`, `sendTo()` and `broadcast()` on the handler, or with `$module->publish($channel, TWebSocketPubSubHandler::encodeMessage($data, $channel))`. The module gives the handler its cluster; a bare `TWebSocketServer` and the handler share one with `setCluster()`.
+
+```php
+$page->getClientScript()->registerScriptFile('prado-pubsub',
+    $page->publishFilePath(TWebSocketPubSubHandler::getClientScriptPath()));
+```
+
+```js
+const ps = new Prado.WebSocket.PubSub('wss://example.com/ws');
+ps.on('open', ({ clientId }) => console.log('connected as', clientId));
+const leave = await ps.subscribe('room:42', (data, frame) => render(data, frame.from));
+await ps.publish('room:42', { text: 'hi' });          // rejects with e.code === 'forbidden' when denied
+const rows = await ps.call('chat.history', { room: 42 });
+leave();
+```
+
+[`examples/chat`](examples/chat) is a runnable multi-room chat on this layer: rooms, history, whispers, and reconnection, run both standalone and as a PRADO application.
+
+The client reconnects with exponential backoff and jitter (`minDelay`, `maxDelay`), re-subscribes, holds requests made while offline (`maxQueue`), times requests out (`requestTimeout`), and drops a connection silent for twice the heartbeat. Close codes 1002, 1003, 1007 to 1010, 4401 and 4403 end reconnection. A publish, send or call in flight when the connection drops rejects with `disconnected` and is not resent. Pub/sub runs on the standalone server; `TWebSocketService` does not serve it.
+
 ## HTTP/2 multiplexing (RFC 8441)
 
 HTTP/2 is an optional capability, active only when the `prado-http2` package and `libnghttp2` are installed (see Requirements). When present, the server recognizes the HTTP/2 connection preface in a connection's first bytes and runs an HTTP/2 session; when absent, `isHttp2Available()` is false and HTTP/2 connections are declined.
@@ -278,7 +332,7 @@ Tests cover the codec (round-trips, masking, fragmentation, control-frame rules)
 
 ### Browser client tests (Playwright)
 
-A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate.
+A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate. The pub/sub specs drive `prado-pubsub.js` against `TWebSocketPubSubHandler`: channel delivery, calls, error codes, a fatal close, reconnection after a server restart, and heartbeat detection of a stalled server. The chat-example specs run both versions of [`examples/chat`](examples/chat) in two browser pages.
 
 ```sh
 npm install                                  # or: bun install
@@ -288,7 +342,7 @@ npx playwright test --project=chromium       # one engine
 HEADLESS=false npx playwright test           # watch it run
 ```
 
-The specs live in `tests/playwright/`; a small PHP echo server ([`ws-server.php`](tests/playwright/ws-server.php)) is spawned per run, and a static page server gives the browser a real HTTP origin. Nothing here is required for the PHP suite — it is an optional, browser-only layer.
+The specs live in `tests/playwright/`; a small PHP echo server ([`ws-server.php`](tests/playwright/ws-server.php), or pub/sub with `WS_PUBSUB=1`) is spawned per run, and a static page server gives the browser a real HTTP origin. Nothing here is required for the PHP suite — it is an optional, browser-only layer.
 
 ## License
 

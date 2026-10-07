@@ -15,6 +15,7 @@ use Prado\Exceptions\TInvalidOperationException;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketServerModule;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBackplane;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketClusterAware;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
@@ -37,7 +38,10 @@ use Prado\Xml\TXmlElement;
  *  - the {@see getHandlerClass() HandlerClass} handler the connections dispatch through (a
  *    {@see TWebSocketHandler} by default, whose events the module re-raises as {@see onOpen},
  *    {@see onMessage}, {@see onClose} and {@see onError}, so a configuration attribute such as
- *    `OnMessage="Application.Chat.onMessage"` receives them);
+ *    `OnMessage="Application.Chat.onMessage"` receives them).  The request events of a
+ *    {@see PubSub\TWebSocketPubSubHandler} ({@see onSubscribe}, {@see onPublish}, {@see onSend},
+ *    {@see onCall}) are re-raised the same way, and an {@see IWebSocketClusterAware} handler is
+ *    given the module's cluster;
  *  - {@see setSubprotocols() Subprotocols}, {@see setOrigins() Origins},
  *    {@see setAllowedHosts() AllowedHosts}, {@see setPermessageDeflate() PermessageDeflate};
  *  - the limits {@see setMaxMessageSize() MaxMessageSize}, {@see setMaxSendBufferBytes() MaxSendBufferBytes},
@@ -306,14 +310,19 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the handler the connections dispatch through.  A {@see TComponent} handler has its
-	 * `onOpen`/`onMessage`/`onClose`/`onError` events re-raised as the module's.
+	 * `onOpen`/`onMessage`/`onClose`/`onError` events, and the pub/sub
+	 * `onSubscribe`/`onPublish`/`onSend`/`onCall` events it defines, re-raised as the module's.  An
+	 * {@see IWebSocketClusterAware} handler is given the module's cluster once it exists.
 	 * @param IWebSocketHandler $value The handler.
 	 */
 	public function setHandler(IWebSocketHandler $value): void
 	{
 		$this->_handler = $value;
+		if ($value instanceof IWebSocketClusterAware && $this->_cluster !== null) {
+			$value->setCluster($this->_cluster);
+		}
 		if ($value instanceof TComponent) {
-			foreach (['onOpen', 'onMessage', 'onClose', 'onError'] as $event) {
+			foreach (['onOpen', 'onMessage', 'onClose', 'onError', 'onSubscribe', 'onPublish', 'onSend', 'onCall'] as $event) {
 				if ($value->hasEvent($event)) {
 					$value->attachEventHandler($event, fn ($sender, $param) => $this->raiseEvent($event, $sender, $param));
 				}
@@ -384,6 +393,50 @@ class TWebSocketModule extends TSocketServerModule
 	public function onError(mixed $sender, mixed $param = null): void
 	{
 		$this->raiseEvent('onError', $sender, $param);
+	}
+
+	/**
+	 * Raised before a pub/sub client joins a channel.  The sender is the {@see TWebSocketConnection}.
+	 * @param mixed $sender The connection.
+	 * @param mixed $param The {@see PubSub\TWebSocketPubSubEventParameter}.
+	 * @since 1.2.0
+	 */
+	public function onSubscribe(mixed $sender, mixed $param = null): void
+	{
+		$this->raiseEvent('onSubscribe', $sender, $param);
+	}
+
+	/**
+	 * Raised before a pub/sub client publishes.  The sender is the {@see TWebSocketConnection}.
+	 * @param mixed $sender The connection.
+	 * @param mixed $param The {@see PubSub\TWebSocketPubSubEventParameter}.
+	 * @since 1.2.0
+	 */
+	public function onPublish(mixed $sender, mixed $param = null): void
+	{
+		$this->raiseEvent('onPublish', $sender, $param);
+	}
+
+	/**
+	 * Raised before a pub/sub client sends a direct message.  The sender is the {@see TWebSocketConnection}.
+	 * @param mixed $sender The connection.
+	 * @param mixed $param The {@see PubSub\TWebSocketPubSubEventParameter}.
+	 * @since 1.2.0
+	 */
+	public function onSend(mixed $sender, mixed $param = null): void
+	{
+		$this->raiseEvent('onSend', $sender, $param);
+	}
+
+	/**
+	 * Raised for a pub/sub client call.  The sender is the {@see TWebSocketConnection}.
+	 * @param mixed $sender The connection.
+	 * @param mixed $param The {@see PubSub\TWebSocketPubSubEventParameter}.
+	 * @since 1.2.0
+	 */
+	public function onCall(mixed $sender, mixed $param = null): void
+	{
+		$this->raiseEvent('onCall', $sender, $param);
 	}
 
 	// =========================================================================
@@ -597,13 +650,16 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Returns the cluster coordinator, creating it from the configured node id and backplane on
-	 * first use.
+	 * first use.  A handler already set that is {@see IWebSocketClusterAware} is given the new cluster.
 	 * @return TWebSocketCluster The cluster coordinator.
 	 */
 	public function getCluster(): TWebSocketCluster
 	{
 		if ($this->_cluster === null) {
 			$this->_cluster = new TWebSocketCluster($this->_nodeId, $this->_backplane ?? new TNullBackplane());
+			if ($this->_handler instanceof IWebSocketClusterAware) {
+				$this->_handler->setCluster($this->_cluster);
+			}
 		}
 		return $this->_cluster;
 	}
