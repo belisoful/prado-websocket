@@ -7,7 +7,7 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 - **Current version: v1.1.0** (released 2026-09-22; v1.0.0 and v1.0.1 before it). Targets PRADO 4.4 (`pradosoft/prado` `master`, aliased `4.4.x-dev`). Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - Symbols released through v1.1.0 carry **no `@since` tags**. A public symbol added after v1.1.0 gets `@since` with the version it ships in.
 - Record every user-visible change under an `## [Unreleased]` heading in `CHANGELOG.md` as it lands.
-- Supported and CI-tested PHP: **8.1, 8.2, 8.3, 8.4, 8.5**.
+- Supported and CI-tested PHP: **8.2, 8.3, 8.4, 8.5** (PRADO 4.4 requires 8.2; 8.1 was dropped after v1.1.0).
 
 ## Key facts
 
@@ -22,7 +22,7 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 ```sh
 php -l <file>                                        # syntax
 composer fix        # php-cs-fixer on src and tests (tabs); or: vendor/bin/php-cs-fixer fix src  (and: fix tests)
-composer stan       # vendor/bin/phpstan analyse --memory-limit=1G  (level 3, PHP 8.1 – 8.5)
+composer stan       # vendor/bin/phpstan analyse --memory-limit=1G  (level 3, PHP 8.2 – 8.5)
 composer unittest   # vendor/bin/phpunit --testsuite unit
 ```
 

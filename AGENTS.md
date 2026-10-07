@@ -10,7 +10,7 @@
 - **Autobahn|TestSuite** (server compliance, needs Docker): see `.github/workflows/autobahn.yml`; `tests/autobahn/echo-server.php` is the testee and `tests/autobahn/check-report.php` gates the report
 
 ### Linting and Code Analysis
-- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); level 3, `phpVersion` range 8.1 – 8.5
+- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); level 3, `phpVersion` range 8.2 – 8.5
 - **PHP CS Fixer (Dry-run)**: `vendor/bin/php-cs-fixer fix --dry-run src/` and `vendor/bin/php-cs-fixer fix --dry-run tests/` (check)
 - **PHP CS Fixer (Fix)**: `vendor/bin/php-cs-fixer fix src/` and `vendor/bin/php-cs-fixer fix tests/` (or `composer fix`); the finder excludes `tests/`, so `src` and `tests` run as two invocations
 
@@ -30,7 +30,7 @@
 - All class properties must be declared with visibility modifiers (public, protected, private)
 - Uniform Access Principle - Self Encapsulation is required; for an example see `framework/TApplication.php` in PRADO
 - Extract Method → Predicate/Guard Clause (Fowler) is suggested
-- Code must run without deprecation notices on PHP 8.1 through 8.5: no implicitly nullable parameters (write `?Type $x = null`), no non-canonical casts (`(boolean)`, `(integer)`, `(double)`), no `E_STRICT`
+- Code must run without deprecation notices on PHP 8.2 through 8.5: no implicitly nullable parameters (write `?Type $x = null`), no non-canonical casts (`(boolean)`, `(integer)`, `(double)`), no `E_STRICT`
 
 ### Naming Conventions
 - Class names: `TPascalCase` (eg. `TWebSocketServer`); interfaces `IPascalCase` (eg. `IWebSocketBackplane`)
@@ -144,7 +144,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - phpunit DOES NOT have the cli option "--verbose"
 
 ## Development Environment
-- PHP 8.1 through 8.5 are supported and exercised in CI (`.github/workflows/prado-websocket.yml`)
+- PHP 8.2 through 8.5 are supported and exercised in CI (`.github/workflows/prado-websocket.yml`)
 - PHP extensions: ctype, dom, intl, json, pcre, spl (required by PRADO); ffi, openssl (required for HTTP/2); sockets, zlib, redis (optional features)
 - System library: libnghttp2 (HTTP/2, bound via FFI)
 - Composer for dependency management; Node (see `.nvmrc`) or bun for Playwright

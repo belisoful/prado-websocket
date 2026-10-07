@@ -14,7 +14,7 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.1 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.1 through 8.5 |
+| PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
 | `belisoful/prado-http2` `^1.1` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
@@ -320,13 +320,13 @@ The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazil
 composer install
 composer unittest        # phpunit --testsuite unit
 composer fix             # php-cs-fixer on src/ and tests/
-composer stan            # phpstan (level 3, PHP 8.1 – 8.5)
+composer stan            # phpstan (level 3, PHP 8.2 – 8.5)
 composer fulltest        # fix, stan, unittest in order
 composer coverage        # unit tests with a text coverage summary (needs Xdebug)
 composer coverage-html   # HTML coverage report in build/coverage
 ```
 
-Unit tests live under `tests/unit/` in the `Prado\Test\Unit\` namespace (Composer `autoload-dev`), mirroring the directory. CI runs the suite against the PRADO 4.4 development branch and the `prado-http2` main branch on PHP 8.1, 8.2, 8.3, 8.4, and 8.5; the Autobahn|TestSuite server-compliance run and the three Playwright browser jobs run on PHP 8.4.
+Unit tests live under `tests/unit/` in the `Prado\Test\Unit\` namespace (Composer `autoload-dev`), mirroring the directory. CI runs the suite against the PRADO 4.4 development branch and the `prado-http2` main branch on PHP 8.2, 8.3, 8.4, and 8.5; the Autobahn|TestSuite server-compliance run and the three Playwright browser jobs run on PHP 8.4.
 
 Tests cover the codec (round-trips, masking, fragmentation, control-frame rules), the handshake (RFC 6455 accept-key vector), the connection (blocking and `feed()` paths over socket pairs), the server (HTTP/1.1 over a real socket and HTTP/2 auto-selection), and the RFC 8441 round-trip end to end. HTTP/2 tests skip cleanly where `libnghttp2` is absent.
 

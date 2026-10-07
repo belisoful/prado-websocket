@@ -13,6 +13,12 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - Playwright specs for the browser client against the pub/sub handler (`tests/playwright/pubsub.spec.js`); `ws-server.php` serves pub/sub with `WS_PUBSUB=1`.
 - `examples/chat`: a multi-room chat on `TWebSocketPubSubHandler` and `prado-pubsub.js`, with history, whispers and reconnection. It runs as a standalone server or as a PRADO application (`websocket/serve`), and `tests/playwright/chat-example.spec.js` covers both versions.
 
+### Changed
+- PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI and PHPStan cover PHP 8.2 to 8.5.
+
+### Upgrading
+- Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
+
 ## [1.1.0] - 2026-09-22
 
 This release resyncs the extension with PRADO 4.4 development HEAD and lands a full audit and hardening pass. It changes some public API; see [Upgrading from 1.0.x](#upgrading-from-10x).
