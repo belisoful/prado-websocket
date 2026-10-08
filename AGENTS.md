@@ -6,6 +6,7 @@
 - **All Unit Tests**: `vendor/bin/phpunit --testsuite unit` (or `composer unittest`) - runs all unit tests
 - **Test Filter**: `vendor/bin/phpunit --testsuite unit --filter <test function, class, or directory>`
 - **Coverage**: `composer coverage` (text) / `composer coverage-html` (HTML in `build/coverage`); phpunit.xml declares `src/` as the coverage source and the scripts set `XDEBUG_MODE`. Narrow a run with `--filter` and `--coverage-filter`.
+  - **Path/branch coverage, fast**: a full-suite `--path-coverage` run takes about an hour. To get the exact per-class branch and path list that CI reports, pass `--path-coverage` to a run filtered to the relevant test classes, which takes seconds: `composer coverage -- --filter 'TWebSocketFrameCodecTest|TWebSocketMessageTest' --coverage-filter src/IO/Socket/WebSocket/TWebSocketFrameCodec.php --path-coverage`. `--coverage-filter` adds to the `src/` source in phpunit.xml and does not replace it, so every class still gets a row. Read only the rows for the classes under test, and ignore the summary percentages.
 - **Playwright browser-client tests**: `composer functest` (Chromium) / `composer functionaltest` (all browsers); the static page server starts automatically and `tests/playwright/ws-helpers.js` spawns the PHP WebSocket server per spec
 - **Autobahn|TestSuite** (server compliance, needs Docker): see `.github/workflows/autobahn.yml`; `tests/autobahn/echo-server.php` is the testee and `tests/autobahn/check-report.php` gates the report
 
