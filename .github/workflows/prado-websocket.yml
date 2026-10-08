@@ -20,19 +20,19 @@ jobs:
 
     steps:
       - name: Checkout extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: prado-websocket
 
       - name: Checkout PRADO framework (4.4 dev)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: pradosoft/prado
           ref: master
           path: prado
 
       - name: Checkout Belisoful HTTP/2 extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: belisoful/prado-http2
           ref: main
@@ -63,7 +63,7 @@ jobs:
         run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
           key: ${{ runner.os }}-php${{ matrix.php-versions }}-composer-${{ hashFiles('**/composer.json') }}
@@ -104,19 +104,19 @@ jobs:
 
     steps:
       - name: Checkout extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: prado-websocket
 
       - name: Checkout PRADO framework (4.4 dev)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: pradosoft/prado
           ref: master
           path: prado
 
       - name: Checkout Belisoful HTTP/2 extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: belisoful/prado-http2
           ref: main
@@ -133,7 +133,7 @@ jobs:
           extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: prado-websocket/.nvmrc
 
@@ -155,7 +155,7 @@ jobs:
         run: npx playwright test --project=${{ matrix.browser }}
 
       - name: Upload Playwright report (${{ matrix.browser_name }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: playwright-report-${{ matrix.browser }}

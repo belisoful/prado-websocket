@@ -11,19 +11,19 @@ jobs:
 
     steps:
       - name: Checkout extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: prado-websocket
 
       - name: Checkout PRADO framework (4.4 dev)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: pradosoft/prado
           ref: master
           path: prado
 
       - name: Checkout Belisoful HTTP/2 extension
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: belisoful/prado-http2
           ref: main
@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload the Autobahn report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: autobahn-report
           path: prado-websocket/tests/autobahn/reports
