@@ -15,6 +15,8 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 
 ### Changed
 - PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI and PHPStan cover PHP 8.2 to 8.5.
+- CI runs on `ubuntu-26.04`. `belisoful/prado-http2` 1.2 needs libnghttp2 1.60.0 or later, and Ubuntu 24.04 ships 1.59.0, so the HTTP/2 tests were skipped there on PHP 8.2 and 8.3 and crashed PHP 8.4 and 8.5. The README lists the libnghttp2 requirement.
+- The development dependency on `belisoful/prado-http2` is `^1.2`, the release CI builds against.
 - Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0.
 
 ### Upgrading

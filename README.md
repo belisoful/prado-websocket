@@ -16,9 +16,9 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 |---|---|---|
 | PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
-| `belisoful/prado-http2` `^1.1` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
+| `belisoful/prado-http2` `^1.2` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
-| System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2` |
+| System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2`. `prado-http2` 1.2 needs 1.60.0 or later: Ubuntu 26.04 ships 1.68.0, Ubuntu 24.04 only 1.59.0 |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
 | `ext-sockets` | suggested | Faster socket primitives for the standalone server |
 | `ext-zlib` | suggested | RFC 7692 permessage-deflate message compression |

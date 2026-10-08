@@ -6,7 +6,8 @@ env:
 jobs:
   composerext:
     name: WebSocket (PHP ${{ matrix.php-versions }})
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 1.2 needs; 26.04 ships 1.68.0.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     strategy:
@@ -85,7 +86,8 @@ jobs:
 
   playwright:
     name: WebSocket Playwright (${{ matrix.browser_name }})
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 1.2 needs; 26.04 ships 1.68.0.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
