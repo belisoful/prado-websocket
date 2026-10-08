@@ -148,7 +148,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - PHP extensions: ctype, dom, intl, json, pcre, spl (required by PRADO); ffi, openssl (required for HTTP/2); sockets, zlib, redis (optional features)
 - System library: libnghttp2 (HTTP/2, bound via FFI)
 - Composer for dependency management; Node (see `.nvmrc`) or bun for Playwright
-- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer
+- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.0 and 3.95.27); update them together with PRADO
 - Presume that project dependencies are installed
 - CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD
 

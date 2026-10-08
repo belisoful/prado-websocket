@@ -15,6 +15,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 
 ### Changed
 - PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI and PHPStan cover PHP 8.2 to 8.5.
+- Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0.
 
 ### Upgrading
 - Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
