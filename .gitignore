@@ -39,3 +39,4 @@ index
 /playwright-report/
 bun.lock
 bun.lockb
+package-lock.json
