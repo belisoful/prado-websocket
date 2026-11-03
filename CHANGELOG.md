@@ -17,7 +17,8 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 ### Changed
 - PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI and PHPStan cover PHP 8.2 to 8.5.
 - CI runs on `ubuntu-26.04`. `belisoful/prado-http2` 1.2 needs libnghttp2 1.60.0 or later, and Ubuntu 24.04 ships 1.59.0, so the HTTP/2 tests were skipped there on PHP 8.2 and 8.3 and crashed PHP 8.4 and 8.5. The README lists the libnghttp2 requirement.
-- The development dependency on `belisoful/prado-http2` is `^1.2`, the release CI builds against.
+- The development dependency on `belisoful/prado-http2` is `^1.3`, the release CI builds against.
+- `THttp2WebSocketProtocol` holds bytes received while its HTTP/2 session is busy and feeds them, in order, once the outer `receive()` or `send()` returns; a `send()` made during another `send()` returns `''`. `prado-http2` 1.3 refuses to re-enter a session's nghttp2 call (`http2_session_busy`), and a handler that waits on the event loop outside a fiber of its own ticks the reactor from inside that call. Before, the server's next read of that transport threw and ended the whole HTTP/2 connection.
 - Playwright is `@playwright/test` 1.62.1, as PRADO pins; 1.60.0 cannot install browsers on Ubuntu 26.04.
 - Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0.
 - Runs on PRADO's event loop API (pradosoft/prado#1377). `TSocketReactor` is now an `IEventLoop`: `TWebSocketServer` schedules its handshake and close deadlines with `delay()`, its idle scan with `repeat()`, and cancels them with `cancel()`, so timer identifiers are strings. A deadline timer that fires before the server's clock reaches the deadline re-arms itself, and a server that moves to another reactor with `setReactor()` re-arms its pending handshake and close deadlines there.

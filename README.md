@@ -16,9 +16,9 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 |---|---|---|
 | PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
-| `belisoful/prado-http2` `^1.2` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
+| `belisoful/prado-http2` `^1.3` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
-| System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2`. `prado-http2` 1.2 needs 1.60.0 or later: Ubuntu 26.04 ships 1.68.0, Ubuntu 24.04 only 1.59.0 |
+| System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2`. `prado-http2` needs 1.60.0 or later: Ubuntu 26.04 ships 1.68.0, Ubuntu 24.04 only 1.59.0 |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
 | `ext-sockets` | suggested | Faster socket primitives for the standalone server |
 | `ext-zlib` | suggested | RFC 7692 permessage-deflate message compression |
@@ -130,7 +130,7 @@ $server->serve();                                 // TSocketReactor-driven loop;
 
 The loop is PRADO's `TSocketReactor`: the listener, every connection and the cluster backplane's sockets are multiplexed through one `select()`, transports are watched for writes only while output is queued, and the handshake, close and idle deadlines run as reactor timers. Pass your own reactor with `setReactor()` to run other sources in the same loop; `serveOnce()` runs one tick for tests.
 
-While `serve()` runs, the reactor is also PRADO's `TAsync` loop (the prior loop is restored on exit), and `TWebSocketModule` serves the same way. A fiber that a handler starts with `TAsync::run()` therefore resumes on the loop the server ticks, so a handler can wait on `TAsync::sleep()`, a `TFuture`, or `TCurlMultiHttpClient` without stalling other clients. Start such waits in a fiber: an `await()` on the main fiber ticks the reactor from inside the handler's callback.
+While `serve()` runs, the reactor is also PRADO's `TAsync` loop (the prior loop is restored on exit), and `TWebSocketModule` serves the same way. A fiber that a handler starts with `TAsync::run()` therefore resumes on the loop the server ticks, so a handler can wait on `TAsync::sleep()`, a `TFuture`, or `TCurlMultiHttpClient` without stalling other clients. Start such waits in a fiber: an `await()` on the main fiber ticks the reactor from inside the handler's callback. Over HTTP/2 the handler runs inside the session's nghttp2 call, which `prado-http2` 1.3 refuses to re-enter; `THttp2WebSocketProtocol` holds the bytes the loop reads for that session meanwhile and feeds them once the call returns.
 
 ### As a daemon from prado-cli
 

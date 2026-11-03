@@ -6,7 +6,7 @@ env:
 jobs:
   composerext:
     name: WebSocket (PHP ${{ matrix.php-versions }})
-    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 1.2 needs; 26.04 ships 1.68.0.
+    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 needs; 26.04 ships 1.68.0.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
 
@@ -73,7 +73,7 @@ jobs:
       - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
         run: |
           composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
-          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.2.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
@@ -86,7 +86,7 @@ jobs:
 
   playwright:
     name: WebSocket Playwright (${{ matrix.browser_name }})
-    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 1.2 needs; 26.04 ships 1.68.0.
+    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 needs; 26.04 ships 1.68.0.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
@@ -148,7 +148,7 @@ jobs:
       - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
         run: |
           composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
-          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.2.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader

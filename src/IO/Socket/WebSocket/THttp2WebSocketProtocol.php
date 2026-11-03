@@ -85,6 +85,15 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var ?callable The per-stream notification callback set during {@see serve()}. */
 	private $_onStream;
 
+	/** @var bool Whether a {@see receive()} is feeding the session. */
+	private bool $_receiving = false;
+
+	/** @var bool Whether a {@see send()} is draining the session. */
+	private bool $_sending = false;
+
+	/** @var string The bytes received while the session was busy, fed once it is not. */
+	private string $_deferred = '';
+
 	/**
 	 * @param IWebSocketHandler $handler The handler each WebSocket stream is run through.
 	 * @throws \Prado\IO\Http2\THttp2Exception When libnghttp2 is unavailable.
@@ -255,20 +264,68 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/**
 	 * Feeds received transport bytes into the HTTP/2 session, driving the WebSocket streams.
+	 *
+	 * Handlers run inside the session's nghttp2 call, and {@see TH2Session::receive()} refuses
+	 * re-entry (`http2_session_busy`).  A handler that waits on the event loop outside a fiber of its
+	 * own ticks the loop from inside that call, and the loop may read this transport again.  Bytes
+	 * that arrive while the session is busy are held and fed, in order, once the outer
+	 * {@see receive()} or {@see send()} returns.  HTTP/2 flow control bounds the DATA a peer sends
+	 * meanwhile, since the session acknowledges none of the held bytes.
 	 * @param string $bytes The bytes read from the transport.
 	 */
 	public function receive(string $bytes): void
 	{
-		$this->_session->receive($bytes);
+		if ($this->_receiving || $this->_sending) {
+			$this->_deferred .= $bytes;
+			return;
+		}
+		$this->_receiving = true;
+		try {
+			$this->_session->receive($bytes);
+			$this->feedDeferred();
+		} finally {
+			$this->_receiving = false;
+		}
 	}
 
 	/**
-	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.
+	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.  A call made
+	 * while a {@see send()} is in progress (a handler waiting on the event loop from inside it)
+	 * returns `''`; the outer call or the next one carries the output.
 	 * @return string The bytes to write to the transport.
 	 */
 	public function send(): string
 	{
-		return $this->_session->send();
+		if ($this->_sending) {
+			return '';
+		}
+		$this->_sending = true;
+		try {
+			$output = $this->_session->send();
+		} finally {
+			$this->_sending = false;
+		}
+		if (!$this->_receiving && $this->_deferred !== '') {
+			$this->_receiving = true;
+			try {
+				$this->feedDeferred();
+			} finally {
+				$this->_receiving = false;
+			}
+		}
+		return $output;
+	}
+
+	/**
+	 * Feeds the bytes held while the session was busy, including any that arrive while they are fed.
+	 */
+	private function feedDeferred(): void
+	{
+		while ($this->_deferred !== '') {
+			$bytes = $this->_deferred;
+			$this->_deferred = '';
+			$this->_session->receive($bytes);
+		}
 	}
 
 	/**
@@ -448,6 +505,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 				$this->onClose($connection);
 			}
 		} finally {
+			$this->_deferred = '';
 			$this->_session->close();
 		}
 	}

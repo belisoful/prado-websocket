@@ -418,4 +418,61 @@ class THttp2WebSocketProtocolTest extends TestCase
 		}
 		$client->close();
 	}
+
+	public function testReceiveFromInsideAHandlerIsHeldUntilTheOuterReceiveReturns()
+	{
+		$handler = new TWebSocketHandler();
+		$received = [];
+		$heldDuringHandler = null;
+		[$protocol, $client, $stream] = $this->establish($handler);
+		$handler->attachEventHandler('onMessage', function ($connection, $message) use (&$received, &$heldDuringHandler, $protocol, $client, $stream) {
+			$received[] = (string) $message;
+			if ((string) $message === 'first') {
+				// A handler waiting on the event loop lets the loop read the transport again.
+				$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('second'), random_bytes(4)));
+				$protocol->receive($client->send());
+				$heldDuringHandler = $received;
+			}
+		});
+
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('first'), random_bytes(4)));
+		$protocol->receive($client->send());
+
+		self::assertSame(['first'], $heldDuringHandler, 'Bytes received inside a handler are held while the session is busy.');
+		self::assertSame(['first', 'second'], $received, 'The held bytes are fed in order once the outer receive returns.');
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
+
+	public function testSendAndReceiveFromInsideASendAreDeferred()
+	{
+		$handler = new TWebSocketHandler();
+		$received = [];
+		$handler->attachEventHandler('onMessage', function ($connection, $message) use (&$received) {
+			$received[] = (string) $message;
+		});
+		[$protocol, $client, $stream] = $this->establish($handler);
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		$nested = null;
+		$protocol->getSession()->attachEventHandler('onFrameSent', function () use (&$nested, &$received, $protocol, $client, $stream) {
+			if ($nested !== null) {
+				return;
+			}
+			$nested = $protocol->send();
+			$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('during send'), random_bytes(4)));
+			$protocol->receive($client->send());
+			self::assertSame([], $received, 'A receive inside a send is held.');
+		});
+		$protocol->getSession()->ping();
+		$protocol->send();
+
+		self::assertSame('', $nested, 'A send inside a send yields nothing instead of throwing http2_session_busy.');
+		self::assertSame(['during send'], $received, 'The held bytes are fed once the outer send returns.');
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
 }
