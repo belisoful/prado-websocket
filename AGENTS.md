@@ -182,8 +182,7 @@ Docblocks inform and describe; it is not persuasive writing.
 # PRADO Framework Agent Safeguards -- ANTI-PATTERNS
 Between the next brackets, it is required without exception:
 {
-- NEVER (without exception) execute the following "git" commands without asking the developer for approval first: clone, mv, restore, rm, branch, commit, merge, rebase, reset, pull, push
-- NEVER (without exception) execute "rm" commands on any paths without asking the developer for approval first
+- NEVER execute "rm" commands on any paths without asking the developer for approval first; except to clean up prior work
 - NEVER remove composer --dev dependencies required for development
 - NEVER perform an action that erases or overwrites files for the task of unit testing and fixing; file changes are important and must be kept, because the changes themselves are being unit tested.
 - NEVER delete any folders or files until the associated task is absolutely and totally complete.
