@@ -130,6 +130,8 @@ $server->serve();                                 // TSocketReactor-driven loop;
 
 The loop is PRADO's `TSocketReactor`: the listener, every connection and the cluster backplane's sockets are multiplexed through one `select()`, transports are watched for writes only while output is queued, and the handshake, close and idle deadlines run as reactor timers. Pass your own reactor with `setReactor()` to run other sources in the same loop; `serveOnce()` runs one tick for tests.
 
+While `serve()` runs, the reactor is also PRADO's `TAsync` loop (the prior loop is restored on exit), and `TWebSocketModule` serves the same way. A fiber that a handler starts with `TAsync::run()` therefore resumes on the loop the server ticks, so a handler can wait on `TAsync::sleep()`, a `TFuture`, or `TCurlMultiHttpClient` without stalling other clients. Start such waits in a fiber: an `await()` on the main fiber ticks the reactor from inside the handler's callback.
+
 ### As a daemon from prado-cli
 
 `TWebSocketModule` is a PRADO `TSocketServerModule`: configure it in the application and run it with the shell:
@@ -147,6 +149,8 @@ php protected/prado-cli.php websocket/serve            # or: --port 9000 --addre
 ```
 
 The module binds `Endpoint` (or `Scheme`/`Address`/`Port`; `tls://` with `SocketOptions` for the certificate), creates the `HandlerClass` handler (a `TWebSocketHandler` by default) and re-raises its `onOpen`/`onMessage`/`onClose`/`onError` as module events, applies `Subprotocols`, `Origins`, `AllowedHosts`, `PermessageDeflate` and the limits (`MaxMessageSize`, `HandshakeTimeout`, `IdleTimeout`, `CloseTimeout`, `MaxConnections`), and serves until SIGTERM or CTRL-C. Running it is gated by PRADO's `socket_server` permission.
+
+The module's `EventLoop` is the `TSocketReactor` the server ticks: `EventLoopClass` defaults to `TSocketReactor`, and `setEventLoop()` takes one the application has already loaded with other sources or timers. PRADO's `TSocketServerModule` defaults to a `TRevoltEventLoop`, which the server cannot tick, so the module accepts only a reactor.
 
 Each accepted connection stays non-blocking while its opening bytes arrive: the HTTP/2 preface starts an HTTP/2 session (one socket, many multiplexed WebSockets); otherwise the RFC 6455 upgrade handshake runs. A connection that has not completed its handshake within `HandshakeTimeout` is dropped, and the loop's wait is bounded by the nearest handshake deadline, idle scan, or cluster tick, so idle reaping runs on a quiet server too. Either way, complete messages dispatch to the handler, and `onConnection` is raised on the server per ready `TWebSocketConnection`.
 

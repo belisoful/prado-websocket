@@ -11,7 +11,10 @@
 namespace Prado\IO\Socket\WebSocket;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataTypeException;
 use Prado\Exceptions\TInvalidOperationException;
+use Prado\IO\Async\IEventLoop;
+use Prado\IO\Socket\TSocketReactor;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketServerModule;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBackplane;
@@ -53,9 +56,11 @@ use Prado\Xml\TXmlElement;
  *    the `backplane` key of an array configuration); without one the module runs a single node on a
  *    {@see TNullBackplane}.  A mesh backplane is also added as the server's peer endpoint.
  *
- * The server owns its event loop (a {@see \Prado\IO\Socket\TSocketReactor} the module supplies
- * through {@see createReactor()}), so the parent's `onClientConnect`/`onClientData`/
- * `onClientDisconnect` events are not raised; the handler events above are the connection lifecycle.
+ * The server drives its own event loop: the module's {@see getEventLoop() EventLoop}, a
+ * {@see TSocketReactor} created through {@see createReactor()} (the parent defaults to a
+ * {@see \Prado\IO\Async\TRevoltEventLoop}, which the server cannot tick).  The parent's
+ * `onClientConnect`/`onClientData`/`onClientDisconnect` events are not raised; the handler events
+ * above are the connection lifecycle.
  * Application code reaches the cluster through {@see publish()}, {@see broadcast()},
  * {@see sendToClient()} and {@see presence()}.  A daemon that builds its own server hands it the
  * cluster with {@see prepareServer()}.  The {@see setNodeId() NodeId} is fixed once the cluster exists.
@@ -89,6 +94,9 @@ class TWebSocketModule extends TSocketServerModule
 
 	/** The default handler class the connections dispatch through. */
 	public const DEFAULT_HANDLER_CLASS = TWebSocketHandler::class;
+
+	/** The default event loop class: the server ticks a {@see TSocketReactor}. */
+	public const DEFAULT_EVENT_LOOP_CLASS = TSocketReactor::class;
 
 	/** @var string The handler class instantiated when no handler is set. */
 	private string $_handlerClass = self::DEFAULT_HANDLER_CLASS;
@@ -247,10 +255,12 @@ class TWebSocketModule extends TSocketServerModule
 	}
 
 	/**
-	 * Drives the server's own reactor loop until {@see stop()} closes the server, delivering caught
-	 * process signals between ticks.  The reactor comes from {@see createReactor()}, so a subclass
-	 * can pre-register other sources or timers in the same loop.
+	 * Drives the server's reactor loop until {@see stop()} closes the server, delivering caught
+	 * process signals between ticks.  The reactor is the module's {@see getEventLoop() EventLoop},
+	 * created by {@see createReactor()} unless one was set, so a subclass or the application can
+	 * register other sources or timers in the same loop.
 	 * @param TSocketServer $server The listening server, a {@see TWebSocketServer}.
+	 * @throws TConfigurationException When the event loop is not a {@see TSocketReactor}.
 	 */
 	protected function serveLoop(TSocketServer $server): void
 	{
@@ -258,8 +268,61 @@ class TWebSocketModule extends TSocketServerModule
 			parent::serveLoop($server);
 			return;
 		}
-		$server->setReactor($this->createReactor());
+		$reactor = $this->getEventLoop();
+		if (!$reactor instanceof TSocketReactor) {
+			throw new TConfigurationException('websocket_module_event_loop_invalid', $reactor::class);
+		}
+		$server->setReactor($reactor);
 		$server->serve(1, fn () => TSignalsDispatcher::syncDispatch());   // a one-second tick keeps a sync-mode signal (and stop()) responsive
+	}
+
+	/**
+	 * Builds the module's default event loop through {@see createReactor()}.
+	 * @return IEventLoop The loop, a {@see TSocketReactor}.
+	 */
+	protected function createEventLoop(): IEventLoop
+	{
+		return $this->createReactor();
+	}
+
+	/**
+	 * Builds the reactor the server runs on from {@see getEventLoopClass() EventLoopClass}.
+	 * Subclasses override this to register other sources or timers before serving.
+	 * @return TSocketReactor The reactor.
+	 */
+	protected function createReactor(): TSocketReactor
+	{
+		return Prado::createComponent($this->getEventLoopClass());
+	}
+
+	/**
+	 * Sets the loop the server runs on.  {@see TWebSocketServer} ticks its loop, so it must be a
+	 * {@see TSocketReactor}.
+	 * @param ?IEventLoop $value The reactor, or null to create the default on the next {@see getEventLoop()}.
+	 * @throws TInvalidDataTypeException When the loop is not a {@see TSocketReactor}.
+	 * @return static The current module.
+	 */
+	public function setEventLoop(?IEventLoop $value): static
+	{
+		if ($value !== null && !$value instanceof TSocketReactor) {
+			throw new TInvalidDataTypeException('websocket_module_event_loop_invalid', $value::class);
+		}
+		return parent::setEventLoop($value);
+	}
+
+	/**
+	 * Sets the reactor class the default loop is created from.
+	 * @param string $value {@see TSocketReactor} or a subclass.
+	 * @throws TConfigurationException When the class is not a {@see TSocketReactor}.
+	 * @return static The current module.
+	 */
+	public function setEventLoopClass($value): static
+	{
+		$value = TPropertyValue::ensureString($value);
+		if (!is_a($value, TSocketReactor::class, true)) {
+			throw new TConfigurationException('websocket_module_event_loop_class_invalid', $value);
+		}
+		return parent::setEventLoopClass($value);
 	}
 
 	/**

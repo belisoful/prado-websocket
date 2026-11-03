@@ -4,6 +4,9 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataTypeException;
+use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TRevoltEventLoop;
 use Prado\IO\Socket\TSocketReactor;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketServerModule;
@@ -34,7 +37,7 @@ class ProbeWebSocketModule extends TWebSocketModule
 	{
 		$reactor = parent::createReactor();
 		foreach ($this->timers as [$delay, $callback]) {
-			$reactor->after($delay, $callback);
+			$reactor->delay($delay, $callback);
 		}
 		return $reactor;
 	}
@@ -179,6 +182,86 @@ class TWebSocketModuleTest extends TestCase
 		self::assertSame(['hello module'], $messages, 'The handler onMessage was re-raised with the TWebSocketMessage.');
 		self::assertNull($module->getServer(), 'The server is released after serving.');
 		$client?->close();
+	}
+
+	public function testTheEventLoopIsAReactor()
+	{
+		$module = new TWebSocketModule();
+		self::assertSame(TSocketReactor::class, $module->getEventLoopClass());
+		self::assertInstanceOf(TSocketReactor::class, $module->getEventLoop());
+		self::assertSame($module->getEventLoop(), $module->getEventLoop(), 'The loop is created once.');
+		$reactor = new TSocketReactor();
+		self::assertSame($module, $module->setEventLoop($reactor));
+		self::assertSame($reactor, $module->getEventLoop());
+	}
+
+	public function testEventLoopClassMustBeAReactor()
+	{
+		$module = new TWebSocketModule();
+		$this->expectException(TConfigurationException::class);
+		$module->setEventLoopClass(TRevoltEventLoop::class);
+	}
+
+	public function testEventLoopMustBeAReactor()
+	{
+		$module = new TWebSocketModule();
+		$this->expectException(TInvalidDataTypeException::class);
+		$module->setEventLoop(new TRevoltEventLoop());
+	}
+
+	public function testServeRunsOnASuppliedReactor()
+	{
+		$module = new TWebSocketModule();
+		$module->setEndpoint('tcp://127.0.0.1:0');
+		$reactor = new TSocketReactor();
+		$module->setEventLoop($reactor);
+		$served = null;
+		$reactor->delay(0.05, function () use ($module, &$served) {
+			$served = $module->getServer();
+			$module->stop();
+		});
+		$start = microtime(true);
+		self::assertTrue($module->serve());
+		self::assertLessThan(3.0, microtime(true) - $start, 'The supplied reactor ran the timer that stopped the loop.');
+		self::assertInstanceOf(TWebSocketServer::class, $served);
+		self::assertSame([], $reactor->getIdentifiers(), 'The server releases the reactor when it stops.');
+	}
+
+	public function testAFiberAHandlerStartsResumesWhileTheModuleServes()
+	{
+		$module = new ProbeWebSocketModule();
+		$module->setEndpoint('tcp://127.0.0.1:0');
+		$prior = TAsync::getLoop();
+		$module->attachEventHandler('onMessage', function ($connection) {
+			TAsync::run(function () use ($connection) {
+				TAsync::sleep(0.05);
+				$connection->send('fiber done');
+			});
+		});
+
+		$client = null;
+		$clientWs = null;
+		$reply = null;
+		$module->timers[] = [0.05, function () use (&$client, &$clientWs, $module) {
+			$client = TSocketStream::connect('tcp://127.0.0.1:' . $module->getServer()->getPort(), 1.0);
+			$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+			$clientWs = new TWebSocketConnection($client, true);
+		}];
+		$module->timers[] = [0.2, function () use (&$client, &$clientWs) {
+			$client->read(4096);   // the 101
+			$clientWs->send('go');
+		}];
+		$module->timers[] = [0.5, function () use (&$clientWs, &$reply, $module) {
+			$reply = (string) $clientWs->receive();
+			$module->stop();
+		}];
+		$module->timers[] = [3.0, fn () => $module->stop()];   // a safety net so a regression cannot hang the suite
+
+		self::assertTrue($module->serve());
+		self::assertSame('fiber done', $reply, 'The fiber the handler started resumed on the served reactor.');
+		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored when serve() returns.');
+		$client?->close();
+		TAsync::setLoop(null);
 	}
 
 	public function testInitWithoutAnApplicationParsesTheBackplaneOnly()

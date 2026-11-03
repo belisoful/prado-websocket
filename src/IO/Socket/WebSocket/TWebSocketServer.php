@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketReactor;
@@ -114,8 +115,8 @@ class TWebSocketServer extends TSocketServer
 	/** @var bool Whether the listener and sessions are registered with the reactor. */
 	private bool $_attached = false;
 
-	/** @var ?int The reactor timer that scans for idle sessions, while an idle timeout is set. */
-	private ?int $_idleTimer = null;
+	/** @var ?string The reactor timer that scans for idle sessions, while an idle timeout is set. */
+	private ?string $_idleTimer = null;
 
 	/** @var array<int, \Prado\IO\IResource> The cluster sources registered with the reactor, keyed by object id. */
 	private array $_clusterSources = [];
@@ -127,10 +128,10 @@ class TWebSocketServer extends TSocketServer
 	private array $_endpoints = [];
 
 	/**
-	 * @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float, handshake?: string, deadline?: float, crypto?: bool, closing?: float, discard?: bool, timer?: int, closeTimer?: int}>
-	 *   Live sessions, keyed by transport object id.  `timer` and `closeTimer` are the reactor timers
-	 *   scheduled for the handshake and close deadlines.  A pending session (its opening handshake still
-	 *   arriving) carries the bytes gathered so far in `handshake`, `crypto` while its TLS handshake
+	 * @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float, handshake?: string, deadline?: float, crypto?: bool, closing?: float, discard?: bool, timer?: string, closeTimer?: string}>
+	 *   Live sessions, keyed by transport object id.  `timer` and `closeTimer` are the reactor timer
+	 *   identifiers scheduled for the handshake and close deadlines.  A pending session (its opening
+	 *   handshake still arriving) carries the bytes gathered so far in `handshake`, `crypto` while its TLS handshake
 	 *   is in progress, and, when a {@see getHandshakeTimeout() HandshakeTimeout} is set, the
 	 *   `deadline` it must complete by.  A closing HTTP/1.1 session carries the `closing` deadline it
 	 *   is ended at, and `discard` once the connection has failed and its input is no longer parsed.
@@ -569,8 +570,9 @@ class TWebSocketServer extends TSocketServer
 		$this->_attached = true;
 		$this->setBlocking(false);
 		$this->getReactor()->register($this, onReadable: fn () => $this->readyListener());
-		foreach ($this->_sessions as $session) {
+		foreach ($this->_sessions as $id => $session) {
 			$this->registerSession($session['transport']);
+			$this->armSessionTimers($id);
 		}
 		$this->armIdleTimer();
 	}
@@ -595,7 +597,7 @@ class TWebSocketServer extends TSocketServer
 		}
 		$this->_clusterSources = [];
 		if ($this->_idleTimer !== null) {
-			$reactor->cancelTimer($this->_idleTimer);
+			$reactor->cancel($this->_idleTimer);
 			$this->_idleTimer = null;
 		}
 		$this->_attached = false;
@@ -603,6 +605,11 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Runs the concurrent event loop until the server closes, pumping with {@see serveOnce()}.
+	 * While it serves, the reactor is the {@see TAsync::getLoop() TAsync loop}, so a fiber that a
+	 * handler starts with {@see TAsync::run()} resumes on the loop the server ticks; the prior TAsync
+	 * loop is restored on exit.  A handler that waits on the main fiber (an `await()` or a
+	 * {@see TAsync::sleep()} outside a fiber of its own) ticks the reactor from inside its callback, so
+	 * a handler starts its waits in a fiber instead.
 	 * @param ?int $seconds Per-pump tick timeout in seconds; null waits until activity or the nearest
 	 *   reactor timer (a handshake, close or idle deadline), blocking only when nothing is pending.
 	 * @param ?callable $afterEach Called after each pump, for a host with work to run between ticks
@@ -611,6 +618,8 @@ class TWebSocketServer extends TSocketServer
 	public function serve(?int $seconds = null, ?callable $afterEach = null): void
 	{
 		$this->attachReactor();
+		$priorLoop = TAsync::getLoop();
+		TAsync::setLoop($this->getReactor());
 		$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
 		try {
 			while ($this->isListening()) {
@@ -620,6 +629,7 @@ class TWebSocketServer extends TSocketServer
 				}
 			}
 		} finally {
+			TAsync::setLoop($priorLoop);
 			$this->_cluster?->close();
 			$this->detachReactor();
 		}
@@ -779,9 +789,7 @@ class TWebSocketServer extends TSocketServer
 		$this->_sessions[$id] = $session;
 		if ($this->_attached) {
 			$this->registerSession($transport);
-			if (isset($session['deadline'])) {
-				$this->_sessions[$id]['timer'] = $this->getReactor()->scheduleAt($session['deadline'], fn () => $this->reapStaleHandshakes());
-			}
+			$this->armSessionTimers($id);
 		}
 	}
 
@@ -821,10 +829,49 @@ class TWebSocketServer extends TSocketServer
 	{
 		foreach (['timer', 'closeTimer'] as $key) {
 			if (isset($this->_sessions[$id][$key])) {
-				$this->getReactor()->cancelTimer($this->_sessions[$id][$key]);
+				$this->getReactor()->cancel($this->_sessions[$id][$key]);
 				unset($this->_sessions[$id][$key]);
 			}
 		}
+	}
+
+	/**
+	 * Schedules the reactor timers of a session's pending deadlines that have none: the handshake
+	 * `deadline` runs {@see reapStaleHandshakes()} and the `closing` deadline runs
+	 * {@see reapClosingSessions()}.  Runs as a session is tracked, as the server attaches to a
+	 * reactor, and after each scan, so a deadline keeps a timer until it is met.
+	 * @param int $id The session (transport object) id.
+	 */
+	private function armSessionTimers(int $id): void
+	{
+		if (!$this->_attached) {
+			return;
+		}
+		$session = $this->_sessions[$id] ?? null;
+		if (isset($session['deadline']) && !isset($session['timer'])) {
+			$this->scheduleSessionTimer($id, 'timer', $session['deadline'], fn () => $this->reapStaleHandshakes());
+		}
+		if (isset($session['closing']) && !isset($session['closeTimer'])) {
+			$this->scheduleSessionTimer($id, 'closeTimer', $session['closing'], fn () => $this->reapClosingSessions());
+		}
+	}
+
+	/**
+	 * Schedules a one-shot reactor timer for a session deadline read on the server's clock.  The
+	 * reactor counts the delay on its own time base, so the timer forgets itself as it fires and the
+	 * scan it runs re-arms a deadline the server's clock has not reached yet.
+	 * @param int $id The session (transport object) id.
+	 * @param string $key The session key that holds the timer, `timer` or `closeTimer`.
+	 * @param float $when The deadline, as a {@see \Prado\Util\Clock\IClock::microtime()} timestamp.
+	 * @param callable $scan The scan the timer runs.
+	 */
+	private function scheduleSessionTimer(int $id, string $key, float $when, callable $scan): void
+	{
+		$delay = max(0.0, $when - $this->getClock()->microtime());
+		$this->_sessions[$id][$key] = $this->getReactor()->delay($delay, function () use ($id, $key, $scan): void {
+			unset($this->_sessions[$id][$key]);
+			$scan();
+		});
 	}
 
 	/**
@@ -839,11 +886,11 @@ class TWebSocketServer extends TSocketServer
 		}
 		$reactor = $this->getReactor();
 		if ($this->_idleTimer !== null) {
-			$reactor->cancelTimer($this->_idleTimer);
+			$reactor->cancel($this->_idleTimer);
 			$this->_idleTimer = null;
 		}
 		if ($this->_idleTimeout > 0) {
-			$this->_idleTimer = $reactor->every($this->_idleTimeout / 2, fn () => $this->reapIdleSessions());
+			$this->_idleTimer = $reactor->repeat($this->_idleTimeout / 2, fn () => $this->reapIdleSessions());
 		}
 	}
 
@@ -865,11 +912,13 @@ class TWebSocketServer extends TSocketServer
 	protected function reapStaleHandshakes(): void
 	{
 		$now = $this->getClock()->microtime();
-		foreach ($this->_sessions as $session) {
+		foreach ($this->_sessions as $id => $session) {
 			if (isset($session['deadline']) && $now >= $session['deadline']) {
 				$this->forgetSession($session['transport']);
 				$this->log('Handshake deadline passed; the pending connection is dropped.', TLogger::NOTICE);
 				$session['transport']->close();
+			} else {
+				$this->armSessionTimers($id);
 			}
 		}
 	}
@@ -899,12 +948,12 @@ class TWebSocketServer extends TSocketServer
 			}
 			if (!isset($session['closing'])) {
 				$this->_sessions[$id]['closing'] = $now + $this->_closeTimeout;
-				if ($this->_attached) {
-					$this->_sessions[$id]['closeTimer'] = $this->getReactor()->scheduleAt($this->_sessions[$id]['closing'], fn () => $this->reapClosingSessions());
-				}
+				$this->armSessionTimers($id);
 			} elseif ($now >= $session['closing']) {
 				$this->log('Close deadline passed; the session is ended without the peer\'s Close.', TLogger::NOTICE);
 				$this->endHttp1Session($transport, $connection);
+			} else {
+				$this->armSessionTimers($id);
 			}
 		}
 	}

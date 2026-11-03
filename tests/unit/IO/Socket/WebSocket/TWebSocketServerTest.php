@@ -3,6 +3,7 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
+use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketReactor;
@@ -48,6 +49,7 @@ class TWebSocketServerTest extends TestCase
 		foreach ($this->tempFiles as $file) {
 			@unlink($file);
 		}
+		TAsync::setLoop(null);
 	}
 
 	/**
@@ -1212,6 +1214,117 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(2, $other->getSourceCount(), 'The listener and the live session re-register with the new reactor.');
 		$client->close();
 		$server->close();
+	}
+
+	public function testADeadlineTimerThatFiresBeforeTheServerClockIsRearmed()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		$server->setClock($clock);
+		$server->setHandshakeTimeout(5);
+		$reactorClock = new TMockClock();   // the reactor counts delays on its own time base
+		$reactorClock->setMicrotime(0.0);
+		$reactor = new TSocketReactor();
+		$reactor->setClock($reactorClock);
+		$server->setReactor($reactor);
+
+		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$server->serveOnce(0, 100000);
+		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is pending.');
+
+		$reactorClock->setMicrotime(6.0);   // the timer fires, but the server's clock has not reached the deadline
+		$server->serveOnce(0, 10000);
+		self::assertSame(1, $server->getConnectionCount(), 'A deadline the server clock has not reached keeps the session.');
+
+		$clock->setMicrotime(1006.0);
+		$reactorClock->setMicrotime(12.0);   // the re-armed timer fires
+		$server->serveOnce(0, 10000);
+		self::assertSame(0, $server->getConnectionCount(), 'The re-armed deadline drops the silent peer.');
+		$silent->close();
+		$server->close();
+	}
+
+	public function testACompletedHandshakeCancelsItsDeadlineTimer()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setHandshakeTimeout(5);
+		$reactor = new TSocketReactor();
+		$server->setReactor($reactor);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		for ($i = 0; $i < 10 && $server->getConnections() === []; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		self::assertStringContainsString('101', $client->read(4096));
+		self::assertCount(3, $reactor->getIdentifiers(), 'Only the listener and the session read and write callbacks remain; the handshake timer is cancelled.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testSwappingReactorsCarriesAPendingHandshakeDeadline()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		$server->setClock($clock);
+		$server->setHandshakeTimeout(5);
+
+		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$server->serveOnce(0, 100000);
+		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is pending.');
+
+		$other = new TSocketReactor();
+		$other->setClock($clock);
+		$server->setReactor($other);
+		$server->serveOnce(0, 10000);
+		$clock->setMicrotime(1006.0);
+		$server->serveOnce(0, 10000);
+		self::assertSame(0, $server->getConnectionCount(), 'The deadline is re-armed on the new reactor and drops the silent peer.');
+		$silent->close();
+		$server->close();
+	}
+
+	public function testServeMakesTheReactorTheTAsyncLoopSoAHandlerFiberResumes()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$prior = TAsync::getLoop();
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onMessage', function ($connection) use ($server) {
+			self::assertSame($server->getReactor(), TAsync::getLoop(), 'The TAsync loop is the reactor while serving.');
+			TAsync::run(function () use ($connection) {
+				TAsync::sleep(0.05);   // suspends this fiber on the reactor the server ticks
+				$connection->send('fiber done');
+			});
+		});
+		$server->setHandler($handler);
+
+		$client = null;
+		$clientWs = null;
+		$reply = null;
+		$reactor = $server->getReactor();
+		// serve() blocks the test thread, so the client acts from timers on the server's own reactor.
+		$reactor->delay(0.05, function () use (&$client, &$clientWs, $server) {
+			$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+			$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+			$clientWs = new TWebSocketConnection($client, true);
+		});
+		$reactor->delay(0.2, function () use (&$client, &$clientWs) {
+			$client->read(4096);   // the 101
+			$clientWs->send('go');
+		});
+		$reactor->delay(0.5, function () use (&$clientWs, &$reply, $server) {
+			$reply = (string) $clientWs->receive();
+			$server->close();
+		});
+		$reactor->delay(3.0, fn () => $server->close());   // a safety net so a regression cannot hang the suite
+
+		$server->serve();
+		self::assertSame('fiber done', $reply, 'The fiber the handler started resumed and sent its reply.');
+		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored when serve() returns.');
+		$client?->close();
 	}
 
 	public function testIdleSessionIsPingedThenReapedOnAQuietServer()

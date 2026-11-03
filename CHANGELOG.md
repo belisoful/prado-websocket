@@ -10,6 +10,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - `prado-pubsub.js`, the dependency-free browser client (`TWebSocketPubSubHandler::getClientScriptPath()`): promise-based requests with timeouts, reconnection with exponential backoff and jitter, re-subscription, an offline queue, and a heartbeat that detects a stalled connection.
 - `IWebSocketClusterAware`. `TWebSocketModule` gives its cluster to a cluster-aware handler and re-raises the pub/sub request events as its own `onSubscribe`, `onPublish`, `onSend` and `onCall`.
 - Error codes: `websocket_pubsub_frame_malformed`, `websocket_pubsub_type_unknown`, `websocket_pubsub_channel_invalid`, `websocket_pubsub_field_required`, `websocket_pubsub_subscription_limit`, `websocket_pubsub_forbidden`, `websocket_pubsub_client_unknown`, `websocket_pubsub_method_unknown`, `websocket_pubsub_internal_error`.
+- Error codes: `websocket_module_event_loop_invalid`, `websocket_module_event_loop_class_invalid`.
 - Playwright specs for the browser client against the pub/sub handler (`tests/playwright/pubsub.spec.js`); `ws-server.php` serves pub/sub with `WS_PUBSUB=1`.
 - `examples/chat`: a multi-room chat on `TWebSocketPubSubHandler` and `prado-pubsub.js`, with history, whispers and reconnection. It runs as a standalone server or as a PRADO application (`websocket/serve`), and `tests/playwright/chat-example.spec.js` covers both versions.
 
@@ -19,9 +20,14 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - The development dependency on `belisoful/prado-http2` is `^1.2`, the release CI builds against.
 - Playwright is `@playwright/test` 1.62.1, as PRADO pins; 1.60.0 cannot install browsers on Ubuntu 26.04.
 - Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0.
+- Runs on PRADO's event loop API (pradosoft/prado#1377). `TSocketReactor` is now an `IEventLoop`: `TWebSocketServer` schedules its handshake and close deadlines with `delay()`, its idle scan with `repeat()`, and cancels them with `cancel()`, so timer identifiers are strings. A deadline timer that fires before the server's clock reaches the deadline re-arms itself, and a server that moves to another reactor with `setReactor()` re-arms its pending handshake and close deadlines there.
+- `TWebSocketServer::serve()` makes its reactor the `TAsync` loop while it serves and restores the prior loop on exit, so a fiber that a handler starts with `TAsync::run()` resumes. Before, such a fiber waited on the default Revolt loop, which nothing ran, and never resumed. `TWebSocketModule` gets the same behavior from `TSocketServerModule::serve()` (pradosoft/prado#1419).
+- `TWebSocketModule` serves on its `EventLoop`, the `IEventLoop` that `TSocketServerModule` now owns. The module's `EventLoopClass` defaults to `TSocketReactor`, and `setEventLoop()`/`setEventLoopClass()` accept only a `TSocketReactor`, because the server ticks its loop. `createReactor()` stays the module's seam for building the reactor.
 
 ### Upgrading
 - Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
+- Requires PRADO 4.4 master with the event loop API (pradosoft/prado#1377, #1419). Code that schedules on `TWebSocketServer::getReactor()` uses `delay()`, `repeat()` and `cancel()` in place of `after()`/`scheduleAt()`, `every()` and `cancelTimer()`. Callbacks given to `register()` are called as `(string $callbackId, IResource $source)`.
+- A `TWebSocketModule` subclass that overrides `createReactor()` keeps working. Setting the module's `EventLoopClass` or `EventLoop` to a non-reactor loop such as `TRevoltEventLoop` throws.
 
 ## [1.1.0] - 2026-09-22
 
