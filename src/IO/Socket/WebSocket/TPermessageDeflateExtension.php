@@ -36,6 +36,8 @@ use Prado\TComponent;
  * window; the receive side always inflates with the maximum window, which decodes any peer window.
  *
  * A {@see TPermessageDeflateNegotiator} configures and produces this extension during the handshake.
+ * Both need the zlib extension: without it, constructing either throws, so compression is refused
+ * when it is configured rather than failing mid-connection.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc7692.html
@@ -98,15 +100,29 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 	 * @param bool $deflateNoContextTakeover Whether to reset the send-side context after each message.
 	 * @param bool $inflateNoContextTakeover Whether to reset the receive-side context after each message.
 	 * @param int $level The DEFLATE compression level (-1 for the zlib default, 0-9 otherwise).
+	 * @throws TWebSocketException When the zlib extension is not loaded.
 	 * @throws TInvalidDataValueException When the level is not -1 or 0-9.
 	 */
 	public function __construct(int $deflateWindowBits = self::MAX_WINDOW_BITS, bool $deflateNoContextTakeover = false, bool $inflateNoContextTakeover = false, int $level = -1)
 	{
+		if (!static::isAvailable()) {
+			throw new TWebSocketException('websocket_permessage_deflate_zlib_missing');
+		}
 		$this->_deflateWindowBits = max(self::MIN_WINDOW_BITS, min(self::MAX_WINDOW_BITS, $deflateWindowBits));
 		$this->_deflateNoContextTakeover = $deflateNoContextTakeover;
 		$this->_inflateNoContextTakeover = $inflateNoContextTakeover;
 		$this->_level = self::ensureLevel($level);
 		parent::__construct();
+	}
+
+	/**
+	 * Returns whether the zlib extension, which permessage-deflate compresses with, is loaded.
+	 * @return bool Whether permessage-deflate can run.
+	 * @since 1.2.0
+	 */
+	public static function isAvailable(): bool
+	{
+		return extension_loaded('zlib');
 	}
 
 	/**
@@ -145,12 +161,15 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 	 * Compresses an outgoing message and reports that it set {@see IWebSocketExtension::RSV1}.  The
 	 * sync-flush trailer is removed; an empty message becomes a single empty block.
 	 * @param string $payload The message payload.
-	 * @throws TWebSocketException When the DEFLATE context cannot be created.
+	 * @throws TWebSocketException When the DEFLATE context cannot be created or compression fails.
 	 * @return array{0: string, 1: int} The compressed payload and the RSV1 bit.
 	 */
 	public function encodeMessage(string $payload): array
 	{
 		$out = deflate_add($this->deflateContext(), $payload, ZLIB_SYNC_FLUSH);
+		if ($out === false) {
+			throw new TWebSocketException('websocket_permessage_deflate_deflate_failed');
+		}
 		if (str_ends_with($out, self::FLUSH_TRAILER)) {
 			$out = substr($out, 0, -4);
 		}

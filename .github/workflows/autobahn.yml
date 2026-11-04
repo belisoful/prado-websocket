@@ -1,10 +1,20 @@
 name: Autobahn TestSuite
 on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  # A newer push to the same ref supersedes the run still in progress.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # The fuzzingclient image, pinned by tag and digest so a new upstream image cannot change the run.
+  AUTOBAHN_IMAGE: crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
 jobs:
   autobahn:
     name: Autobahn fuzzingclient (server compliance)
     # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 needs; 26.04 ships 1.68.0.
     runs-on: ubuntu-26.04
+    timeout-minutes: 30
 
     defaults:
       run:
@@ -34,10 +44,13 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: ctype, dom, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
+          extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
 
-      - name: Register the sibling PRADO 4.4 checkout as a Composer path repository
-        run: composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+      # The same PRADO and prado-http2 revisions the unit and Playwright jobs build against.
+      - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
+        run: |
+          composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
@@ -60,7 +73,7 @@ jobs:
           docker run --rm --network host \
             -v "$PWD/tests/autobahn:/config" \
             -v "$PWD/tests/autobahn/reports:/reports" \
-            crossbario/autobahn-testsuite \
+            "$AUTOBAHN_IMAGE" \
             wstest -m fuzzingclient -s /config/fuzzingclient.json
 
       - name: Check the Autobahn report

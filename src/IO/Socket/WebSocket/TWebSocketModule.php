@@ -95,7 +95,10 @@ class TWebSocketModule extends TSocketServerModule
 	/** The default handler class the connections dispatch through. */
 	public const DEFAULT_HANDLER_CLASS = TWebSocketHandler::class;
 
-	/** The default event loop class: the server ticks a {@see TSocketReactor}. */
+	/**
+	 * The default event loop class: the server ticks a {@see TSocketReactor}.
+	 * @since 1.2.0
+	 */
 	public const DEFAULT_EVENT_LOOP_CLASS = TSocketReactor::class;
 
 	/** @var string The handler class instantiated when no handler is set. */
@@ -279,6 +282,7 @@ class TWebSocketModule extends TSocketServerModule
 	/**
 	 * Builds the module's default event loop through {@see createReactor()}.
 	 * @return IEventLoop The loop, a {@see TSocketReactor}.
+	 * @since 1.2.0
 	 */
 	protected function createEventLoop(): IEventLoop
 	{
@@ -301,6 +305,7 @@ class TWebSocketModule extends TSocketServerModule
 	 * @param ?IEventLoop $value The reactor, or null to create the default on the next {@see getEventLoop()}.
 	 * @throws TInvalidDataTypeException When the loop is not a {@see TSocketReactor}.
 	 * @return static The current module.
+	 * @since 1.2.0
 	 */
 	public function setEventLoop(?IEventLoop $value): static
 	{
@@ -315,6 +320,7 @@ class TWebSocketModule extends TSocketServerModule
 	 * @param string $value {@see TSocketReactor} or a subclass.
 	 * @throws TConfigurationException When the class is not a {@see TSocketReactor}.
 	 * @return static The current module.
+	 * @since 1.2.0
 	 */
 	public function setEventLoopClass($value): static
 	{

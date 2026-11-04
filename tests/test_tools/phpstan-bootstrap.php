@@ -1,10 +1,10 @@
 <?php
 
 /**
- * A few common settings for all unit tests.
+ * PHPStan bootstrap for the PRADO WebSockets extension.
  *
- * Also remember do define the @package attribute for your test class to make it appear under
- * the right package in unit test and code coverage reports.
+ * Loads Composer's autoloader, so the analysis resolves the framework, the HTTP/2 extension, and
+ * PRADO's PHPStan extensions that `phpstan.neon.dist` registers as services.
  */
 
 require_once(__DIR__ . '/../../vendor/autoload.php');

@@ -238,11 +238,13 @@ class TWebSocketFrameCodec
 	 */
 	private static function extendedLength(int $marker, string $bytes): int
 	{
+		$length = 0;
+		for ($i = 0, $count = strlen($bytes); $i < $count; $i++) {
+			$length = ($length << 8) | ord($bytes[$i]);   // network order; a set top bit of 8 bytes yields a negative int
+		}
 		if ($marker === self::LENGTH_16) {
-			$length = unpack('n', $bytes)[1];
 			$minimum = self::LENGTH_16;
 		} else {
-			$length = unpack('J', $bytes)[1];
 			if ($length < 0) {
 				throw new TWebSocketException('websocket_frame_length_invalid');
 			}

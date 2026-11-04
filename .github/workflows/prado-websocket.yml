@@ -1,11 +1,17 @@
 name: PRADO WebSocket Extension
 on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  # A newer push to the same ref supersedes the run still in progress.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 env:
   # The PHP version used for the browser (Playwright) tests
   PHP_VERSION: '8.4'
 jobs:
   composerext:
-    name: WebSocket (PHP ${{ matrix.php-versions }})
+    name: WebSocket (PHP ${{ matrix.php-versions }}, prado-http2 ${{ matrix.http2 }})
     # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 needs; 26.04 ships 1.68.0.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -14,6 +20,12 @@ jobs:
       fail-fast: false
       matrix:
         php-versions: ['8.2', '8.3', '8.4', '8.5']
+        # 'main' builds against the prado-http2 development HEAD; 'release' installs the Packagist
+        # release that the `^1.3` constraint resolves to, which is what users install.
+        http2: ['main']
+        include:
+          - php-versions: '8.4'
+            http2: 'release'
 
     defaults:
       run:
@@ -33,6 +45,7 @@ jobs:
           path: prado
 
       - name: Checkout Belisoful HTTP/2 extension
+        if: matrix.http2 == 'main'
         uses: actions/checkout@v7
         with:
           repository: belisoful/prado-http2
@@ -48,16 +61,10 @@ jobs:
         with:
           php-version: ${{ matrix.php-versions }}
           extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
-          tools: php-cs-fixer, phpstan, cs2pr
+          tools: cs2pr
 
-      - name: Validate composer.json and composer.lock
-        run: composer validate --strict
-
-      - name: Validate code syntax using php-cs-fixer (src)
-        run: php-cs-fixer check src -vvv --using-cache=no --format=checkstyle | cs2pr
-
-      - name: Validate code syntax using php-cs-fixer (tests)
-        run: php-cs-fixer check tests -vvv --using-cache=no --format=checkstyle | cs2pr
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
 
       - name: Get composer cache directory
         id: composer-cache
@@ -67,19 +74,31 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-php${{ matrix.php-versions }}-composer-${{ hashFiles('**/composer.json') }}
-          restore-keys: ${{ runner.os }}-php${{ matrix.php-versions }}-composer-
+          key: ${{ runner.os }}-php${{ matrix.php-versions }}-http2-${{ matrix.http2 }}-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: ${{ runner.os }}-php${{ matrix.php-versions }}-http2-${{ matrix.http2 }}-composer-
 
-      - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
-        run: |
-          composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
-          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
+      - name: Register the sibling PRADO 4.4 checkout as a Composer path repository
+        run: composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
+
+      - name: Register the sibling HTTP/2 checkout as a Composer path repository
+        if: matrix.http2 == 'main'
+        run: composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
 
+      - name: Report the installed prado-http2
+        run: composer show belisoful/prado-http2
+
+      # The pinned php-cs-fixer and phpstan from composer.json, so CI and `composer fix`/`composer stan` agree.
+      - name: Validate code syntax using php-cs-fixer (src)
+        run: vendor/bin/php-cs-fixer check src -vvv --using-cache=no --format=checkstyle | cs2pr
+
+      - name: Validate code syntax using php-cs-fixer (tests)
+        run: vendor/bin/php-cs-fixer check tests -vvv --using-cache=no --format=checkstyle | cs2pr
+
       - name: Validate code using phpstan
-        run: phpstan analyse --error-format=checkstyle | cs2pr
+        run: vendor/bin/phpstan analyse --memory-limit=1G --error-format=checkstyle | cs2pr
 
       - name: Run Unit Tests
         run: composer unittest

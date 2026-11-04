@@ -1,0 +1,12 @@
+# Development-only files stay out of the Composer dist (git archive).
+# The dist keeps src/, config/, examples/, agents/, and the top-level docs.
+/.gitattributes        export-ignore
+/.github               export-ignore
+/.gitignore            export-ignore
+/.nvmrc                export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/package.json          export-ignore
+/phpstan.neon.dist     export-ignore
+/phpunit.xml           export-ignore
+/playwright.config.js  export-ignore
+/tests                 export-ignore

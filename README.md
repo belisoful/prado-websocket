@@ -14,14 +14,14 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5 |
+| PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5. PHP 8.2 is the minimum from 1.2.0 (unreleased); the released v1.1.0 runs on PHP 8.1 – 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
 | `belisoful/prado-http2` `^1.3` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2`. `prado-http2` needs 1.60.0 or later: Ubuntu 26.04 ships 1.68.0, Ubuntu 24.04 only 1.59.0 |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
 | `ext-sockets` | suggested | Faster socket primitives for the standalone server |
-| `ext-zlib` | suggested | RFC 7692 permessage-deflate message compression |
+| `ext-zlib` | suggested | RFC 7692 permessage-deflate message compression; without it, constructing `TPermessageDeflateNegotiator` throws |
 | `ext-redis` | suggested | The Redis-backed cluster backplane (`TRedisBackplane`) for multi-host scaling |
 
 HTTP/2 is **opt-in**. Add it with:
@@ -41,6 +41,8 @@ composer require belisoful/prado-websocket
 PRADO 4.4 is not yet released, so the extension depends on its development branch (`^4.4@dev`). Composer applies stability flags only from the root project, so allow it there, for example with `"minimum-stability": "dev"` and `"prefer-stable": true`, or by requiring `pradosoft/prado:^4.4@dev` yourself.
 
 Release notes and upgrade steps between versions are in [CHANGELOG.md](CHANGELOG.md).
+
+This README documents the development branch. Features marked **1.2.0 (unreleased)**, browser pub/sub among them, are not in the v1.1.0 release on Packagist.
 
 ## What it provides
 
@@ -70,10 +72,10 @@ Release notes and upgrade steps between versions are in [CHANGELOG.md](CHANGELOG
 | `TFileBackplane` | Shared-directory backplane for one host or a shared filesystem (dev/small clusters); owner-only spool |
 | `TRedisBackplane` | Redis pub/sub + presence backplane for multi-host scaling (needs `ext-redis`) |
 | `TMeshBackplane` | Peer-to-peer gossip backplane over server-to-server WebSocket links; shared-secret authenticated |
-| `IWebSocketClusterAware` | A handler the module hands its cluster to |
-| `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster |
-| `TWebSocketPubSubEventParameter` / `TWebSocketPubSubException` | The pub/sub request event parameter, and the rejection carrying the reply code |
-| `prado-pubsub.js` | The dependency-free browser client of `prado.pubsub.v1` |
+| `IWebSocketClusterAware` | A handler the module hands its cluster to. **1.2.0 (unreleased)** |
+| `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster. **1.2.0 (unreleased)** |
+| `TWebSocketPubSubEventParameter` / `TWebSocketPubSubException` | The pub/sub request event parameter, and the rejection carrying the reply code. **1.2.0 (unreleased)** |
+| `prado-pubsub.js` | The dependency-free browser client of `prado.pubsub.v1`. **1.2.0 (unreleased)** |
 
 ## Architecture
 
@@ -190,7 +192,11 @@ use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 
 $bytes = TWebSocketFrameCodec::encode(TWebSocketFrame::text('hi'));   // server frame (unmasked)
-$frame = TWebSocketFrameCodec::tryDecode($buffer);                    // null until a whole frame
+$decoded = TWebSocketFrameCodec::tryDecode($buffer);                  // null until a whole frame
+if ($decoded !== null) {
+    $frame = $decoded['frame'];                                        // the TWebSocketFrame
+    $buffer = substr($buffer, $decoded['length']);                     // drop the bytes it used
+}
 ```
 
 ### Subprotocols and extensions
@@ -212,7 +218,7 @@ Negotiation runs on every accept path: the `serveOnce()` loop, the synchronous `
 
 ## Compression (RFC 7692 permessage-deflate)
 
-`TPermessageDeflateExtension` compresses message payloads with DEFLATE when both peers negotiate it; it is transparent to `onMessage`/`receive()`. Enable it by offering `TPermessageDeflateNegotiator` (above); the negotiator's constructor tunes the context-takeover and window-bits parameters, and inflation is **bounded**: each inflate step is sized against the remaining output budget, so a compression-bomb frame cannot materialize more than about 1 KiB beyond `MaxMessageSize`. A truncated compressed message closes with 1007. Offers and responses are checked per RFC 7692 §7.1: a malformed or duplicated parameter declines the offer (falling through to the client's next one), and a client is bound by the parameters it offered even when the server omits them. It needs `ext-zlib`.
+`TPermessageDeflateExtension` compresses message payloads with DEFLATE when both peers negotiate it; it is transparent to `onMessage`/`receive()`. Enable it by offering `TPermessageDeflateNegotiator` (above); the negotiator's constructor tunes the context-takeover and window-bits parameters, and inflation is **bounded**: each inflate step is sized against the remaining output budget, so a compression-bomb frame cannot materialize more than about 1 KiB beyond `MaxMessageSize`. A truncated compressed message closes with 1007. Offers and responses are checked per RFC 7692 §7.1: a malformed or duplicated parameter declines the offer (falling through to the client's next one), and a client is bound by the parameters it offered even when the server omits them. It needs `ext-zlib`: without it, constructing the negotiator or the extension throws `websocket_permessage_deflate_zlib_missing`, so compression fails at configuration rather than mid-connection; `TPermessageDeflateNegotiator::isAvailable()` checks first.
 
 ## Hardening and limits
 
@@ -254,6 +260,8 @@ Backplane choices:
 - **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. The dialer answers first and the accepting node answers only a verified peer, so a replayed handshake cannot turn one node into a signing oracle for another. Only an address this node dials (a seed, or one a verified peer announced) obtains its answer, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL.
 
 ## Pub/sub for browsers (`prado.pubsub.v1`)
+
+**1.2.0 (unreleased).** Pub/sub is on the development branch; the v1.1.0 release does not include it.
 
 A browser needs no library to open a WebSocket, but the cluster's `subscribe()`/`publish()` are server-side calls. `TWebSocketPubSubHandler` defines a small JSON subprotocol over them, and `prado-pubsub.js` is its browser client.
 
@@ -324,13 +332,13 @@ The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazil
 composer install
 composer unittest        # phpunit --testsuite unit
 composer fix             # php-cs-fixer on src/ and tests/
-composer stan            # phpstan (level 3, PHP 8.2 – 8.5)
+composer stan            # phpstan (level 4, PHP 8.2 – 8.5)
 composer fulltest        # fix, stan, unittest in order
 composer coverage        # unit tests with a text coverage summary (needs Xdebug)
 composer coverage-html   # HTML coverage report in build/coverage
 ```
 
-Unit tests live under `tests/unit/` in the `Prado\Test\Unit\` namespace (Composer `autoload-dev`), mirroring the directory. CI runs the suite against the PRADO 4.4 development branch and the `prado-http2` main branch on PHP 8.2, 8.3, 8.4, and 8.5; the Autobahn|TestSuite server-compliance run and the three Playwright browser jobs run on PHP 8.4.
+Unit tests live under `tests/unit/` in the `Prado\Test\Unit\` namespace (Composer `autoload-dev`), mirroring the directory. CI runs the suite against the PRADO 4.4 development branch and the `prado-http2` main branch on PHP 8.2, 8.3, 8.4, and 8.5, and once more on PHP 8.4 with the Packagist `prado-http2` release; the Autobahn|TestSuite server-compliance run and the three Playwright browser jobs run on PHP 8.4.
 
 Tests cover the codec (round-trips, masking, fragmentation, control-frame rules), the handshake (RFC 6455 accept-key vector), the connection (blocking and `feed()` paths over socket pairs), the server (HTTP/1.1 over a real socket and HTTP/2 auto-selection), and the RFC 8441 round-trip end to end. HTTP/2 tests skip cleanly where `libnghttp2` is absent.
 

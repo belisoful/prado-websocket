@@ -170,14 +170,18 @@ class TWebSocketModuleTest extends TestCase
 			$clientWs = new TWebSocketConnection($client, true);
 		}];
 		$module->timers[] = [0.25, function () use (&$client, &$clientWs) {
-			$client->read(4096);   // the 101
+			$client->setBlocking(false);   // a blocking read here would stall the loop that writes the 101
+			$client->read(4096);   // the 101, when it has arrived; a frame behind the request is delivered either way
 			$clientWs->send('hello module');
 		}];
-		$module->timers[] = [3.0, fn () => $module->stop()];   // a safety net so a regression cannot hang the suite
+		$safetyNet = false;
+		$module->timers[] = [5.0, function () use ($module, &$safetyNet) {   // a safety net so a regression cannot hang the suite
+			$safetyNet = true;
+			$module->stop();
+		}];
 
-		$start = microtime(true);
 		self::assertTrue($module->serve(), 'serve() ran and returned when stopped.');
-		self::assertLessThan(3.0, microtime(true) - $start, 'The loop stopped on the message, not on the safety net.');
+		self::assertFalse($safetyNet, 'The loop stopped on the message, not on the safety net.');
 		self::assertSame(1, $opened, 'The handler onOpen was re-raised as the module onOpen.');
 		self::assertSame(['hello module'], $messages, 'The handler onMessage was re-raised with the TWebSocketMessage.');
 		self::assertNull($module->getServer(), 'The server is released after serving.');
@@ -220,10 +224,8 @@ class TWebSocketModuleTest extends TestCase
 			$served = $module->getServer();
 			$module->stop();
 		});
-		$start = microtime(true);
 		self::assertTrue($module->serve());
-		self::assertLessThan(3.0, microtime(true) - $start, 'The supplied reactor ran the timer that stopped the loop.');
-		self::assertInstanceOf(TWebSocketServer::class, $served);
+		self::assertInstanceOf(TWebSocketServer::class, $served, 'The supplied reactor ran the timer that stopped the loop.');
 		self::assertSame([], $reactor->getIdentifiers(), 'The server releases the reactor when it stops.');
 	}
 
@@ -240,24 +242,44 @@ class TWebSocketModuleTest extends TestCase
 		});
 
 		$client = null;
-		$clientWs = null;
 		$reply = null;
-		$module->timers[] = [0.05, function () use (&$client, &$clientWs, $module) {
-			$client = TSocketStream::connect('tcp://127.0.0.1:' . $module->getServer()->getPort(), 1.0);
+		// The client never blocks: a blocking read would stall the very loop that has to answer it.
+		$module->timers[] = [0.05, function () use (&$client, &$reply, $module) {
+			$server = $module->getServer();
+			$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 			$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+			$client->setBlocking(false);
 			$clientWs = new TWebSocketConnection($client, true);
+			$buffer = '';
+			$upgraded = false;
+			$poll = function () use (&$poll, &$buffer, &$upgraded, &$reply, $client, $clientWs, $module, $server) {
+				$buffer .= $client->read(65536);
+				if (!$upgraded && ($end = strpos($buffer, "\r\n\r\n")) !== false) {
+					$upgraded = true;
+					$buffer = substr($buffer, $end + 4);   // past the 101
+					$clientWs->send('go');
+				}
+				if ($upgraded && $buffer !== '') {
+					$messages = $clientWs->feed($buffer);
+					$buffer = '';
+					if ($messages !== []) {
+						$reply = $messages[0];
+						$module->stop();
+						return;
+					}
+				}
+				$server->getReactor()->delay(0.02, $poll);
+			};
+			$poll();
 		}];
-		$module->timers[] = [0.2, function () use (&$client, &$clientWs) {
-			$client->read(4096);   // the 101
-			$clientWs->send('go');
-		}];
-		$module->timers[] = [0.5, function () use (&$clientWs, &$reply, $module) {
-			$reply = (string) $clientWs->receive();
+		$safetyNet = false;
+		$module->timers[] = [5.0, function () use ($module, &$safetyNet) {   // a safety net so a regression cannot hang the suite
+			$safetyNet = true;
 			$module->stop();
 		}];
-		$module->timers[] = [3.0, fn () => $module->stop()];   // a safety net so a regression cannot hang the suite
 
 		self::assertTrue($module->serve());
+		self::assertFalse($safetyNet, 'The reply ended the loop, not the safety net.');
 		self::assertSame('fiber done', $reply, 'The fiber the handler started resumed on the served reactor.');
 		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored when serve() returns.');
 		$client?->close();

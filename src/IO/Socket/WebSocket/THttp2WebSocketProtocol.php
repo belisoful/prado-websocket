@@ -417,10 +417,10 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	{
 		$this->_onStream = $onStream;
 		$connection->write($this->send());                  // initial SETTINGS
-		while ($connection->isOpen() && !$connection->eof()) {
+		while ($connection->isOpen()) {
 			$bytes = $connection->read(self::READ_CHUNK);
 			if ($bytes === '' && $connection->eof()) {
-				break;
+				break;   // the read reached end of stream
 			}
 			if ($bytes !== '') {
 				$this->receive($bytes);

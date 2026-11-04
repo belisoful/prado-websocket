@@ -4,6 +4,8 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TIOException;
+use Prado\IO\Socket\WebSocket\TPermessageDeflateExtension;
+use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\TStream;
@@ -117,8 +119,177 @@ class ClockedDribblingStream extends DribblingStream
 	}
 }
 
+/** A peer that answers the request written to it with the response a closure builds, read back one byte per read. */
+class RespondingStream extends DribblingStream
+{
+	/** @var string The response bytes not yet read. */
+	private string $_pending = '';
+
+	/** @param \Closure(string): string $respond Builds the response head from the request written. */
+	public function __construct(private \Closure $respond)
+	{
+		parent::__construct(0);
+	}
+
+	public function write(string $string): int
+	{
+		parent::write($string);
+		$this->_pending .= ($this->respond)($string);
+		return strlen($string);
+	}
+
+	public function eof(): bool
+	{
+		return $this->_pending === '';
+	}
+
+	public function read(int $length): string
+	{
+		$this->reads++;
+		$bytes = substr($this->_pending, 0, $length);
+		$this->_pending = substr($this->_pending, strlen($bytes));
+		return $bytes;
+	}
+}
+
 class TWebSocketHandshakeTest extends TestCase
 {
+	/**
+	 * Builds a peer that runs the server side of the handshake on the request the client writes.
+	 * @param array $options The {@see TWebSocketHandshake::acceptConnection()} options.
+	 * @return RespondingStream The client's transport.
+	 */
+	private static function acceptingServer(array $options = []): RespondingStream
+	{
+		return new RespondingStream(function (string $request) use ($options): string {
+			$stream = TStream::fromString($request);
+			TWebSocketHandshake::acceptConnection($stream, $options);
+			$stream->seek(strlen($request));
+			return $stream->getContents();
+		});
+	}
+
+	/**
+	 * Builds a peer that answers with a 101 accepting the client's key, plus the given headers.
+	 * @param array<string, string> $headers The extra response headers.
+	 * @return RespondingStream The client's transport.
+	 */
+	private static function upgradingServer(array $headers): RespondingStream
+	{
+		return new RespondingStream(function (string $request) use ($headers): string {
+			$key = TWebSocketHandshake::parseHttpMessage($request)['headers']['sec-websocket-key'];
+			return TWebSocketHandshake::buildServerResponse($key, $headers);
+		});
+	}
+
+	public function testOpenConnectionCompletesAgainstAnAcceptingServer()
+	{
+		$stream = self::acceptingServer(['subprotocols' => ['chat'], 'extensions' => [new TPermessageDeflateNegotiator()]]);
+		$result = TWebSocketHandshake::openConnection($stream, 'example.com', '/chat', [
+			'subprotocols' => ['graphql-ws', 'chat'],
+			'extensions' => [new TPermessageDeflateNegotiator()],
+			'headers' => ['Origin' => 'https://example.com'],
+		]);
+		self::assertSame(101, $result['statusCode']);
+		self::assertSame('chat', $result['subprotocol'], 'The subprotocol the server selected from the offer is returned.');
+		self::assertCount(1, $result['extensions'], 'The extension the server accepted is resolved.');
+		self::assertInstanceOf(TPermessageDeflateExtension::class, $result['extensions'][0]);
+		self::assertStringStartsWith('GET /chat HTTP/1.1', $stream->written);
+		self::assertStringContainsString('Sec-WebSocket-Protocol: graphql-ws, chat', $stream->written);
+		self::assertStringContainsString('Sec-WebSocket-Extensions: permessage-deflate', $stream->written);
+		self::assertStringContainsString('Origin: https://example.com', $stream->written, 'Extra request headers are sent.');
+	}
+
+	public function testOpenConnectionWithoutOffersSelectsNothing()
+	{
+		$stream = self::acceptingServer(['subprotocols' => ['chat'], 'extensions' => [new TPermessageDeflateNegotiator()]]);
+		$result = TWebSocketHandshake::openConnection($stream, 'example.com');
+		self::assertNull($result['subprotocol']);
+		self::assertSame([], $result['extensions']);
+		self::assertStringNotContainsString('Sec-WebSocket-Protocol', $stream->written, 'No subprotocol is offered.');
+		self::assertStringNotContainsString('Sec-WebSocket-Extensions', $stream->written, 'No extension is offered.');
+	}
+
+	public function testOpenConnectionAcceptsAnEmptySelectedSubprotocol()
+	{
+		$result = TWebSocketHandshake::openConnection(self::upgradingServer(['Sec-WebSocket-Protocol' => '']), 'example.com');
+		self::assertSame('', $result['subprotocol'], 'An empty selection is not a subprotocol the client failed to offer.');
+	}
+
+	public function testOpenConnectionFailsOnASubprotocolNotOffered()
+	{
+		try {
+			TWebSocketHandshake::openConnection(self::upgradingServer(['Sec-WebSocket-Protocol' => 'other']), 'example.com', '/', ['subprotocols' => ['chat']]);
+			self::fail('A subprotocol the client did not offer fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_subprotocol_not_offered', $e->getErrorCode());
+		}
+	}
+
+	public function testOpenConnectionFailsOnARejection()
+	{
+		$stream = new RespondingStream(fn () => TWebSocketHandshake::buildRejection(403));
+		try {
+			TWebSocketHandshake::openConnection($stream, 'example.com');
+			self::fail('A refused upgrade fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_rejected', $e->getErrorCode());
+			self::assertStringContainsString('403', $e->getMessage());
+		}
+	}
+
+	public function testOpenConnectionFailsOnAWrongAcceptKey()
+	{
+		$stream = new RespondingStream(fn () => TWebSocketHandshake::buildServerResponse(TWebSocketHandshake::generateKey()));
+		try {
+			TWebSocketHandshake::openConnection($stream, 'example.com');
+			self::fail('A 101 that does not answer the client key fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_rejected', $e->getErrorCode());
+		}
+	}
+
+	public function testReceiveRequestReturnsTheRequestWithoutResponding()
+	{
+		$request = "GET /chat HTTP/1.1\r\nHost: ex\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " . self::SAMPLE_KEY . "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+		$stream = TStream::fromString($request);
+		$parsed = TWebSocketHandshake::receiveRequest($stream);
+		self::assertSame('GET', $parsed['method']);
+		self::assertSame('/chat', $parsed['target']);
+		self::assertSame(self::SAMPLE_KEY, $parsed['headers']['sec-websocket-key']);
+		$stream->seek(strlen($request));
+		self::assertSame('', $stream->getContents(), 'Nothing is written; the caller completes or refuses the handshake.');
+		$stream->close();
+	}
+
+	public function testReceiveRequestRefusesANonUpgrade()
+	{
+		$stream = TStream::fromString("GET / HTTP/1.1\r\nHost: ex\r\n\r\n");
+		try {
+			TWebSocketHandshake::receiveRequest($stream);
+			self::fail('A request that is not an upgrade is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_not_upgrade', $e->getErrorCode());
+		}
+		$stream->seek(0, SEEK_END);
+		self::assertSame(strlen("GET / HTTP/1.1\r\nHost: ex\r\n\r\n"), $stream->tell(), 'No rejection is written; the caller chooses it.');
+		$stream->close();
+	}
+
+	public function testReceiveRequestMeasuresItsDeadlineOnTheGivenClock()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		$stream = new ClockedDribblingStream($clock, 0.01);
+		try {
+			TWebSocketHandshake::receiveRequest($stream, 0.03, $clock);
+			self::fail('A request head not complete by the deadline fails.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode());
+		}
+		self::assertSame(3, $stream->reads, 'The deadline on the given clock stops the read.');
+	}
+
 	public function testReadHandshakeMeasuresItsDeadlineOnTheGivenClock()
 	{
 		$clock = new TMockClock();

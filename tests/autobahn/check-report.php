@@ -6,15 +6,17 @@
  * Reads the report's `index.json` and exits non-zero when any case ends in a failing behavior,
  * either for the message exchange (`behavior`) or the close handshake (`behaviorClose`).  `OK`,
  * `NON-STRICT`, `INFORMATIONAL`, and `UNIMPLEMENTED` pass; `FAILED`, `WRONG CODE`, `UNCLEAN`, and
- * `FAILED BY CLIENT` fail.
+ * `FAILED BY CLIENT` fail.  A report with fewer cases than the minimum fails too, so a run that
+ * stopped early or reached a dead server cannot pass; the full fuzzingclient suite runs over 500.
  *
- * Usage: php tests/autobahn/check-report.php <path-to-index.json>
+ * Usage: php tests/autobahn/check-report.php <path-to-index.json> [minimum-cases]
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @link https://github.com/belisoful/prado-websocket
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 $path = $argv[1] ?? '';
+$minimum = (int) ($argv[2] ?? 500);
 if ($path === '' || !is_file($path)) {
 	fwrite(STDERR, "Autobahn report not found: '{$path}'.\n");
 	exit(2);
@@ -41,8 +43,8 @@ foreach ($report as $agent => $cases) {
 }
 
 printf("Autobahn: %d cases checked, %d failing.\n", $total, count($failures));
-if ($total === 0) {
-	fwrite(STDERR, "No cases were run; the echo server may not have been reachable.\n");
+if ($total < $minimum) {
+	fwrite(STDERR, "Only {$total} cases were run, fewer than the {$minimum} required; the run stopped early or the echo server was not reachable.\n");
 	exit(2);
 }
 if ($failures !== []) {

@@ -176,10 +176,10 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
-	 * Builds a connection from a handshake result, applying the negotiated subprotocol.
+	 * Builds a connection from a handshake result, applying the negotiated subprotocol and extensions.
 	 * @param StreamInterface $stream The transport stream.
 	 * @param bool $isClient Whether this is the client side.
-	 * @param array{subprotocol?: ?string} $result The handshake result.
+	 * @param array{subprotocol?: ?string, extensions?: IWebSocketExtension[]} $result The handshake result.
 	 * @return self The configured connection.
 	 */
 	private static function wrapNegotiated(StreamInterface $stream, bool $isClient, array $result): self
@@ -443,7 +443,7 @@ class TWebSocketConnection extends TComponent
 				if ($this->receiveFrame() !== null) {
 					continue;   // receiveFrame() handles the peer's Close inline, marking the connection closed
 				}
-				if ($this->_closed || !$this->awaitReadable($deadline)) {
+				if ($this->getIsClosed() || !$this->awaitReadable($deadline)) {
 					break;
 				}
 			}
@@ -639,13 +639,16 @@ class TWebSocketConnection extends TComponent
 			if ($available < 4) {
 				return null;
 			}
-			$length = unpack('n', $buffer, $offset + 2)[1];
+			$length = (ord($buffer[$offset + 2]) << 8) | ord($buffer[$offset + 3]);
 			$header += 2;
 		} elseif ($length === 127) {
 			if ($available < 10) {
 				return null;
 			}
-			$length = unpack('J', $buffer, $offset + 2)[1];
+			$length = 0;
+			for ($i = $offset + 2; $i < $offset + 10; $i++) {
+				$length = ($length << 8) | ord($buffer[$i]);   // network order; a set top bit yields a negative int
+			}
 			if ($length < 0 || $length > PHP_INT_MAX - $header) {
 				return null;
 			}

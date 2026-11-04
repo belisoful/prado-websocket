@@ -208,10 +208,13 @@ class TMeshBackplaneTest extends TestCase
 		$mesh = new TMeshBackplane();
 		$mesh->setSecret('shh');
 		new TWebSocketCluster('n', $mesh);
-		$mesh->connectPeer('tcp://127.0.0.1:59991');
-		$mesh->connectPeer('tcp://127.0.0.1:59991');   // the same peer is already being dialed
+		$listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);   // an OS-chosen port; never accepted, so the dial stays in flight
+		$peer = 'tcp://127.0.0.1:' . $listener->getLocalAddress()->getPort();
+		$mesh->connectPeer($peer);
+		$mesh->connectPeer($peer);   // the same peer is already being dialed
 		self::assertSame(1, $mesh->getPendingCount(), 'A second dial to a peer already in flight is skipped.');
 		$mesh->close();
+		$listener->close();
 	}
 
 	public function testDeadPeerIsPruned()
