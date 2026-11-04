@@ -400,19 +400,25 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 					unset($this->_presence[$clientId]);
 				}
 				break;
+			case TWebSocketEnvelope::NODE_DOWN:
+				$node = (string) ($envelope->getMeta()['node'] ?? $envelope->getOriginNode());
+				if ($node !== '' && $node !== $this->_nodeId) {
+					$this->dropNodePresence($node);   // a peer reaped the node, or the node is replacing its own presence
+				}
+				break;
 		}
 	}
 
 	/**
 	 * Drops the presence mirror entries whose node matches a dead node, called by a backplane's
-	 * failure detector so a crashed node's clients stop being advertised.  Local clients never match,
-	 * since their node is this node, which the detector never targets.
+	 * failure detector, or on a {@see TWebSocketEnvelope::NODE_DOWN}, so a crashed node's clients stop
+	 * being advertised.  A local client is never dropped.
 	 * @param string $node The dead node id.
 	 */
 	public function dropNodePresence(string $node): void
 	{
 		foreach ($this->_presence as $clientId => $meta) {
-			if (($meta['node'] ?? null) === $node) {
+			if (($meta['node'] ?? null) === $node && !isset($this->_clients[$clientId])) {
 				unset($this->_presence[$clientId]);
 			}
 		}

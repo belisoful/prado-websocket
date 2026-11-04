@@ -3,7 +3,9 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 
 use PHPUnit\Framework\TestCase;
+use Prado\IO\IResource;
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBufferedBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
@@ -11,6 +13,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
+use Prado\IO\Stream\TBufferStream;
 use Prado\Prado;
 use Prado\Util\Log\TLogger;
 
@@ -37,8 +40,96 @@ class FailingDropBackplane extends TNullBackplane
 	}
 }
 
+/** A backplane whose one source holds queued output until the server reports it writable. */
+class QueuedOutputBackplane extends TNullBackplane implements IWebSocketBufferedBackplane
+{
+	public bool $pending = true;
+	/** @var IResource[] The sources the server asked to flush. */
+	public array $flushed = [];
+
+	public function __construct(public TSocketStream $source)
+	{
+		parent::__construct();
+	}
+
+	public function getSources(): array
+	{
+		return [$this->source];
+	}
+
+	public function getWriteSources(): array
+	{
+		return $this->pending ? [$this->source] : [];
+	}
+
+	public function flushSource(IResource $source): void
+	{
+		$this->flushed[] = $source;
+		$this->pending = false;
+	}
+}
+
 class TWebSocketServerClusterTest extends TestCase
 {
+	public function testAClusterSourceWithQueuedOutputWakesTheLoopAndIsFlushed()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		[$local, $remote] = TSocketStream::pair();
+		$local->setBlocking(false);
+		$backplane = new QueuedOutputBackplane($local);
+		$server->setCluster(new TWebSocketCluster('s1', $backplane));
+		$server->setHandler(new TWebSocketHandler());
+
+		$server->serveOnce(0);   // registers the cluster source and arms it for writability
+		self::assertSame([], $backplane->flushed, 'Nothing is flushed before the loop sees the source writable.');
+
+		$started = microtime(true);
+		$server->serveOnce(1);   // the armed, writable source wakes the loop at once
+		self::assertLessThan(0.5, microtime(true) - $started, 'A cluster source with queued output does not wait out the tick timeout.');
+		self::assertSame([$local], $backplane->flushed, 'The writable source is flushed through the backplane.');
+
+		$server->serveOnce(0, 20000);
+		self::assertCount(1, $backplane->flushed, 'A drained source is disarmed and not flushed again.');
+
+		$remote->close();
+		$local->close();
+		$server->close();
+	}
+
+	public function testALargeMeshMessageDrainsThroughTheServeLoop()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$serverMesh = new TMeshBackplane();
+		$serverMesh->setSecret('shh');
+		$serverCluster = new TWebSocketCluster('srv', $serverMesh);
+		$server->setCluster($serverCluster);
+		$server->setHandler(new TWebSocketHandler());
+
+		$dialer = new TMeshBackplane();
+		$dialer->setSecret('shh');
+		$dialerCluster = new TWebSocketCluster('dialer', $dialer);
+		$sink = new TBufferStream();
+		$dialerCluster->register(new TWebSocketConnection($sink, false));
+		$dialer->connectPeer('tcp://127.0.0.1:' . $server->getPort());
+		for ($i = 0; $i < 40; $i++) {
+			$server->serveOnce(0, 5000);   // accept, handshake, and the mutual challenge
+			$dialer->tick();
+		}
+		self::assertSame(1, $serverMesh->getPeerCount(), 'The dialer is linked.');
+
+		$serverCluster->broadcast(str_repeat('x', 8 * 1024 * 1024));   // larger than the socket buffers
+		self::assertNotSame([], $serverMesh->getWriteSources(), 'The kernel does not take the message at once.');
+		for ($i = 0; $i < 20000 && $sink->getSize() === 0; $i++) {
+			$server->serveOnce(0);   // no further cluster traffic: only the loop drains the link
+			$dialer->tick();
+		}
+		self::assertGreaterThan(8 * 1024 * 1024, $sink->getSize(), 'The whole message reaches the remote client.');
+		self::assertSame([], $serverMesh->getWriteSources(), 'Nothing stays queued on the link.');
+
+		$dialer->close();
+		$server->close();
+	}
+
 	public function testAThrowingBackplaneUnregisterDoesNotEscapeServeOnce()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');

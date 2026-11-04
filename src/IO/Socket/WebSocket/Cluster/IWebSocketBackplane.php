@@ -21,7 +21,8 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
  * Loop integration: {@see getSources()} returns any selectable resources to fold into the server's
  * event loop, and {@see tick()} is pumped once per loop iteration to read inbound traffic and run
  * housekeeping (heartbeats, registry expiry).  A driver that has no selectable resource returns an
- * empty array and does its work in {@see tick()}.
+ * empty array and does its work in {@see tick()}.  A driver whose sources queue output implements
+ * {@see IWebSocketBufferedBackplane}, so the server drains them on writability.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */

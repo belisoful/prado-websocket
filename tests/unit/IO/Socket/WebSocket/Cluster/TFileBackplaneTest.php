@@ -52,6 +52,134 @@ class TFileBackplaneTest extends TestCase
 		return [new TWebSocketConnection($stream, false), $stream];
 	}
 
+	/** Opens a node on the shared directory whose backplane reads the given clock. */
+	private function makeClockedNode(string $nodeId, TMockClock $clock): TWebSocketCluster
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		$backplane->setClock($clock);
+		$cluster = new TWebSocketCluster($nodeId, $backplane);
+		$cluster->open();
+		return $cluster;
+	}
+
+	private function presenceFile(string $clientId): string
+	{
+		return $this->dir . DIRECTORY_SEPARATOR . 'presence' . DIRECTORY_SEPARATOR . rawurlencode($clientId);
+	}
+
+	public function testEveryNodeForgetsAClientWhoseNodeCrashed()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$a = $this->makeClockedNode('A', $clock);
+		$b = $this->makeClockedNode('B', $clock);
+		$c = $this->makeClockedNode('C', $clock);
+		[$connection] = $this->makeConnection();
+		$clientId = $c->register($connection);
+		$a->tick();
+		$b->tick();
+		self::assertArrayHasKey($clientId, $a->presence());
+		self::assertArrayHasKey($clientId, $b->presence());
+
+		// C crashes: it stops refreshing its file.  Whichever node reaps the file first, both forget the client.
+		for ($i = 0; $i < 20; $i++) {
+			$clock->setMicrotime($clock->microtime() + 5);
+			$a->tick();
+			$b->tick();
+		}
+
+		self::assertFileDoesNotExist($this->presenceFile($clientId));
+		self::assertArrayNotHasKey($clientId, $a->presence(), "A running node forgets the crashed node's client.");
+		self::assertArrayNotHasKey($clientId, $b->presence(), "Every running node forgets the crashed node's client.");
+	}
+
+	public function testTheReaperDropsTheDecodedClientId()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$p = $this->makeClockedNode('P', $clock);
+		$q = $this->makeClockedNode('host:q', $clock);   // a node id that the file name URL-encodes
+		[$connection] = $this->makeConnection();
+		$clientId = $q->register($connection);
+		$p->tick();
+		self::assertArrayHasKey($clientId, $p->presence());
+
+		for ($i = 0; $i < 20; $i++) {
+			$clock->setMicrotime($clock->microtime() + 5);
+			$p->tick();   // Q has crashed
+		}
+
+		self::assertFileDoesNotExist($this->presenceFile($clientId));
+		self::assertArrayNotHasKey($clientId, $p->presence(), 'The reaper drops the client id, not its encoded file name.');
+	}
+
+	public function testARestartUnderTheSameNodeIdReplacesItsPresence()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$x = $this->makeClockedNode('X', $clock);
+		$y1 = $this->makeClockedNode('Y', $clock);
+		[$connection] = $this->makeConnection();
+		$oldId = $y1->register($connection);
+		$x->tick();
+		self::assertArrayHasKey($oldId, $x->presence());
+
+		$y2 = $this->makeClockedNode('Y', $clock);   // Y crashed and restarted at once
+		[$fresh] = $this->makeConnection();
+		$newId = $y2->register($fresh);
+		$x->tick();
+
+		self::assertFileDoesNotExist($this->presenceFile($oldId), "The previous incarnation's presence file is removed.");
+		self::assertArrayNotHasKey($oldId, $x->presence(), "The previous incarnation's client leaves the peer's mirror.");
+		self::assertArrayHasKey($newId, $x->presence(), "The new incarnation's client is present.");
+		self::assertArrayNotHasKey($oldId, $this->makeClockedNode('Z', $clock)->presence(), 'A late joiner never sees the previous incarnation.');
+	}
+
+	public function testOpenKeepsAndReannouncesClientsRegisteredBeforeIt()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$x = $this->makeClockedNode('X', $clock);
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		$backplane->setClock($clock);
+		$y = new TWebSocketCluster('Y', $backplane);
+		[$connection] = $this->makeConnection();
+		$clientId = $y->register($connection);   // registered before the backplane opens
+		$y->open();
+		$x->tick();
+
+		self::assertFileExists($this->presenceFile($clientId), "Opening keeps a current client's file.");
+		self::assertArrayHasKey($clientId, $x->presence(), 'The current client is announced after the presence reset.');
+	}
+
+	public function testAStalledNodeRewritesAndReannouncesAReapedPresenceFile()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$x = $this->makeClockedNode('X', $clock);
+		$y = $this->makeClockedNode('Y', $clock);
+		[$connection] = $this->makeConnection();
+		$clientId = $y->register($connection);
+		$x->tick();
+
+		for ($i = 0; $i < 20; $i++) {
+			$clock->setMicrotime($clock->microtime() + 5);
+			$x->tick();   // Y stalls: X reaps its file and drops the client
+		}
+		self::assertArrayNotHasKey($clientId, $x->presence());
+		self::assertFileDoesNotExist($this->presenceFile($clientId));
+
+		$y->tick();   // Y resumes
+		$x->tick();
+
+		self::assertFileExists($this->presenceFile($clientId), 'The resumed node writes its live client\'s file again.');
+		self::assertGreaterThan(0, filesize($this->presenceFile($clientId)), 'The rewritten file holds the metadata, not an empty touch.');
+		self::assertArrayHasKey($clientId, $x->presence(), 'The resumed node announces its live client again.');
+		self::assertArrayHasKey($clientId, $this->makeClockedNode('Z', $clock)->presence(), 'A late joiner sees the live client.');
+	}
+
 	public function testOpenRequiresADirectory()
 	{
 		$cluster = new TWebSocketCluster('lonely', new TFileBackplane());

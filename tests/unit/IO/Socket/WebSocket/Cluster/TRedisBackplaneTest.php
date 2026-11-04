@@ -3,6 +3,7 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 
 use PHPUnit\Framework\TestCase;
+use Prado\Exceptions\TConfigurationException;
 use Prado\IO\Socket\WebSocket\Cluster\TRedisBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
@@ -24,6 +25,13 @@ class FakeRedis
 	/** @var bool Whether every command fails, as when the server is down. */
 	public bool $failing = false;
 	public int $connects = 0;
+	public int $closes = 0;
+	/** @var bool The results of connect(), auth() and select(). */
+	public bool $connectOk = true;
+	public bool $authOk = true;
+	public bool $selectOk = true;
+	/** @var array<int, int|string> The passwords and databases the client was given. */
+	public array $calls = [];
 
 	/** Forgets everything, as a restarted Redis would. */
 	public function flush(): void
@@ -42,7 +50,7 @@ class FakeRedis
 	{
 		$this->guard();
 		$this->connects++;
-		return true;
+		return $this->connectOk;
 	}
 
 	public function setOption(int $option, mixed $value): bool
@@ -52,16 +60,19 @@ class FakeRedis
 
 	public function auth(string $password): bool
 	{
-		return true;
+		$this->calls[] = $password;
+		return $this->authOk;
 	}
 
 	public function select(int $database): bool
 	{
-		return true;
+		$this->calls[] = $database;
+		return $this->selectOk;
 	}
 
 	public function close(): bool
 	{
+		$this->closes++;
 		return true;
 	}
 
@@ -181,6 +192,15 @@ class FakeRedisBackplane extends TRedisBackplane
 	protected function createRedis(): object
 	{
 		return $this->fake;
+	}
+}
+
+/** A backplane on a host without ext-redis. */
+class NoExtensionRedisBackplane extends TRedisBackplane
+{
+	protected function hasRedisExtension(): bool
+	{
+		return false;
 	}
 }
 
@@ -353,6 +373,295 @@ class TRedisBackplaneTest extends TestCase
 
 		$payloads = array_map(fn ($e) => $e->getPayload(), $this->inbox('n2'));
 		self::assertSame(['two', 'three'], $payloads, 'A stalled inbox keeps only the newest entries.');
+	}
+
+	/** @return array{0: TWebSocketCluster, 1: FakeRedisBackplane} An opened cluster node on the fake Redis. */
+	private function openNode(string $nodeId): array
+	{
+		[$cluster, $backplane] = $this->makeNode($nodeId);
+		$cluster->open();
+		return [$cluster, $backplane];
+	}
+
+	public function testANodeReapedWhileStalledRejoinsOnItsNextHeartbeat()
+	{
+		[$n1, $bp1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		[$connection, $sink] = $this->makeConnection();
+		$clientId = $n1->register($connection);
+		$n1->subscribe($clientId, 'news');
+		$n2->tick();
+		self::assertArrayHasKey($clientId, $n2->presence());
+
+		// n1 stalls past the TTL: its heartbeat key expires and n2 reaps it.
+		unset($this->redis->strings[$this->prefix . 'node:n1']);
+		$this->clock->setMicrotime(1000.0 + $bp1->getNodeTtl() + 1);
+		$n2->tick();
+		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'nodes']);
+		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news'] ?? [], "The reap withdrew the stalled node's channel interest.");
+		self::assertArrayNotHasKey($clientId, $n2->presence());
+
+		// n1 resumes: its next heartbeat finds it missing from the registry and rebuilds.
+		$n1->tick();
+		self::assertArrayHasKey('n1', $this->redis->sets[$this->prefix . 'nodes'], 'The resumed node is back in the registry.');
+		self::assertArrayHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news'] ?? [], 'The resumed node re-declares its channel interest.');
+		self::assertArrayHasKey($clientId, $this->redis->hashes[$this->prefix . 'presence'] ?? [], 'The resumed node re-puts its clients.');
+
+		$n2->tick();
+		self::assertArrayHasKey($clientId, $n2->presence(), "The peer learns the resumed node's client again.");
+		$n2->publish('news', 'after');
+		self::assertTrue($n2->sendToClient($clientId, 'direct'), "The peer can address the resumed node's client.");
+		$before = $sink->getSize();
+		$n1->tick();
+		self::assertStringContainsString('after', substr((string) $sink, $before), 'The resumed node receives channel traffic.');
+		self::assertStringContainsString('direct', substr((string) $sink, $before), 'The resumed node receives direct traffic.');
+	}
+
+	public function testEveryNodeDropsAReapedNodesClients()
+	{
+		[$a] = $this->openNode('A');
+		[$b] = $this->openNode('B');
+		[$c, $bpC] = $this->openNode('C');
+		[$connection] = $this->makeConnection();
+		$clientId = $c->register($connection);
+		$a->tick();
+		$b->tick();
+		self::assertArrayHasKey($clientId, $a->presence());
+		self::assertArrayHasKey($clientId, $b->presence());
+
+		// C crashes and its heartbeat key expires.  A prunes first; C is then gone from the registry, so B's prune never finds it.
+		unset($this->redis->strings[$this->prefix . 'node:C']);
+		$this->clock->setMicrotime(1000.0 + $bpC->getNodeTtl() + 1);
+		$a->tick();
+		$b->tick();
+
+		self::assertArrayNotHasKey($clientId, $a->presence(), "The reaping node drops the dead node's client.");
+		self::assertArrayNotHasKey($clientId, $b->presence(), "Every other node drops the dead node's client too.");
+	}
+
+	public function testAClientThatLeftDuringAnOutageIsDroppedOnThePeers()
+	{
+		[$p] = $this->openNode('P');
+		[$q] = $this->openNode('Q');
+		[$leaving] = $this->makeConnection();
+		[$staying] = $this->makeConnection();
+		$leavingId = $q->register($leaving);
+		$stayingId = $q->register($staying);
+		$p->tick();
+		self::assertArrayHasKey($leavingId, $p->presence());
+
+		$this->redis->failing = true;
+		$q->tick();                  // Q faults and disconnects
+		$q->unregister($leaving);    // the drop is lost: Redis is down
+		$this->redis->failing = false;
+		$this->clock->setMicrotime(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
+		$q->tick();                  // Q reconnects and replaces its presence
+		$p->tick();
+
+		self::assertArrayNotHasKey($leavingId, $p->presence(), "The client that left during the outage leaves the peer's mirror.");
+		self::assertArrayHasKey($stayingId, $p->presence(), 'The client still connected stays present on the peer.');
+	}
+
+	public function testARestartUnderTheSameNodeIdReplacesItsPresenceOnThePeers()
+	{
+		[$x] = $this->openNode('X');
+		[$y1] = $this->openNode('Y');
+		[$connection] = $this->makeConnection();
+		$oldId = $y1->register($connection);
+		$x->tick();
+		self::assertArrayHasKey($oldId, $x->presence());
+
+		[$y2] = $this->openNode('Y');   // Y crashed and restarted at once, inside its TTL
+		[$fresh] = $this->makeConnection();
+		$newId = $y2->register($fresh);
+		$x->tick();
+
+		self::assertArrayNotHasKey($oldId, $x->presence(), "The previous incarnation's client leaves the peer's mirror.");
+		self::assertArrayHasKey($newId, $x->presence(), "The new incarnation's client is present.");
+	}
+
+	public function testANodeDownNeverDropsTheReceiversOwnClients()
+	{
+		[$n1] = $this->openNode('n1');
+		[$connection] = $this->makeConnection();
+		$clientId = $n1->register($connection);
+		$this->redis->lists[$this->prefix . 'inbox:n1'][] = (new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, 'n2', '', null, null, ['node' => 'n1']))->encode();
+
+		$n1->tick();
+
+		self::assertArrayHasKey($clientId, $n1->presence(), 'A node-down naming this node leaves its own clients alone.');
+	}
+
+	public function testCloseLeavesTheClusterAndReleasesTheConnection()
+	{
+		[$cluster, $backplane] = $this->openNode('n1');
+		[$connection] = $this->makeConnection();
+		$clientId = $cluster->register($connection);
+		$cluster->subscribe($clientId, 'news');
+		$this->redis->lists[$this->prefix . 'inbox:n1'][] = 'pending';
+
+		$backplane->close();
+
+		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'nodes']);
+		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news'] ?? []);
+		self::assertArrayNotHasKey($this->prefix . 'nodech:n1', $this->redis->sets);
+		self::assertArrayNotHasKey($this->prefix . 'node:n1', $this->redis->strings);
+		self::assertArrayNotHasKey($this->prefix . 'inbox:n1', $this->redis->lists);
+		self::assertSame(1, $this->redis->closes, 'The connection is closed.');
+
+		$backplane->close();   // already closed: a no-op
+		self::assertSame(1, $this->redis->closes);
+	}
+
+	public function testCloseSwallowsAFaultFromADeadConnection()
+	{
+		[, $backplane] = $this->openNode('n1');
+		$this->redis->failing = true;
+
+		$backplane->close();   // the commands fail; the keys expire by TTL instead
+
+		self::assertSame(0, $this->redis->closes);
+		$this->redis->failing = false;
+		$backplane->close();
+		self::assertSame(0, $this->redis->closes, 'The backplane forgot the dead connection.');
+	}
+
+	public function testUnsubscribeWithdrawsChannelInterest()
+	{
+		[$cluster] = $this->openNode('n1');
+		[$connection] = $this->makeConnection();
+		$clientId = $cluster->register($connection);
+		$cluster->subscribe($clientId, 'news');
+		self::assertArrayHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news']);
+
+		$cluster->unsubscribe($clientId, 'news');
+
+		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news'] ?? []);
+		self::assertArrayNotHasKey('news', $this->redis->sets[$this->prefix . 'nodech:n1'] ?? []);
+	}
+
+	public function testPublishReachesOnlyTheInterestedNodes()
+	{
+		[$n1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		$this->openNode('n3');
+		[$connection] = $this->makeConnection();
+		$n2->subscribe($n2->register($connection), 'news');
+
+		$n1->publish('news', 'hello');
+		$n1->publish('empty', 'nobody');   // no node is interested: nothing is pushed
+
+		$publishes = fn (string $node) => array_map(fn ($e) => $e->getPayload(), array_values(array_filter($this->inbox($node), fn ($e) => $e->getType() === TWebSocketEnvelope::PUBLISH)));
+		self::assertSame(['hello'], $publishes('n2'), 'The interested node receives the publish.');
+		self::assertSame([], $publishes('n3'), 'A node without interest receives nothing.');
+	}
+
+	public function testDirectToAClientWithoutAResolvableNodeIsNotRouted()
+	{
+		[$n1] = $this->openNode('n1');
+		$this->openNode('n2');
+		$this->redis->hashes[$this->prefix . 'presence']['broken'] = '{not json';
+		$this->redis->hashes[$this->prefix . 'presence']['nodeless'] = '{"user":"x"}';
+
+		$n1->sendToClient('broken', 'lost');
+		$n1->sendToClient('nodeless', 'lost');
+		$n1->sendToClient('unknown', 'lost');
+
+		self::assertSame([], array_filter($this->inbox('n2'), fn ($e) => $e->getType() === TWebSocketEnvelope::DIRECT), 'A direct to a client with no resolvable node goes nowhere.');
+		self::assertSame(2, $this->redis->connects, 'A malformed entry is not a Redis fault.');
+	}
+
+	public function testOpenAuthenticatesAndSelectsTheDatabase()
+	{
+		[$cluster, $backplane] = $this->makeNode('n1');
+		$backplane->setPassword('secret');
+		$backplane->setDatabase(3);
+		$cluster->open();
+
+		self::assertSame(['secret', 3], $this->redis->calls, 'The password and the database are sent on connect.');
+	}
+
+	public static function provideRefusedConnections(): array
+	{
+		return [
+			'connect refused' => ['connectOk'],
+			'auth refused' => ['authOk'],
+			'select refused' => ['selectOk'],
+		];
+	}
+
+	/**
+	 * @dataProvider provideRefusedConnections
+	 * @param string $flag
+	 */
+	public function testOpenFailsWhenTheServerRefusesTheConnection(string $flag)
+	{
+		$this->redis->{$flag} = false;
+		[$cluster, $backplane] = $this->makeNode('n1');
+		$backplane->setPassword('secret');
+		$backplane->setDatabase(3);
+		try {
+			$cluster->open();
+			self::fail('The open succeeded.');
+		} catch (TConfigurationException $e) {
+			self::assertSame('websocket_backplane_redis_connect_failed', $e->getErrorCode());
+		}
+		self::assertArrayNotHasKey($this->prefix . 'nodes', $this->redis->sets, 'Nothing is written through a refused connection.');
+		$cluster->publish('news', 'dropped');   // the backplane holds no half-open handle
+		self::assertSame([], $this->redis->lists);
+	}
+
+	public function testOpenWrapsAFaultInTheJoin()
+	{
+		[$cluster] = $this->makeNode('n1');
+		$this->redis->failing = true;
+		try {
+			$cluster->open();
+			self::fail('The open succeeded.');
+		} catch (TConfigurationException $e) {
+			self::assertSame('websocket_backplane_redis_connect_failed', $e->getErrorCode());
+		}
+	}
+
+	public function testPropertiesRoundTripWithTheirDefaultsAndBounds()
+	{
+		$backplane = new TRedisBackplane();
+		self::assertSame('127.0.0.1', $backplane->getHost());
+		self::assertSame(6379, $backplane->getPort());
+		self::assertNull($backplane->getPassword());
+		self::assertSame(0, $backplane->getDatabase());
+		self::assertSame('ws:', $backplane->getPrefix());
+		self::assertSame(30, $backplane->getNodeTtl());
+		self::assertSame(2.0, $backplane->getTimeout());
+		self::assertSame(10000, $backplane->getInboxLimit());
+
+		self::assertSame($backplane, $backplane->setHost('redis.internal')->setPort('6380')->setPassword('pw')->setDatabase('2')->setPrefix('app:')->setNodeTtl('12')->setTimeout('0.5')->setInboxLimit('50'));
+		self::assertSame('redis.internal', $backplane->getHost());
+		self::assertSame(6380, $backplane->getPort());
+		self::assertSame('pw', $backplane->getPassword());
+		self::assertSame(2, $backplane->getDatabase());
+		self::assertSame('app:', $backplane->getPrefix());
+		self::assertSame(12, $backplane->getNodeTtl());
+		self::assertSame(0.5, $backplane->getTimeout());
+		self::assertSame(50, $backplane->getInboxLimit());
+
+		$backplane->setPassword('')->setNodeTtl(0)->setInboxLimit(-5);
+		self::assertNull($backplane->getPassword(), 'An empty password means none.');
+		self::assertSame(1, $backplane->getNodeTtl(), 'The TTL is at least one second.');
+		self::assertSame(0, $backplane->getInboxLimit(), 'A negative limit means unlimited.');
+		self::assertSame([], $backplane->getSources(), 'Redis is polled, not selected on.');
+	}
+
+	public function testOpenRequiresTheRedisExtension()
+	{
+		$backplane = new NoExtensionRedisBackplane();
+		new TWebSocketCluster('n1', $backplane);
+		try {
+			$backplane->open();
+			self::fail('The open succeeded without ext-redis.');
+		} catch (TConfigurationException $e) {
+			self::assertSame('websocket_backplane_redis_missing', $e->getErrorCode());
+		}
 	}
 
 	public function testAFailedLocalDeliveryDoesNotDisconnectOrDropTheBatch()

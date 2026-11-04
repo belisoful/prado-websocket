@@ -10,6 +10,7 @@ use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Stream\TBufferStream;
 use Prado\TComponent;
 use Prado\Util\Clock\TMockClock;
 
@@ -34,6 +35,12 @@ class SpyCluster extends TComponent implements IWebSocketCluster
 	public function receiveEnvelope(TWebSocketEnvelope $envelope): void
 	{
 		$this->received[] = $envelope;
+	}
+
+	/** @return TWebSocketEnvelope[] The received envelopes other than node announces (a new link's join state starts with one). */
+	public function traffic(): array
+	{
+		return array_values(array_filter($this->received, fn ($e) => $e->getType() !== TWebSocketEnvelope::NODE_UP));
 	}
 
 	public function hasLocalClient(string $clientId): bool
@@ -98,6 +105,166 @@ class TMeshBackplaneTest extends TestCase
 		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);
 	}
 
+	/**
+	 * Links two mesh nodes with a connected socket pair and returns the transports.
+	 * @param TMeshBackplane $a
+	 * @param TMeshBackplane $b
+	 * @return array{0: TSocketStream, 1: TSocketStream} The dialer's and the acceptor's transports.
+	 */
+	private function linkPair(TMeshBackplane $a, TMeshBackplane $b): array
+	{
+		[$rawA, $rawB] = TSocketStream::pair();
+		$rawA->setBlocking(false);
+		$rawB->setBlocking(false);
+		$a->addPeer(new TWebSocketConnection($rawA, true), $rawA);
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);
+		return [$rawA, $rawB];
+	}
+
+	/** @return array{0: TWebSocketCluster, 1: TMeshBackplane} A coordinator on a mesh backplane. */
+	private function makeClusterNode(string $id, TMockClock $clock): array
+	{
+		$mesh = new TMeshBackplane();
+		$mesh->setClock($clock);
+		return [new TWebSocketCluster($id, $mesh), $mesh];
+	}
+
+	public function testTickDrainsALinkThatTheKernelDidNotTakeAtOnce()
+	{
+		[$a] = $this->makeNode('A');
+		[$b, $spyB] = $this->makeNode('B');
+		[$rawA] = $this->linkPair($a, $b);
+		$b->tick();
+
+		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', str_repeat('x', 1024 * 1024)));
+		self::assertSame([$rawA], $a->getWriteSources(), 'The link holds output the socket buffer could not take.');
+		for ($i = 0; $i < 2000 && $a->getWriteSources() !== []; $i++) {
+			$a->tick();   // no further traffic: only the tick flushes the link
+			$b->tick();
+		}
+		$b->tick();
+
+		self::assertSame([], $a->getWriteSources(), 'The queued output drains.');
+		self::assertCount(1, $spyB->traffic(), 'The whole message reaches the peer.');
+		self::assertSame(1024 * 1024, strlen($spyB->traffic()[0]->getPayload()));
+	}
+
+	public function testFlushSourceDrainsTheWritableLink()
+	{
+		[$a] = $this->makeNode('A');
+		[$b, $spyB] = $this->makeNode('B');
+		[$rawA] = $this->linkPair($a, $b);
+		$b->tick();
+
+		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', str_repeat('y', 1024 * 1024)));
+		[$stranger] = TSocketStream::pair();
+		$a->flushSource($stranger);   // a source the backplane does not hold is ignored
+		self::assertSame([$rawA], $a->getWriteSources());
+		for ($i = 0; $i < 2000 && $a->getWriteSources() !== []; $i++) {
+			$a->flushSource($rawA);   // the server reports the link writable
+			$b->tick();
+		}
+		$b->tick();
+
+		self::assertSame([], $a->getWriteSources(), 'Flushing the writable link drains it.');
+		self::assertCount(1, $spyB->traffic(), 'The whole message reaches the peer.');
+	}
+
+	public function testAFailedFlushDropsThePeer()
+	{
+		[$a] = $this->makeNode('A');
+		[$b] = $this->makeNode('B');
+		[$rawA, $rawB] = $this->linkPair($a, $b);
+		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', str_repeat('z', 1024 * 1024)));
+		self::assertSame([$rawA], $a->getWriteSources());
+
+		$rawB->close();   // the peer goes away with output still queued
+		for ($i = 0; $i < 10 && $a->getPeerCount() > 0; $i++) {
+			$a->flushSource($rawA);
+		}
+
+		self::assertSame(0, $a->getPeerCount(), 'A link whose write fails is dropped.');
+		self::assertSame([], $a->getWriteSources());
+	}
+
+	public function testARestartedNodesPreviousClientsAreDroppedOnItsNewIncarnation()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		[$ca, $a] = $this->makeClusterNode('A', $clock);
+		[$cb1, $b1] = $this->makeClusterNode('B', $clock);
+		[, $rawB1] = $this->linkPair($a, $b1);
+		$oldId = $cb1->register(new TWebSocketConnection(new TBufferStream(), false));
+		$a->tick();
+		self::assertArrayHasKey($oldId, $ca->presence());
+
+		$rawB1->close();   // B exits
+		$a->tick();
+		[$cb2, $b2] = $this->makeClusterNode('B', $clock);   // and restarts at once under the same node id
+		$newId = $cb2->register(new TWebSocketConnection(new TBufferStream(), false));
+		$this->linkPair($a, $b2);
+		$a->tick();
+
+		self::assertArrayNotHasKey($oldId, $ca->presence(), "The previous incarnation's client is dropped.");
+		self::assertArrayHasKey($newId, $ca->presence(), "The new incarnation's client is present.");
+	}
+
+	public function testARestartIsDetectedBehindAnIntermediary()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		[$cp, $p] = $this->makeClusterNode('P', $clock);
+		[, $q] = $this->makeClusterNode('Q', $clock);
+		[$cr1, $r1] = $this->makeClusterNode('R', $clock);
+		$this->linkPair($p, $q);
+		[, $rawR1] = $this->linkPair($q, $r1);   // a line: P - Q - R
+		$oldId = $cr1->register(new TWebSocketConnection(new TBufferStream(), false));
+		$q->tick();
+		$p->tick();
+		self::assertArrayHasKey($oldId, $cp->presence());
+
+		$rawR1->close();
+		$q->tick();
+		[$cr2, $r2] = $this->makeClusterNode('R', $clock);
+		$newId = $cr2->register(new TWebSocketConnection(new TBufferStream(), false));
+		$this->linkPair($q, $r2);
+		$q->tick();   // relays R's new announce and presence
+		$p->tick();
+
+		self::assertArrayNotHasKey($oldId, $cp->presence(), "A node that is not R's direct peer drops R's previous incarnation too.");
+		self::assertArrayHasKey($newId, $cp->presence());
+	}
+
+	public function testAnUnchangedOrMissingIncarnationKeepsTheNodesClients()
+	{
+		[$b, $spyB, $peer] = $this->verifiedPeer('A');
+		$announce = fn (array $meta) => $peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'A', '', null, null, $meta))->encode());
+		$announce(['uri' => '']);   // a node predating incarnations
+		$announce(['uri' => '', 'incarnation' => 'one']);
+		$announce(['uri' => '', 'incarnation' => 'one']);   // a heartbeat from the same incarnation
+		$announce(['uri' => '']);
+		$b->tick();
+		self::assertSame([], $spyB->droppedNodes, 'Only a changed incarnation drops the node\'s clients.');
+
+		$announce(['uri' => '', 'incarnation' => 'two']);
+		$b->tick();
+		self::assertSame(['A'], $spyB->droppedNodes, 'A new incarnation drops the clients held for the node.');
+		$b->close();
+	}
+
+	public function testJoinStateAnnouncesTheNodeBeforeItsPresence()
+	{
+		[$a] = $this->makeNode('A');
+		[$b, $spyB] = $this->makeNode('B');
+		$a->putPresence('A-1', ['node' => 'A']);
+		$this->link($a, $b);
+		$b->tick();
+
+		$types = array_map(fn ($e) => $e->getType(), $spyB->received);
+		self::assertSame([TWebSocketEnvelope::NODE_UP, TWebSocketEnvelope::PRESENCE_SET], $types, 'The announce precedes the presence, even when the node advertises no URI.');
+		self::assertNotSame('', $spyB->received[0]->getMeta()['incarnation'] ?? '', 'The announce carries the incarnation.');
+	}
+
 	public function testPublishFloodsToTheLinkedPeer()
 	{
 		[$a, $spyA] = $this->makeNode('A');
@@ -107,9 +274,9 @@ class TMeshBackplaneTest extends TestCase
 		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'A', 'hello', 'news'));
 		$b->tick();
 
-		self::assertCount(1, $spyB->received, 'The peer delivers the flooded envelope.');
-		self::assertSame('hello', $spyB->received[0]->getPayload());
-		self::assertSame('news', $spyB->received[0]->getChannel());
+		self::assertCount(1, $spyB->traffic(), 'The peer delivers the flooded envelope.');
+		self::assertSame('hello', $spyB->traffic()[0]->getPayload());
+		self::assertSame('news', $spyB->traffic()[0]->getChannel());
 		self::assertCount(0, $spyA->received, 'A node does not deliver its own published envelope to itself.');
 	}
 
@@ -122,8 +289,8 @@ class TMeshBackplaneTest extends TestCase
 		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', 'all'));
 		$b->tick();
 
-		self::assertCount(1, $spyB->received);
-		self::assertSame(TWebSocketEnvelope::BROADCAST, $spyB->received[0]->getType());
+		self::assertCount(1, $spyB->traffic());
+		self::assertSame(TWebSocketEnvelope::BROADCAST, $spyB->traffic()[0]->getType());
 	}
 
 	public function testDuplicateSuppressedAcrossATriangle()
@@ -141,7 +308,7 @@ class TMeshBackplaneTest extends TestCase
 
 		$copies = array_filter($spyC->received, fn ($e) => $e->getId() === 'env-1');
 		self::assertCount(1, $copies, 'A duplicate arriving over a second path is dropped.');
-		self::assertCount(1, $spyB->received);
+		self::assertCount(1, $spyB->traffic());
 	}
 
 	public function testPresenceSnapshotConvergesANewPeer()

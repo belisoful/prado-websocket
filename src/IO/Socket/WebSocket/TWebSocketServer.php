@@ -12,10 +12,12 @@ namespace Prado\IO\Socket\WebSocket;
 
 use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\THttp2Exception;
+use Prado\IO\IResource;
 use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketReactor;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBufferedBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
 use Prado\Util\Clock\TApplicationClockAwareTrait;
@@ -118,7 +120,7 @@ class TWebSocketServer extends TSocketServer
 	/** @var ?string The reactor timer that scans for idle sessions, while an idle timeout is set. */
 	private ?string $_idleTimer = null;
 
-	/** @var array<int, \Prado\IO\IResource> The cluster sources registered with the reactor, keyed by object id. */
+	/** @var array<int, IResource> The cluster sources registered with the reactor, keyed by object id. */
 	private array $_clusterSources = [];
 
 	/** @var bool Whether the cluster has been ticked during the current pump. */
@@ -748,8 +750,9 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Registers the cluster backplane's selectable sources (mesh peer links and dials) with the
-	 * reactor as they appear, so peer traffic wakes the loop; a ready source ticks the cluster.  A
-	 * source the backplane no longer reports is removed.
+	 * reactor as they appear, so peer traffic wakes the loop; a ready source ticks the cluster, and a
+	 * writable one {@see writableClusterSource() drains} its queued output while armed.  A source the
+	 * backplane no longer reports is removed.
 	 */
 	protected function syncClusterSources(): void
 	{
@@ -762,7 +765,7 @@ class TWebSocketServer extends TSocketServer
 			$id = spl_object_id($source);
 			$current[$id] = $source;
 			if (!isset($this->_clusterSources[$id])) {
-				$reactor->register($source, onReadable: fn () => $this->tickCluster());
+				$reactor->register($source, onReadable: fn () => $this->tickCluster(), onWritable: fn () => $this->writableClusterSource($source));
 			}
 		}
 		foreach ($this->_clusterSources as $id => $source) {
@@ -774,10 +777,28 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Arms each session transport with queued output for writability and disarms the rest, so the
-	 * reactor watches writes only where a drain is pending (a writable socket is otherwise always
-	 * ready).  Output queued outside a pump (a cluster broadcast, a handler's out-of-band send) is
-	 * picked up here.
+	 * Drains a writable cluster source's queued output through a {@see IWebSocketBufferedBackplane}.
+	 * A backplane fault is logged and never terminates the serve loop.
+	 * @param IResource $source The writable cluster source.
+	 */
+	protected function writableClusterSource(IResource $source): void
+	{
+		$backplane = $this->_cluster?->getBackplane();
+		if (!$backplane instanceof IWebSocketBufferedBackplane) {
+			return;
+		}
+		try {
+			$backplane->flushSource($source);
+		} catch (\Throwable $e) {
+			$this->log('Cluster flush failed: ' . $e->getMessage());
+		}
+	}
+
+	/**
+	 * Arms each session transport and cluster source with queued output for writability and disarms
+	 * the rest, so the reactor watches writes only where a drain is pending (a writable socket is
+	 * otherwise always ready).  Output queued outside a pump (a cluster broadcast, a handler's
+	 * out-of-band send, a mesh peer message larger than the socket buffer) is picked up here.
 	 */
 	protected function armWrites(): void
 	{
@@ -788,6 +809,16 @@ class TWebSocketServer extends TSocketServer
 		}
 		foreach ($this->_sessions as $id => $session) {
 			$reactor->wantWrite($session['transport'], isset($pending[$id]));
+		}
+		$backplane = $this->_cluster?->getBackplane();
+		$queued = [];
+		if ($backplane instanceof IWebSocketBufferedBackplane) {
+			foreach ($backplane->getWriteSources() as $source) {
+				$queued[spl_object_id($source)] = true;
+			}
+		}
+		foreach ($this->_clusterSources as $id => $source) {
+			$reactor->wantWrite($source, isset($queued[$id]));
 		}
 	}
 

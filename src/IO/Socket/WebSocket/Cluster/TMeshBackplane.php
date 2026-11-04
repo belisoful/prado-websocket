@@ -11,6 +11,7 @@
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\IO\IResource;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -37,11 +38,16 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  *    so {@see subscribe()}/{@see unsubscribe()} are inert.
  *
  * Presence floods as presence envelopes, and a node sends its local presence to each peer as the
- * link is added, so a joining node converges.  The mesh self-assembles: it is seeded from the
- * {@see setPeers() Peers} dialed on {@see open()}, then each node announces its {@see setAdvertise()
- * Advertise} URI, which floods so other nodes dial it (a lexical tie-break makes exactly one side of
- * any pair initiate, and an established peer is never dialed twice).  Dials are asynchronous and
- * advance in {@see tick()}, so the serve loop never blocks on a connecting or handshaking peer.
+ * link is added, so a joining node converges.  Every node announce carries the sender's incarnation,
+ * a value drawn once per backplane instance.  A node that hears a new incarnation for a node id drops
+ * the clients it holds for that id before applying the new incarnation's presence, so a node that
+ * restarts under a static node id leaves no phantom clients.
+ *
+ * The mesh self-assembles: it is seeded from the {@see setPeers() Peers} dialed on {@see open()},
+ * then each node announces its {@see setAdvertise() Advertise} URI, which floods so other nodes dial
+ * it (a lexical tie-break makes exactly one side of any pair initiate, and an established peer is
+ * never dialed twice).  Dials are asynchronous and advance in {@see tick()}, so the serve loop never
+ * blocks on a connecting or handshaking peer.
  *
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
  * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
@@ -56,6 +62,10 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  * untrusted network, where an address can be taken over.  The secret is required: {@see open()}
  * refuses to start without one, since no peer could ever join.
  *
+ * A peer link buffers output the kernel does not take at once.  {@see tick()} flushes it, and the
+ * server watches each link with output pending for writability ({@see IWebSocketBufferedBackplane}),
+ * so a message larger than the socket buffer drains as fast as the peer reads it.
+ *
  * Liveness is tracked per node from the traffic it originates.  A node unheard for the
  * {@see getNodeTtl() TTL} is declared down: its clients leave the presence mirror and any direct link
  * to it is dropped, which frees its URI so it is dialed again when it returns.  Seed peers that are
@@ -63,7 +73,7 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
-class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSocketEndpoint
+class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, IWebSocketEndpoint
 {
 	use TApplicationClockAwareTrait;
 
@@ -142,6 +152,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	/** @var float The last {@see \Prado\Util\Clock\IClock::microtime()} unlinked seed peers were re-dialed. */
 	private float $_lastRedial = 0.0;
 
+	/** @var string This backplane's incarnation, announced in each node announce; '' until first used. */
+	private string $_incarnation = '';
+
+	/** @var array<string, string> The last incarnation announced by each node, keyed by node id. */
+	private array $_incarnations = [];
+
 	/**
 	 * Binds the owning coordinator.
 	 * @param IWebSocketCluster $cluster The coordinator received envelopes are delivered to.
@@ -218,11 +234,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		$this->_knownUris = [];
 		$this->_connectedUris = [];
 		$this->_nodeSeen = [];
+		$this->_incarnations = [];
 	}
 
 	/**
-	 * Drains each peer link, delivering received envelopes and re-flooding them, and drops a peer
-	 * whose link has closed.
+	 * Flushes each peer link's queued output, drains each link, delivering received envelopes and
+	 * re-flooding them, and drops a peer whose link has closed.
 	 */
 	public function tick(): void
 	{
@@ -233,6 +250,9 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		foreach ($this->_peers as $id => $peer) {
 			if (!$peer['verified'] && $peer['authDeadline'] > 0.0 && $this->getClock()->microtime() > $peer['authDeadline']) {
 				$this->dropPeer($id, 'the challenge went unanswered');
+				continue;
+			}
+			if (!$this->flushPeer($id)) {
 				continue;
 			}
 			$bytes = $this->readPeer($peer['transport']);
@@ -261,7 +281,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			return;
 		}
 		$this->_lastHeartbeat = $now;
-		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise]);
+		$envelope = $this->nodeAnnounce();
 		$this->markSeen($envelope->getId());
 		$this->flood($envelope, null);
 	}
@@ -282,7 +302,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		$this->_lastNodeScan = $now;
 		foreach ($this->_nodeSeen as $node => $seen) {
 			if (($now - $seen) > $this->_nodeTtl) {
-				unset($this->_nodeSeen[$node]);
+				unset($this->_nodeSeen[$node], $this->_incarnations[$node]);
 				Prado::log("Mesh node {$node} was not heard from for {$this->_nodeTtl}s; declaring it down", TLogger::WARNING, static::class);
 				$this->_cluster?->dropNodePresence($node);
 				foreach ($this->_peers as $id => $peer) {
@@ -301,6 +321,39 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	public function getSources(): array
 	{
 		return array_merge(array_column($this->_peers, 'transport'), array_column($this->_pending, 'transport'));
+	}
+
+	/**
+	 * Returns the transports of the peer links with output queued.  Implements
+	 * {@see IWebSocketBufferedBackplane}.
+	 * @return IResource[] The transports to watch for writability.
+	 * @since 1.2.0
+	 */
+	public function getWriteSources(): array
+	{
+		$sources = [];
+		foreach ($this->_peers as $peer) {
+			if ($peer['link']->hasPendingOutbound()) {
+				$sources[] = $peer['transport'];
+			}
+		}
+		return $sources;
+	}
+
+	/**
+	 * Writes a writable peer link's queued output, dropping the peer when the write fails.
+	 * Implements {@see IWebSocketBufferedBackplane}.
+	 * @param IResource $source The writable peer transport.
+	 * @since 1.2.0
+	 */
+	public function flushSource(IResource $source): void
+	{
+		foreach ($this->_peers as $id => $peer) {
+			if ($peer['transport'] === $source) {
+				$this->flushPeer($id);
+				return;
+			}
+		}
 	}
 
 	// =========================================================================
@@ -411,19 +464,52 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	}
 
 	/**
-	 * Sends this node's join state to a peer: its local clients' presence and, when advertising, its
-	 * node announce.  On a secret-gated mesh this runs only from {@see verifyChallenge()}, once this
-	 * node has verified the peer, so state is never shown to an unproven peer — dialed or accepted.
+	 * Sends this node's join state to a peer: its node announce, then its local clients' presence.
+	 * The announce comes first so a peer that held a previous incarnation of this node id drops it
+	 * before applying the presence; it also carries the advertised URI, through whose re-flood the
+	 * rest of the mesh can dial back.  On a secret-gated mesh this runs only from
+	 * {@see verifyChallenge()}, once this node has verified the peer, so state is never shown to an
+	 * unproven peer — dialed or accepted.
 	 * @param TWebSocketConnection $link The peer link.
 	 */
 	private function sendJoinState(TWebSocketConnection $link): void
 	{
+		$this->sendTo($link, $this->nodeAnnounce());
 		foreach ($this->_localPresence as $clientId => $meta) {
 			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
 		}
-		if ($this->_advertise !== '') {
-			// Announce this node so the peer, and through its re-flood the rest of the mesh, can dial back.
-			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise]));
+	}
+
+	/**
+	 * Builds this node's announce: a {@see TWebSocketEnvelope::NODE_UP} carrying its advertised URI
+	 * and its incarnation.
+	 * @return TWebSocketEnvelope The announce.
+	 */
+	private function nodeAnnounce(): TWebSocketEnvelope
+	{
+		if ($this->_incarnation === '') {
+			$this->_incarnation = bin2hex(random_bytes(8));
+		}
+		return new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise, 'incarnation' => $this->_incarnation]);
+	}
+
+	/**
+	 * Records a node's announced incarnation.  A changed incarnation means the node restarted under
+	 * the same id, so the clients held for its previous incarnation are dropped from the presence
+	 * mirror.  An announce without an incarnation (from a node predating it) is ignored.
+	 * @param string $node The announcing node id.
+	 * @param string $incarnation The announced incarnation, or ''.
+	 */
+	private function trackIncarnation(string $node, string $incarnation): void
+	{
+		if ($incarnation === '') {
+			return;
+		}
+		$known = $this->_incarnations[$node] ?? '';
+		$this->_incarnations[$node] = $incarnation;
+		if ($known !== '' && $known !== $incarnation) {
+			Prado::log("Mesh node {$node} restarted with a new incarnation; dropping its previous clients", TLogger::NOTICE, static::class);
+			$this->_cluster?->dropNodePresence($node);
 		}
 	}
 
@@ -678,6 +764,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			return;
 		}
 		$this->markSeen($envelope->getId());
+		if ($type === TWebSocketEnvelope::NODE_UP) {
+			$incarnation = $envelope->getMeta()['incarnation'] ?? '';
+			$this->trackIncarnation($origin, is_string($incarnation) ? $incarnation : '');   // before any presence the new incarnation sends
+		}
 		try {
 			$this->_cluster?->receiveEnvelope($envelope);
 		} catch (\Throwable $e) {
@@ -765,6 +855,25 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 		} catch (\Throwable $e) {
 			$this->dropPeer(spl_object_id($link), 'a send failed: ' . $e->getMessage());
 		}
+	}
+
+	/**
+	 * Writes a peer link's queued output without blocking, dropping the peer when the write fails.
+	 * @param int $id The peer object id.
+	 * @return bool Whether the peer is still linked.
+	 */
+	private function flushPeer(int $id): bool
+	{
+		if (!isset($this->_peers[$id])) {
+			return false;
+		}
+		try {
+			$this->_peers[$id]['link']->flushOutbound();
+		} catch (\Throwable $e) {
+			$this->dropPeer($id, 'a flush failed: ' . $e->getMessage());
+			return false;
+		}
+		return true;
 	}
 
 	/**

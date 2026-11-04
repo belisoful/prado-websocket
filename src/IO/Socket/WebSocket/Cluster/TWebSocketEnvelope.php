@@ -25,8 +25,12 @@ use Prado\TComponent;
  *  - {@see BROADCAST}: deliver Payload to every local client.
  *  - {@see DIRECT}: deliver Payload to the local client named by {@see getClientId() ClientId}.
  *  - {@see PRESENCE_SET}/{@see PRESENCE_DROP}: update the presence mirror for ClientId.
- *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI;
- *    the coordinator itself ignores it, while the mesh backplane uses it to find peers and detect failures.
+ *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI
+ *    and incarnation; the coordinator itself ignores it, while the mesh backplane uses it to find peers,
+ *    detect failures, and detect a restart under the same node id.
+ *  - {@see NODE_DOWN}: drop every presence entry of the node named by the `node` metadata (the origin
+ *    node when absent).  A backplane sends it when it reaps a dead node, and a node sends it about
+ *    itself before re-announcing its clients, so every node replaces that node's presence.
  *  - {@see AUTH_CHALLENGE}/{@see AUTH_RESPONSE}: a mesh-only peer authentication handshake (a nonce and its
  *    signed answer) consumed by the backplane itself, never routed to the coordinator.
  *
@@ -59,7 +63,7 @@ class TWebSocketEnvelope extends TComponent
 	/** A mesh node's discovery and liveness heartbeat, carrying its advertised URI. */
 	public const NODE_UP = 'node.up';
 
-	/** Reserved: node failure is detected by a backplane's liveness timeout (which calls {@see IWebSocketCluster::dropNodePresence()}), not by this envelope. */
+	/** A node's clients left the cluster: the node named by the `node` metadata (else the origin) was reaped, or is re-announcing its presence. */
 	public const NODE_DOWN = 'node.down';
 
 	/** A mesh peer's anti-replay challenge: a fresh nonce each side of a new peer link asks the other to sign. */

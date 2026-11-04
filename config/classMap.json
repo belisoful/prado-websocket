@@ -30,6 +30,7 @@
 	"TMeshBackplane": "Prado\\IO\\Socket\\WebSocket\\Cluster\\TMeshBackplane",
 	"TRedisBackplane": "Prado\\IO\\Socket\\WebSocket\\Cluster\\TRedisBackplane",
 	"IWebSocketClusterAware": "Prado\\IO\\Socket\\WebSocket\\Cluster\\IWebSocketClusterAware",
+	"IWebSocketBufferedBackplane": "Prado\\IO\\Socket\\WebSocket\\Cluster\\IWebSocketBufferedBackplane",
 	"TWebSocketPubSubHandler": "Prado\\IO\\Socket\\WebSocket\\PubSub\\TWebSocketPubSubHandler",
 	"TWebSocketPubSubEventParameter": "Prado\\IO\\Socket\\WebSocket\\PubSub\\TWebSocketPubSubEventParameter",
 	"TWebSocketPubSubException": "Prado\\IO\\Socket\\WebSocket\\PubSub\\TWebSocketPubSubException",
