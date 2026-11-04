@@ -35,12 +35,17 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  *  - Presence lives in the hash `{prefix}presence` (client id to metadata), seeded into a joining
  *    node in {@see open()} and kept live as changes fan out as presence envelopes.
  *  - Discovery is dynamic: a node refreshes a TTL heartbeat key `{prefix}node:{node}`, and a stale
- *    member of `{prefix}nodes` (its heartbeat expired) is reaped, its clients dropped from every
- *    node's presence mirror.
+ *    member of `{prefix}nodes` (its heartbeat expired) is reaped.  The reaping node sends a
+ *    {@see TWebSocketEnvelope::NODE_DOWN} to every other node, so each drops the dead node's clients
+ *    from its presence mirror.
+ *  - A node whose heartbeat finds it missing from `{prefix}nodes` was reaped while it stalled (or
+ *    Redis lost its data).  It rejoins as on {@see open()}.
  *  - A dropped connection degrades the backplane rather than the serve loop; {@see tick()} retries it
- *    every {@see RECONNECT_INTERVAL} seconds, and a reconnect rebuilds the node's registry entry,
- *    channel interest, and presence from local state, so nothing declared during the outage is lost.
- *    Opening under a node id purges what a previous incarnation of that id left behind.
+ *    every {@see RECONNECT_INTERVAL} seconds.
+ *  - {@see open()}, a reconnect, and a rejoin replace the node's presence: the node purges what it
+ *    (or a previous incarnation of its id) left in Redis, sends a {@see TWebSocketEnvelope::NODE_DOWN}
+ *    about itself, then re-declares its registry entry, channel interest, and current clients.  A
+ *    client that left during an outage is dropped on every node, and one that joined is announced.
  *
  * Requires ext-redis at runtime.  Configure {@see setHost() Host}, {@see setPort() Port}, and
  * optionally {@see setPassword() Password}, {@see setDatabase() Database}, {@see setPrefix() Prefix},
@@ -121,8 +126,9 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 
 	/**
 	 * Connects to Redis, purges what a previous incarnation of this node id left behind, joins the node
-	 * registry, re-declares the local channel interest and presence, and seeds the presence mirror.
-	 * The same sequence serves a reconnect, so state declared while disconnected is not lost.
+	 * registry, replaces the node's presence on the other nodes, re-declares the local channel interest,
+	 * and seeds the presence mirror.  The same sequence serves a reconnect, so the cluster converges on
+	 * the local state, including clients that joined or left while disconnected.
 	 * @throws TConfigurationException When ext-redis is missing or the connection fails.
 	 */
 	public function open(): void
@@ -142,8 +148,7 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 			$this->_redis = $redis;
 			$this->reapNode($this->nodeId(), false);   // a prior incarnation's (or the pre-drop) interest and presence, rebuilt below from local state; the inbox is kept and drained
 			$this->heartbeat(true);   // the first registry write can fail too, so it stays inside the guard
-			$this->resync();
-			$this->seedPresence();
+			$this->rejoin();
 		} catch (TConfigurationException $e) {
 			$this->_redis = null;
 			throw $e;
@@ -209,7 +214,10 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 					}
 				}
 			}
-			$this->heartbeat(false);
+			if ($this->heartbeat(false)) {
+				Prado::log('Redis backplane found node ' . $this->nodeId() . ' missing from the registry (reaped while stalled, or Redis lost its data); rejoining', TLogger::WARNING, static::class);
+				$this->rejoin();
+			}
 			$this->prune();
 		});
 	}
@@ -274,10 +282,34 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	protected function createRedis(): object
 	{
-		if (!class_exists('Redis')) {
+		if (!$this->hasRedisExtension()) {
 			throw new TConfigurationException('websocket_backplane_redis_missing');
 		}
 		return new \Redis();
+	}
+
+	/**
+	 * Indicates whether ext-redis is loaded.  Isolated so a test can take the missing-extension path.
+	 * @return bool Whether the phpredis client class exists.
+	 * @since 1.2.0
+	 */
+	protected function hasRedisExtension(): bool
+	{
+		return class_exists('Redis');
+	}
+
+	/**
+	 * Replaces this node's presence across the cluster and re-seeds the local mirror.  The other nodes
+	 * receive a {@see TWebSocketEnvelope::NODE_DOWN} about this node, which drops every client they hold
+	 * for it, followed by the current local clients.  Each inbox is a FIFO list, so the drop reaches a
+	 * node before the re-announcement.
+	 */
+	private function rejoin(): void
+	{
+		$node = $this->nodeId();
+		$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, $node, '', null, null, ['node' => $node]));
+		$this->resync();
+		$this->seedPresence();
 	}
 
 	/**
@@ -465,20 +497,22 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	/**
 	 * Joins the node registry and refreshes the heartbeat, throttled to a third of the TTL.
 	 * @param bool $force Whether to refresh regardless of the throttle.
+	 * @return bool Whether the node was missing from the registry, as after a peer reaped it.
 	 */
-	private function heartbeat(bool $force): void
+	private function heartbeat(bool $force): bool
 	{
 		if ($this->_redis === null) {
-			return;
+			return false;
 		}
 		$now = $this->getClock()->microtime();
 		if (!$force && ($now - $this->_lastBeat) < ($this->_nodeTtl / 3)) {
-			return;
+			return false;
 		}
 		$this->_lastBeat = $now;
 		$node = $this->nodeId();
-		$this->_redis->sAdd($this->_prefix . 'nodes', $node);
+		$added = $this->_redis->sAdd($this->_prefix . 'nodes', $node);
 		$this->_redis->setex($this->_prefix . 'node:' . $node, $this->_nodeTtl, '1');
+		return is_int($added) && $added > 0;
 	}
 
 	/**
@@ -505,7 +539,8 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 	/**
 	 * Reclaims all state a dead node left behind: its registry membership, its channel interest (so
 	 * publishes stop re-creating its inbox), its inbox list (which has no TTL of its own), and its
-	 * clients' presence entries, which are also dropped from the local presence mirror.  Without this
+	 * clients' presence entries.  The dead node's clients are dropped from the local presence mirror,
+	 * and a {@see TWebSocketEnvelope::NODE_DOWN} tells every other node to drop them too.  Without this
 	 * a node that dies ungracefully leaks unbounded Redis memory and leaves phantom clients advertised
 	 * cluster-wide.
 	 * @param string $node The dead node id.
@@ -535,7 +570,8 @@ class TRedisBackplane extends TComponent implements IWebSocketBackplane
 		}
 		if ($node !== $this->nodeId()) {
 			Prado::log("Redis backplane reaped node {$node}: its heartbeat expired", TLogger::WARNING, static::class);
-			$this->_cluster?->dropNodePresence($node);   // the running nodes forget the dead node's clients too, not only a late joiner
+			$this->_cluster?->dropNodePresence($node);
+			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, $this->nodeId(), '', null, null, ['node' => $node]));   // the dead node is gone from the registry, so no other node's prune finds it
 		}
 	}
 

@@ -34,6 +34,13 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  *    This is the shared registry a late-joining node reads in {@see open()} to converge, while live
  *    changes also flow as presence envelopes through the log.
  *
+ * Each node refreshes its clients' presence files every third of the {@see getPresenceTtl()
+ * PresenceTtl}.  A file left unrefreshed for twice the TTL belonged to a node that crashed: the node
+ * that finds it removes it and logs a presence drop, so every node forgets the client.  A node that
+ * stalled and finds its file removed writes and announces it again.  {@see open()} replaces the
+ * node's presence: it removes what a previous incarnation of the node id left and logs a
+ * {@see TWebSocketEnvelope::NODE_DOWN} about the node before announcing its current clients.
+ *
  * The log grows without bound, so this driver suits development, tests, and small clusters; a
  * high-throughput deployment uses a service-backed driver (Redis).
  *
@@ -69,7 +76,7 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	/** @var int The byte offset read up to in the log. */
 	private int $_offset = 0;
 
-	/** @var array<string, true> The local clients whose presence files this node refreshes. */
+	/** @var array<string, array<string, mixed>> The local clients' presence metadata, keyed by client id; this node refreshes their files. */
 	private array $_localClients = [];
 
 	/** @var int The seconds a presence file may go unrefreshed before it is reaped as a crashed node's. */
@@ -130,7 +137,8 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 
 	/**
 	 * Joins the cluster: creates the directory layout, starts reading the log from its current end
-	 * (so prior traffic is not replayed), and seeds the presence mirror from the registry.
+	 * (so prior traffic is not replayed), replaces this node's presence, and seeds the presence mirror
+	 * from the registry.
 	 * @throws TConfigurationException When the directory is unset or cannot be created.
 	 */
 	public function open(): void
@@ -151,8 +159,33 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			@chmod($log, self::FILE_MODE);   // create the log owner-only, before any node appends to it
 		}
 		$this->_offset = is_file($log) ? (int) filesize($log) : 0;
+		$this->replacePresence();
 		$this->reapStalePresence();   // drop a crashed node's leftover presence before seeding, so it is not replayed
 		$this->seedPresence();
+	}
+
+	/**
+	 * Replaces this node's presence in the registry and on the other nodes.  The presence files a
+	 * previous incarnation of the node id left are removed, a {@see TWebSocketEnvelope::NODE_DOWN} about
+	 * the node is logged so every node drops the clients it holds for it, and the current local clients
+	 * are announced again after it.
+	 */
+	private function replacePresence(): void
+	{
+		$node = $this->_cluster?->getNodeId() ?? '';
+		if ($node === '') {
+			return;
+		}
+		foreach ($this->presenceFiles() as $file) {
+			$meta = json_decode((string) @file_get_contents($file), true);
+			if (is_array($meta) && ($meta['node'] ?? null) === $node && !isset($this->_localClients[rawurldecode(basename($file))])) {
+				@unlink($file);
+			}
+		}
+		$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, $node, '', null, null, ['node' => $node]));
+		foreach ($this->_localClients as $clientId => $meta) {
+			$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, (string) $clientId, $meta));
+		}
 	}
 
 	/**
@@ -251,7 +284,8 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	/**
 	 * Refreshes this node's presence files and reaps stale ones, throttled to a third of the TTL.  A
 	 * live node keeps its clients' files fresh; a file no node has touched within twice the TTL belonged
-	 * to a node that crashed, so it is removed rather than replayed as a phantom client forever.
+	 * to a node that crashed, so it is removed rather than replayed as a phantom client forever.  A
+	 * local client's file that a peer reaped while this node stalled is written and announced again.
 	 */
 	private function presenceHousekeeping(): void
 	{
@@ -260,16 +294,22 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			return;
 		}
 		$this->_lastPresenceBeat = $now;
-		foreach (array_keys($this->_localClients) as $clientId) {
-			@touch($this->presencePath($clientId), $this->getClock()->time());
+		foreach ($this->_localClients as $clientId => $meta) {
+			$path = $this->presencePath((string) $clientId);
+			clearstatcache(true, $path);
+			if (is_file($path) && (int) @filesize($path) > 0) {
+				@touch($path, $this->getClock()->time());
+			} else {
+				$this->putPresence((string) $clientId, $meta);   // reaped while this node stalled: write the file again and re-announce the client
+			}
 		}
 		$this->reapStalePresence();
 	}
 
 	/**
 	 * Removes presence files no node has refreshed within twice the TTL, the residue of a crashed
-	 * node, and drops each reaped client from the local presence mirror, so a running node forgets a
-	 * dead node's clients as a late joiner would.
+	 * node.  Each reaped client is dropped from the local presence mirror and a
+	 * {@see TWebSocketEnvelope::PRESENCE_DROP} is logged, so every node forgets the dead node's clients.
 	 */
 	private function reapStalePresence(): void
 	{
@@ -278,15 +318,22 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		}
 		$cutoff = $this->getClock()->time() - 2 * $this->_presenceTtl;
 		$reaped = [];
-		foreach (glob($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+		foreach ($this->presenceFiles() as $file) {
 			if ((int) @filemtime($file) < $cutoff) {
 				$meta = json_decode((string) @file_get_contents($file), true);
-				$reaped[basename($file)] = is_array($meta) ? (string) ($meta['node'] ?? '') : '';
+				$reaped[$file] = is_array($meta) ? (string) ($meta['node'] ?? '') : '';
 				@unlink($file);
 			}
 		}
-		foreach ($reaped as $clientId => $node) {
-			$this->_cluster?->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $node, '', null, (string) $clientId));
+		$self = $this->_cluster?->getNodeId() ?? '';
+		foreach ($reaped as $file => $node) {
+			clearstatcache(true, $file);
+			if (is_file($file)) {
+				continue;   // the owner wrote it again after a stall; the client is live
+			}
+			$clientId = rawurldecode(basename($file));   // the file name is the URL-encoded client id
+			$this->_cluster?->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $node, '', null, $clientId));
+			$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $self, '', null, $clientId));
 		}
 	}
 
@@ -340,7 +387,8 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		}
 		@file_put_contents($path, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
 		@chmod($path, self::FILE_MODE);   // presence metadata is owner-only, not world-readable
-		$this->_localClients[$clientId] = true;
+		@touch($path, $this->getClock()->time());   // freshness is measured on the backplane's clock
+		$this->_localClients[$clientId] = $meta;
 		$node = $this->_cluster !== null ? $this->_cluster->getNodeId() : (string) ($meta['node'] ?? '');
 		$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, $clientId, $meta));
 	}
@@ -396,7 +444,7 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		if ($this->_cluster === null) {
 			return;
 		}
-		foreach (glob($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+		foreach ($this->presenceFiles() as $file) {
 			$meta = json_decode((string) @file_get_contents($file), true);
 			if (!is_array($meta)) {
 				continue;
@@ -404,6 +452,15 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			$clientId = rawurldecode(basename($file));
 			$this->_cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, (string) ($meta['node'] ?? ''), '', null, $clientId, $meta));
 		}
+	}
+
+	/**
+	 * Returns the paths of the presence files in the registry.
+	 * @return string[] The presence file paths.
+	 */
+	private function presenceFiles(): array
+	{
+		return glob($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR . DIRECTORY_SEPARATOR . '*') ?: [];
 	}
 
 	/**

@@ -44,8 +44,7 @@ interface IWebSocketCluster
 
 	/**
 	 * Drops the presence mirror entries for a node a backplane has declared dead, so a crashed node's
-	 * clients do not linger as phantom presence.  Only remote entries match, since the local node is
-	 * never its own failure detector's target.
+	 * clients do not linger as phantom presence.  A local client is never dropped.
 	 * @param string $node The dead node id.
 	 */
 	public function dropNodePresence(string $node): void;

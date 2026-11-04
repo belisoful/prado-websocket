@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketCluster;
+use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -350,6 +351,27 @@ class TWebSocketClusterTest extends TestCase
 		$this->cluster->subscribe($liveId, 'news');
 		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'nodeB', 'remote', 'news'));
 		self::assertStringContainsString('remote', (string) $sink, 'Inbound delivery is isolated the same way.');
+	}
+
+	public function testNodeDownDropsTheNamedNodesRemoteClients()
+	{
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		[$connection] = $this->makeConnection();
+		$localId = $cluster->register($connection);
+		foreach (['n2-1' => 'n2', 'n2-2' => 'n2', 'n3-1' => 'n3', 'n4-1' => 'n4'] as $clientId => $node) {
+			$cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, $clientId, ['node' => $node]));
+		}
+
+		$cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, 'n3', '', null, null, ['node' => 'n2']));   // n3 reaped n2
+		self::assertEqualsCanonicalizing([$localId, 'n3-1', 'n4-1'], array_keys($cluster->presence()), "The named node's clients are dropped.");
+
+		$cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, 'n4'));   // n4 replaces its own presence
+		self::assertEqualsCanonicalizing([$localId, 'n3-1'], array_keys($cluster->presence()), 'Without a node named, the origin node is dropped.');
+
+		$cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, 'n3', '', null, null, ['node' => 'n1']));
+		self::assertArrayHasKey($localId, $cluster->presence(), 'A node-down naming the local node never drops its clients.');
+		$cluster->dropNodePresence('n1');
+		self::assertArrayHasKey($localId, $cluster->presence(), 'A local client is never dropped as a dead node\'s.');
 	}
 
 	public function testRemotePresenceCannotOverwriteALocalClient()
