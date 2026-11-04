@@ -6,12 +6,12 @@
 - **All Unit Tests**: `vendor/bin/phpunit --testsuite unit` (or `composer unittest`) - runs all unit tests
 - **Test Filter**: `vendor/bin/phpunit --testsuite unit --filter <test function, class, or directory>`
 - **Coverage**: `composer coverage` (text) / `composer coverage-html` (HTML in `build/coverage`); phpunit.xml declares `src/` as the coverage source and the scripts set `XDEBUG_MODE`. Narrow a run with `--filter` and `--coverage-filter`.
-  - **Path/branch coverage, fast**: a full-suite `--path-coverage` run takes about an hour. To get the exact per-class branch and path list that CI reports, pass `--path-coverage` to a run filtered to the relevant test classes, which takes seconds: `composer coverage -- --filter 'TWebSocketFrameCodecTest|TWebSocketMessageTest' --coverage-filter src/IO/Socket/WebSocket/TWebSocketFrameCodec.php --path-coverage`. `--coverage-filter` adds to the `src/` source in phpunit.xml and does not replace it, so every class still gets a row. Read only the rows for the classes under test, and ignore the summary percentages.
+  - **Path/branch coverage, fast**: a full-suite `--path-coverage` run takes about an hour. CI collects no coverage. To get a class's exact branch and path list, pass `--path-coverage` to a run filtered to the relevant test classes, which takes seconds: `composer coverage -- --filter 'TWebSocketFrameCodecTest|TWebSocketMessageTest' --coverage-filter src/IO/Socket/WebSocket/TWebSocketFrameCodec.php --path-coverage`. `--coverage-filter` adds to the `src/` source in phpunit.xml and does not replace it, so every class still gets a row. Read only the rows for the classes under test, and ignore the summary percentages.
 - **Playwright browser-client tests**: `composer functest` (Chromium) / `composer functionaltest` (all browsers); the static page server starts automatically and `tests/playwright/ws-helpers.js` spawns the PHP WebSocket server per spec
 - **Autobahn|TestSuite** (server compliance, needs Docker): see `.github/workflows/autobahn.yml`; `tests/autobahn/echo-server.php` is the testee and `tests/autobahn/check-report.php` gates the report
 
 ### Linting and Code Analysis
-- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); level 3, `phpVersion` range 8.2 – 8.5
+- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); level 4 with `treatPhpDocTypesAsCertain: false` (as PRADO), `phpVersion` range 8.2 – 8.5
 - **PHP CS Fixer (Dry-run)**: `vendor/bin/php-cs-fixer fix --dry-run src/` and `vendor/bin/php-cs-fixer fix --dry-run tests/` (check)
 - **PHP CS Fixer (Fix)**: `vendor/bin/php-cs-fixer fix src/` and `vendor/bin/php-cs-fixer fix tests/` (or `composer fix`); the finder excludes `tests/`, so `src` and `tests` run as two invocations
 
@@ -151,9 +151,10 @@ Docblocks inform and describe; it is not persuasive writing.
 - PHP extensions: ctype, dom, intl, json, pcre, spl (required by PRADO); ffi, openssl (required for HTTP/2); sockets, zlib, redis (optional features)
 - System library: libnghttp2 (HTTP/2, bound via FFI)
 - Composer for dependency management; Node (see `.nvmrc`) or bun for Playwright
-- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.0 and 3.95.27); update them together with PRADO
+- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.3 and 3.95.27); update them together with PRADO
 - Presume that project dependencies are installed
-- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD
+- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD; one unit-test leg (PHP 8.4, `prado-http2 release`) installs the Packagist `belisoful/prado-http2` release that `^1.3` resolves to instead
+- CI runs php-cs-fixer and phpstan from `vendor/bin`, the versions `composer.json` pins
 
 ## Directory Structure
 ```

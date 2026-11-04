@@ -22,7 +22,7 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 ```sh
 php -l <file>                                        # syntax
 composer fix        # php-cs-fixer on src and tests (tabs); or: vendor/bin/php-cs-fixer fix src  (and: fix tests)
-composer stan       # vendor/bin/phpstan analyse --memory-limit=1G  (level 3, PHP 8.2 – 8.5)
+composer stan       # vendor/bin/phpstan analyse --memory-limit=1G  (level 4, PHP 8.2 – 8.5)
 composer unittest   # vendor/bin/phpunit --testsuite unit
 ```
 
