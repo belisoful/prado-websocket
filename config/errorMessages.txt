@@ -2,7 +2,7 @@
 websocket_control_frame_too_long		= WebSocket control frame payload of {0} bytes exceeds the 125-byte limit.
 websocket_control_frame_fragmented		= WebSocket control frame (opcode {0}) must not be fragmented.
 websocket_frame_length_invalid			= WebSocket frame length exceeds the supported range.
-websocket_frame_incomplete				= WebSocket frame truncated: expected {0} bytes, read {1}.
+websocket_frame_incomplete				= WebSocket frame truncated: expected {0, plural, one{# byte} other{# bytes}}, read {1}.
 websocket_send_buffer_overflow			= WebSocket send buffer overflowed {0} bytes: the peer is not reading fast enough.
 websocket_write_failed					= WebSocket write failed: the connection is broken.
 websocket_frame_not_masked				= WebSocket server received an unmasked frame from the client.
@@ -58,7 +58,7 @@ websocket_pubsub_frame_malformed		= A pub/sub frame must be a JSON object with a
 websocket_pubsub_type_unknown			= Unknown pub/sub frame type ''{0}''.
 websocket_pubsub_channel_invalid		= The pub/sub channel name is missing or invalid.
 websocket_pubsub_field_required			= A pub/sub {1} request requires the "{0}" field.
-websocket_pubsub_subscription_limit		= A pub/sub client may hold at most {0} subscriptions.
+websocket_pubsub_subscription_limit		= A pub/sub client may hold at most {0, plural, one{# subscription} other{# subscriptions}}.
 websocket_pubsub_forbidden				= The pub/sub {0} request for ''{1}'' was denied.
 websocket_pubsub_client_unknown			= Pub/sub client ''{0}'' is not connected.
 websocket_pubsub_method_unknown			= No pub/sub method ''{0}'' is available.

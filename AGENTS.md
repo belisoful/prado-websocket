@@ -82,7 +82,9 @@ Docblocks inform and describe; it is not persuasive writing.
 - Throw appropriate PRADO exceptions (`TInvalidDataValueException`, `TInvalidOperationException`, etc.); protocol failures throw `TWebSocketException`
 - Return false or null for methods that are designed to fail gracefully
 - All methods should handle edge cases and validate input parameters
-- Extension Exceptions use error codes (keys) defined in `config/errorMessages.txt`; the message text is purely for user information display only. Every code thrown must exist in that file, and the file should carry no unused codes.
+- Extension Exceptions use error codes (keys) defined in `config/errorMessages.txt`; the message text is purely for user information display only. Every code thrown must exist in that file, and the file should carry no unused codes (`ErrorMessagesFileTest` checks both).
+- Each message is an ICU MessageFormat pattern, as PRADO formats it with `MessageFormatter`. An apostrophe beside a brace quotes it: write a quoted placeholder as `''{0}''` (`'{0}'` renders the literal `{0}`) and a literal brace as `'{'`; an apostrophe elsewhere, as in "can't", is literal. A count that can be 1 uses `{0, plural, one{# item} other{# items}}`.
+- An exception whose message is written for the client or site visitor implements `Prado\Exceptions\IUserException`, as `TWebSocketPubSubException` does.
 
 ### Imports and Includes
 - Use PSR-4 autoloading - no manual includes required

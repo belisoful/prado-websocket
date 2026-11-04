@@ -3,6 +3,7 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket\PubSub;
 
 use PHPUnit\Framework\TestCase;
+use Prado\Exceptions\IUserException;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketClusterAware;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
@@ -350,7 +351,7 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		$this->request($connection, ['type' => 'subscribe', 'id' => '3', 'channel' => 'c']);
 		$reply = $this->replies($stream)[0];
 		self::assertSame(TWebSocketPubSubException::LIMIT, $reply['code']);
-		self::assertStringContainsString('2', $reply['message']);
+		self::assertSame('A pub/sub client may hold at most 2 subscriptions.', $reply['message']);
 		self::assertSame(['a', 'b'], $this->handler->getSubscriptions($connection));
 
 		$this->request($connection, ['type' => 'subscribe', 'id' => '4', 'channel' => 'a']);
@@ -603,6 +604,11 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		$reply = $this->replies($stream)[0];
 		self::assertSame('quota', $reply['code']);
 		self::assertSame('c', $reply['id']);
+	}
+
+	public function testARefusalIsAVisitorFacingException()
+	{
+		self::assertInstanceOf(IUserException::class, new TWebSocketPubSubException('websocket_pubsub_internal_error'), 'Its message is sent to the client.');
 	}
 
 	public function testAnApplicationFailureIsLoggedAndAnsweredInternal()

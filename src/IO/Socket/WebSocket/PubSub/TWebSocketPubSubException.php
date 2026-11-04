@@ -9,6 +9,7 @@
 
 namespace Prado\IO\Socket\WebSocket\PubSub;
 
+use Prado\Exceptions\IUserException;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 
 /**
@@ -16,7 +17,8 @@ use Prado\IO\Socket\WebSocket\TWebSocketException;
  *
  * Rejects one `prado.pubsub.v1` request.  {@see TWebSocketPubSubHandler} answers it with an
  * `error` frame carrying the {@see getReplyCode() ReplyCode} and the exception message; the
- * connection stays open.  An application event handler throws it to refuse a request with its own
+ * connection stays open.  The message is written for the client, so the exception is an
+ * {@see IUserException}.  An application event handler throws it to refuse a request with its own
  * reply code:
  *
  * ```php
@@ -27,7 +29,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketException;
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 1.2.0
  */
-class TWebSocketPubSubException extends TWebSocketException
+class TWebSocketPubSubException extends TWebSocketException implements IUserException
 {
 	/** The frame is malformed or a field is invalid. */
 	public const BAD_REQUEST = 'bad_request';
