@@ -438,6 +438,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			return;
 		}
 		foreach ($messages as $message) {
+			if ($connection->getIsCloseInitiator()) {
+				break;   // the application or server closed the stream: nothing more reaches the handler
+			}
 			$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
 		}
 		if ($connection->getIsClosed()) {

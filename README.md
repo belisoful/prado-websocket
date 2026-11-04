@@ -251,7 +251,7 @@ Backplane choices:
 - **`TNullBackplane`** — single node, no relay (the default).
 - **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it, any other user can access it, or it is a symlink. A crashed node's presence files go stale after `PresenceTtl` and its clients are dropped on every node.
 - **`TRedisBackplane`** — per-node inbox lists plus a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`/`InboxLimit`); the driver for multi-host scaling. Needs `ext-redis`. Redis pub/sub is not used (phpredis subscribe blocks); a node polls its inbox each tick. A dropped connection is retried every 5 s, and a reconnect re-declares the node's channel interest and presence from local state; a node that restarts under the same `NodeId` purges its previous incarnation's leftovers.
-- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. A relay through a third node that holds the secret is not prevented, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL.
+- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. The dialer answers first and the accepting node answers only a verified peer, so a replayed handshake cannot turn one node into a signing oracle for another. Only an address this node dials (a seed, or one a verified peer announced) obtains its answer, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL.
 
 ## Pub/sub for browsers (`prado.pubsub.v1`)
 
@@ -261,7 +261,7 @@ Each message is one JSON object with a `type`. A request with an `id` gets exact
 
 | Client → server | Fields | Server → client | Fields |
 |---|---|---|---|
-| `subscribe` / `unsubscribe` | `channel` | `welcome` | `clientId`, `heartbeat` |
+| `subscribe` / `unsubscribe` | `channel` | `welcome` | `clientId`, `heartbeat`, `maxFrame` |
 | `publish` | `channel`, `data` | `message` | `data`, `channel`?, `from`? |
 | `send` | `to`, `data` | `ack` | `id`, `data`? |
 | `call` | `method`, `params` | `error` | `id`?, `code`, `message` |
@@ -281,9 +281,9 @@ Authorization runs through events, each with a `TWebSocketPubSubEventParameter`:
 - `onSubscribe` → allowed unless a handler calls `setAllowed(false)`.
 - `onPublish` / `onSend` → denied unless `AllowClientPublish` / `AllowClientSend` is set or a handler allows it; a handler may also `setData()`.
 - `onCall` → a handler answers with `setResult()`, or throws a `TWebSocketPubSubException`; an unanswered call is `not_found`.
-- `onOpen` is raised before the `welcome`, so it can authenticate the client (close with 4401 or 4403 to stop the browser from reconnecting) or `subscribe()` it to its own channels.
+- `onOpen` is raised before the `welcome`, so it can authenticate the client (close with 4401 or 4403 to stop the browser from reconnecting) or `subscribe()` it to its own channels. Once a connection is closed this way, nothing the client sends reaches the handler, including requests pipelined behind the handshake.
 
-`MaxSubscriptions` (default 64) bounds each client, and `Heartbeat` (default 25 s; keep it below `IdleTimeout`) sets the client ping interval. Application code reaches clients with `publish()`, `sendTo()` and `broadcast()` on the handler, or with `$module->publish($channel, TWebSocketPubSubHandler::encodeMessage($data, $channel))`. The module gives the handler its cluster; a bare `TWebSocketServer` and the handler share one with `setCluster()`.
+`MaxSubscriptions` (default 64) bounds each client. `MaxFrameSize` (default 65536 bytes) bounds each request: a larger frame is answered `limit` without being decoded, since decoding JSON takes many times a frame's size in memory, and the browser client refuses such a request itself. `Heartbeat` (default 25 s; keep it below `IdleTimeout`) sets the client ping interval. Application code reaches clients with `publish()`, `sendTo()` and `broadcast()` on the handler, or with `$module->publish($channel, TWebSocketPubSubHandler::encodeMessage($data, $channel))`. The module gives the handler its cluster; a bare `TWebSocketServer` and the handler share one with `setCluster()`.
 
 ```php
 $page->getClientScript()->registerScriptFile('prado-pubsub',

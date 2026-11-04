@@ -70,6 +70,9 @@ class TWebSocketConnection extends TComponent
 	/** @var bool Whether a Close frame has been sent. */
 	private bool $_closing = false;
 
+	/** @var bool Whether this side sent the first Close, through {@see close()}, rather than echoing the peer's. */
+	private bool $_closeInitiator = false;
+
 	/** @var bool Whether the connection is closed (Close exchanged or stream ended). */
 	private bool $_closed = false;
 
@@ -191,6 +194,19 @@ class TWebSocketConnection extends TComponent
 	public function getIsClosing(): bool
 	{
 		return $this->_closing;
+	}
+
+	/**
+	 * Returns whether this side began the close handshake with {@see close()}, rather than echoing the
+	 * peer's Close.  A server stops dispatching messages to its handler from then on: what the peer
+	 * sends after an application closed the connection, for example to refuse it in `onOpen`, is
+	 * read and discarded while the server waits for the peer's Close.
+	 * @return bool Whether this side sent the first Close.
+	 * @since 1.2.0
+	 */
+	public function getIsCloseInitiator(): bool
+	{
+		return $this->_closeInitiator;
 	}
 
 	/** @return bool Whether the connection is closed. */
@@ -370,6 +386,7 @@ class TWebSocketConnection extends TComponent
 			return;
 		}
 		$this->_closing = true;
+		$this->_closeInitiator = true;
 		$this->writeAll($this->encodeFrame(TWebSocketFrame::close($code, $reason)));
 	}
 

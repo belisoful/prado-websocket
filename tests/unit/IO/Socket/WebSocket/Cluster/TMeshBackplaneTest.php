@@ -449,6 +449,79 @@ class TMeshBackplaneTest extends TestCase
 		self::assertSame(0, $b->getPeerCount(), 'A peer that fails the challenge is dropped.');
 	}
 
+	public function testAnAcceptedPeerCannotUseOneNodeToAnswerAnothersChallenge()
+	{
+		// An attacker without the secret replays a captured handshake to A and to B, then asks each
+		// node to sign the other's nonce. Neither answers an accepted peer before verifying it.
+		[$a, $spyA] = $this->makeSecretNode('A', 'clustersecret');
+		[$b, $spyB] = $this->makeSecretNode('B', 'clustersecret');
+		$b->putPresence('b-1', ['user' => 'alice']);
+		$attach = function (TMeshBackplane $node): array {
+			[$rawAtk, $rawNode] = TSocketStream::pair();
+			$rawAtk->setBlocking(false);
+			$rawNode->setBlocking(false);
+			$node->addPeer(new TWebSocketConnection($rawNode, false), $rawNode);
+			return [new TWebSocketConnection($rawAtk, true), $rawAtk];
+		};
+		$read = function (TWebSocketConnection $link, TSocketStream $raw): array {
+			$envelopes = [];
+			$bytes = $raw->read(65536);
+			foreach ($bytes === '' ? [] : $link->feed($bytes) as $message) {
+				if (($envelope = TWebSocketEnvelope::decode($message)) !== null) {
+					$envelopes[$envelope->getType()][] = $envelope;
+				}
+			}
+			return $envelopes;
+		};
+		[$linkA, $rawA] = $attach($a);
+		[$linkB, $rawB] = $attach($b);
+		$nonceA = $read($linkA, $rawA)[TWebSocketEnvelope::AUTH_CHALLENGE][0]->getPayload();
+		$nonceB = $read($linkB, $rawB)[TWebSocketEnvelope::AUTH_CHALLENGE][0]->getPayload();
+
+		$linkA->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, 'x', $nonceB))->encode());
+		$linkB->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, 'x', $nonceA))->encode());
+		$a->tick();
+		$b->tick();
+		self::assertArrayNotHasKey(TWebSocketEnvelope::AUTH_RESPONSE, $read($linkA, $rawA), 'A does not sign a nonce for a peer it has not verified.');
+		self::assertArrayNotHasKey(TWebSocketEnvelope::AUTH_RESPONSE, $read($linkB, $rawB), 'B does not sign a nonce for a peer it has not verified.');
+
+		$linkB->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, 'A', 'unsigned'))->encode());
+		$b->tick();
+		self::assertSame(0, $b->getPeerCount(), 'Without a signature to relay, the attacker fails B\'s challenge.');
+		self::assertCount(0, $spyA->received);
+		self::assertCount(0, $spyB->received);
+	}
+
+	public function testAnAcceptedPeersChallengeIsAnsweredOnceItIsVerified()
+	{
+		[$b] = $this->makeSecretNode('B', 'clustersecret');
+		[$rawDialer, $rawB] = TSocketStream::pair();
+		$rawDialer->setBlocking(false);
+		$rawB->setBlocking(false);
+		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);
+		$dialer = new TWebSocketConnection($rawDialer, true);
+		$nonceB = '';
+		foreach ($dialer->feed($rawDialer->read(65536)) as $message) {
+			$nonceB = TWebSocketEnvelope::decode($message)->getPayload();
+		}
+
+		$dialer->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, 'D', 'dialer-nonce'))->encode());
+		$b->tick();
+		self::assertSame('', $rawDialer->read(65536), 'The challenge is held until the dialer is verified.');
+
+		$dialer->send((new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, 'D', $this->answerFor($nonceB, 'D')))->encode());
+		$b->tick();
+		$types = [];
+		foreach ($dialer->feed($rawDialer->read(65536)) as $message) {
+			$envelope = TWebSocketEnvelope::decode($message);
+			$types[] = $envelope->getType();
+			if ($envelope->getType() === TWebSocketEnvelope::AUTH_RESPONSE) {
+				self::assertSame($this->answerFor('dialer-nonce', 'B'), $envelope->getPayload());
+			}
+		}
+		self::assertSame(TWebSocketEnvelope::AUTH_RESPONSE, $types[0] ?? null, 'Once verified, the dialer gets the answer, ahead of any join state.');
+	}
+
 	public function testUnansweredChallengeIsDroppedAfterTheTimeout()
 	{
 		$clock = new TMockClock();

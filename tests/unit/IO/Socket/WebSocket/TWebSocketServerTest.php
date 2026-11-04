@@ -436,6 +436,91 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testAConnectionRefusedInOnOpenDispatchesNoMessage()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$messages = [];
+		$closed = 0;
+		$handler->attachEventHandler('onOpen', function ($conn) {
+			$conn->close(4401, 'unauthenticated');
+		});
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$messages) {
+			$messages[] = $msg->getPayload();
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$pipelined = TWebSocketFrameCodec::encode(new TWebSocketFrame(TWebSocketOpcode::Text, 'pipelined'), random_bytes(4));
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()) . $pipelined);
+		for ($i = 0; $i < 10 && $server->getConnectionCount() === 0; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		$clientWs = new TWebSocketConnection($client, true);
+		$clientWs->send('after the Close');   // a client ignoring the server's Close
+		$clientWs->close(1000);
+		for ($i = 0; $i < 20 && $closed === 0; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+
+		self::assertSame([], $messages, 'A connection the application closed delivers nothing more to the handler.');
+		self::assertSame(1, $closed);
+		$client->close();
+		$server->close();
+	}
+
+	public function testAHandlerClosingMidReadStopsTheRestOfTheRead()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$messages = [];
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$messages) {
+			$messages[] = $msg->getPayload();
+			$conn->close(1008, 'policy');
+		});
+		$server->setHandler($handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		for ($i = 0; $i < 10 && $server->getConnectionCount() === 0; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+		$clientWs = new TWebSocketConnection($client, true);
+		$clientWs->send('first');
+		$clientWs->send('second');
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 50000);
+		}
+
+		self::assertSame(['first'], $messages, 'The message after the handler closed the connection is not dispatched.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testServeConnectionDispatchesNothingAfterTheHandlerCloses()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$handler = new TWebSocketHandler();
+		$messages = [];
+		$handler->attachEventHandler('onOpen', function ($conn) {
+			$conn->close(4403, 'forbidden');
+		});
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$messages) {
+			$messages[] = $msg->getPayload();
+		});
+		$clientWs = new TWebSocketConnection($a, true);
+		$clientWs->send('ignored');
+		$clientWs->close(1000);
+		$handler->handleConnection(new TWebSocketConnection($b, false));
+
+		self::assertSame([], $messages, 'The synchronous loop reads on to the peer\'s Close without dispatching.');
+		$a->close();
+		$b->close();
+	}
+
 	public function testServeOnceEventLoopDispatchesLifecycle()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');

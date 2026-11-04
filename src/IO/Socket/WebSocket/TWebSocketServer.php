@@ -1572,6 +1572,9 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		foreach ($messages as $message) {
+			if ($connection->getIsCloseInitiator()) {
+				break;   // the application or server closed the connection: nothing more reaches the handler
+			}
 			$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
 		}
 		$this->settleHttp1Session($transport, $connection);

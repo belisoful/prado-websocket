@@ -44,7 +44,7 @@ use Prado\Util\Log\TLogger;
  *
  * | Server → client | Fields | When |
  * |---|---|---|
- * | `welcome` | `clientId`, `heartbeat` | After the connection opens. |
+ * | `welcome` | `clientId`, `heartbeat`, `maxFrame` | After the connection opens; `maxFrame` is {@see getMaxFrameSize() MaxFrameSize}. |
  * | `ack` | `id`, `data`? | A request with an `id` succeeded. |
  * | `error` | `id`?, `code`, `message` | A request failed; `code` is a {@see TWebSocketPubSubException} reply code. |
  * | `message` | `data`, `channel`?, `from`? | A channel publish (with `channel`), or a direct send or broadcast (without). |
@@ -53,6 +53,8 @@ use Prado\Util\Log\TLogger;
  * Request handling:
  *  - a connection that did not negotiate {@see SUBPROTOCOL} → closed with 1002 (ProtocolError);
  *  - a Binary message → closed with 1003 (UnsupportedData);
+ *  - a frame over {@see getMaxFrameSize() MaxFrameSize} bytes → `limit`, without an `id`, since the
+ *    frame is refused before it is decoded (the browser client refuses such a request itself);
  *  - a channel outside {@see CHANNEL_PATTERN}, or a malformed frame → `bad_request`;
  *  - a subscribe past {@see getMaxSubscriptions() MaxSubscriptions} → `limit`;
  *  - publish → denied unless {@see getAllowClientPublish() AllowClientPublish} or an `onPublish` handler allows it;
@@ -117,6 +119,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	/** The default client heartbeat interval in seconds. */
 	public const DEFAULT_HEARTBEAT = 25.0;
 
+	/** The default request frame size limit in bytes; JSON decoding takes many times a frame's size in memory. */
+	public const DEFAULT_MAX_FRAME_SIZE = 65536;
+
 	/** The json_encode flags of every outgoing frame. */
 	private const JSON_FLAGS = JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
 
@@ -134,6 +139,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 
 	/** @var float The heartbeat interval announced to clients in seconds; 0 disables it. */
 	private float $_heartbeat = self::DEFAULT_HEARTBEAT;
+
+	/** @var int The request frame size limit in bytes; 0 leaves only the server's MaxMessageSize. */
+	private int $_maxFrameSize = self::DEFAULT_MAX_FRAME_SIZE;
 
 	/** @var array<int, array{id: string, channels: array<string, true>, registered: bool}> The open pub/sub clients, keyed by connection object id. */
 	private array $_clients = [];
@@ -161,12 +169,13 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		}
 		$this->_clients[spl_object_id($connection)] = ['id' => $clientId, 'channels' => [], 'registered' => $registered];
 		parent::onOpen($connection);
-		$this->reply($connection, ['type' => 'welcome', 'clientId' => $clientId, 'heartbeat' => $this->getHeartbeat()]);
+		$this->reply($connection, ['type' => 'welcome', 'clientId' => $clientId, 'heartbeat' => $this->getHeartbeat(), 'maxFrame' => $this->getMaxFrameSize()]);
 	}
 
 	/**
 	 * Decodes and dispatches one request frame, replying `ack` or `error`.  A Binary message closes
-	 * the connection with 1003.  A message on a connection that was not admitted is ignored.
+	 * the connection with 1003.  A message on a connection that was not admitted, or that this side
+	 * has closed (an `onOpen` handler refusing the client), is ignored.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @param string $message The received message payload.
 	 * @param int $opcode The message's opcode (a {@see TWebSocketOpcode} value).
@@ -175,8 +184,8 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
 	{
 		$clientId = $this->getClientId($connection);
-		if ($clientId === null) {
-			return;
+		if ($clientId === null || $connection->getIsCloseInitiator()) {
+			return;   // not admitted, or refused: a connection this side closed runs no further request
 		}
 		if ($opcode !== TWebSocketOpcode::Text) {
 			$connection->close(TWebSocketCloseCode::UnsupportedData, self::SUBPROTOCOL . ' is text-only');
@@ -184,6 +193,12 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		}
 		$id = null;
 		try {
+			$limit = $this->getMaxFrameSize();
+			if ($limit > 0 && strlen($message) > $limit) {
+				// Refused before decoding: json_decode() of a large frame takes tens of times its size in memory.
+				throw (new TWebSocketPubSubException('websocket_pubsub_frame_too_large', strlen($message), $limit))
+					->setReplyCode(TWebSocketPubSubException::LIMIT);
+			}
 			$frame = json_decode($message, true, self::MAX_JSON_DEPTH);
 			if (!is_array($frame)) {
 				throw new TWebSocketPubSubException('websocket_pubsub_frame_malformed', self::MAX_ID_LENGTH);
@@ -708,6 +723,31 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	public function setHeartbeat($value): static
 	{
 		$this->_heartbeat = max(0.0, TPropertyValue::ensureFloat($value));
+		return $this;
+	}
+
+	/**
+	 * Returns the largest request frame, in bytes, the handler decodes.  A larger frame is refused
+	 * with `limit` before it is decoded, since decoding JSON takes many times the frame's size in
+	 * memory; the limit is announced to clients in the `welcome` frame.
+	 * @return int The limit in bytes, or 0 to leave only the server's MaxMessageSize.
+	 *   Default {@see DEFAULT_MAX_FRAME_SIZE}.
+	 */
+	public function getMaxFrameSize(): int
+	{
+		return $this->_maxFrameSize;
+	}
+
+	/**
+	 * Sets the largest request frame, in bytes, the handler decodes.  Raising it raises the memory a
+	 * single request can take while it is decoded; 0 leaves only the server's MaxMessageSize, which
+	 * is meant for messages, not for JSON decoding.  Negative values are treated as 0.
+	 * @param int|string $value The limit in bytes, or 0 for none.
+	 * @return static The current handler.
+	 */
+	public function setMaxFrameSize($value): static
+	{
+		$this->_maxFrameSize = max(0, TPropertyValue::ensureInteger($value));
 		return $this;
 	}
 }

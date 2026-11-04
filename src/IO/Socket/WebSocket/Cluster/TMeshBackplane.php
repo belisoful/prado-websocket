@@ -46,12 +46,15 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
  * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
  * ({@see addPeer()}) in which each side signs the other's nonce together with its own node id and
- * shows no state until it has verified the peer.  So a captured handshake cannot be replayed onto the
- * mesh, a challenge cannot be reflected back at its issuer, and a node a peer dials cannot harvest
- * that node's presence or advertised URI without the secret.  The secret never crosses the wire.
- * A relay through a third node that holds the secret is not prevented by the challenge; use a
- * `tls://` transport on any untrusted network.  The secret is required: {@see open()} refuses to
- * start without one, since no peer could ever join.
+ * shows no state until it has verified the peer.  The dialing side answers first: the accepting side
+ * holds the dialer's challenge until it has verified the dialer's answer.  So an accepted link can
+ * never obtain a signature, and a peer that replays a captured handshake to two nodes cannot use one
+ * as a signing oracle to pass the other's challenge.  A challenge cannot be reflected back at its
+ * issuer, and a node a peer dials cannot harvest that node's presence or advertised URI without the
+ * secret.  The secret never crosses the wire.  Only an endpoint this node chose to dial (a seed, or
+ * a URI announced by a verified peer) obtains its answer, so use a `tls://` transport on any
+ * untrusted network, where an address can be taken over.  The secret is required: {@see open()}
+ * refuses to start without one, since no peer could ever join.
  *
  * Liveness is tracked per node from the traffic it originates.  A node unheard for the
  * {@see getNodeTtl() TTL} is declared down: its clients leave the presence mirror and any direct link
@@ -73,7 +76,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
-	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, authDeadline: float, nodeId: string}> The peer links, keyed by link object id; `nodeId` is the peer's node id once it has proven the secret, '' before. */
+	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, heldNonce: string, authDeadline: float, nodeId: string}> The peer links, keyed by link object id; `nodeId` is the peer's node id once it has proven the secret, '' before; `heldNonce` is an accepted peer's challenge, answered once it is verified. */
 	private array $_peers = [];
 
 	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id. */
@@ -363,11 +366,13 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 * Adds an established peer link and, on a secret-gated mesh, begins mutually authenticating it.
 	 * A known remote URI is recorded so the same peer is never linked twice.
 	 *
-	 * Authentication is symmetric: this node challenges the peer with a fresh nonce and withholds its
+	 * Authentication is mutual: this node challenges the peer with a fresh nonce and withholds its
 	 * join state — and every other cluster message — until it has verified the peer's answer.  Because
 	 * both a dialed and an accepted peer are challenged this way, and the dialer no longer trusts an
 	 * endpoint merely because it dialed it, a node a peer dials cannot harvest that node's presence or
-	 * advertised URI without proving the secret.
+	 * advertised URI without proving the secret.  The answers are ordered: the dialer answers at once,
+	 * and an accepted peer's challenge is answered only after that peer is verified
+	 * ({@see answerChallenge()}).
 	 * @param TWebSocketConnection $link The peer connection.
 	 * @param TSocketStream $transport The connection's transport, for the event loop.
 	 * @param string $uri The remote's URI when known (a dialed peer), or '' for an accepted peer.
@@ -375,7 +380,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	public function addPeer(TWebSocketConnection $link, TSocketStream $transport, string $uri = ''): void
 	{
 		$peerId = spl_object_id($link);
-		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'authDeadline' => 0.0, 'nodeId' => ''];
+		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'heldNonce' => '', 'authDeadline' => 0.0, 'nodeId' => ''];
 		if ($uri !== '') {
 			$this->_connectedUris[$uri] = true;
 			$this->_knownUris[$uri] = true;
@@ -427,6 +432,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 	 * proves this node knows the secret; it grants no trust and releases no state, which happens in
 	 * {@see verifyChallenge()} when this node has verified the peer's answer to its own nonce.
 	 *
+	 * The dialing side answers at once.  The accepting side holds an unverified peer's challenge and
+	 * answers it from {@see verifyChallenge()}, once the peer has proven the secret.  Otherwise any
+	 * accepted link, such as a replayed handshake, could have this node sign a nonce another node
+	 * issued, and present the signature to that node as this node's answer.
+	 *
 	 * A challenge that repeats a nonce this node itself issued is a reflection: the peer is trying to
 	 * have this node sign its own challenge and hand the answer back.  Such a peer is dropped.  The
 	 * node id in the answer closes the same hole structurally, since {@see verifyChallenge()} refuses
@@ -446,6 +456,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			}
 		}
 		$link = $this->_peers[$peerId]['link'];
+		if (!$link->getIsClient() && !$this->_peers[$peerId]['verified']) {
+			$this->_peers[$peerId]['heldNonce'] = $nonce;   // an accepted peer proves the secret first; verifyChallenge() answers
+			return;
+		}
 		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_RESPONSE, $this->nodeId(), $this->challengeAnswer($nonce, $this->nodeId())));
 	}
 
@@ -474,6 +488,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBackplane, IWebSock
 			$this->_peers[$peerId]['authDeadline'] = 0.0;
 			$this->_peers[$peerId]['nodeId'] = $answerer;
 			$this->_nodeSeen[$answerer] = $this->getClock()->microtime();   // answering the challenge is proof of life, before its first heartbeat
+			$held = $this->_peers[$peerId]['heldNonce'];
+			if ($held !== '') {
+				$this->_peers[$peerId]['heldNonce'] = '';
+				$this->answerChallenge($peerId, $held);   // the accepted peer is verified: answer its challenge, ahead of the join state
+			}
 			$this->sendJoinState($this->_peers[$peerId]['link']);
 		} else {
 			$this->dropPeer($peerId, 'it failed the challenge');   // not a legitimate peer

@@ -41,6 +41,9 @@ trait TWebSocketHandlerTrait
 		$this->onOpen($connection);
 		try {
 			while (($message = $connection->receiveMessage()) !== null) {
+				if ($connection->getIsCloseInitiator()) {
+					continue;   // this side closed the connection: read on for the peer's Close, dispatching nothing
+				}
 				$this->onMessage($connection, $message->getPayload(), $message->getOpcode());
 			}
 		} catch (\Throwable $e) {

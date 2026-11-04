@@ -20,7 +20,9 @@
  *
  * Events: open({clientId}), close({code, reason, willReconnect}), message(data, frame), error(PubSubError).
  * Requests reject with a PubSubError whose `code` is the server's reply code, or one of the
- * client codes: timeout, disconnected, closed, queue_full.
+ * client codes: timeout, disconnected, closed, queue_full.  A request larger than the server's
+ * frame limit (the welcome's maxFrame) rejects with `limit`, and one JSON cannot serialize (a
+ * BigInt or a cycle) with `bad_request`, without being sent.
  *
  * The client reconnects with exponential backoff and full jitter, re-subscribes its channels,
  * holds requests made while offline (up to maxQueue), and pings at the server's heartbeat
@@ -94,6 +96,8 @@
 			this._reconnectTimer = null;
 			this._heartbeatTimer = null;
 			this._lastSeen = 0;
+			this._maxFrame = 0;
+			this._encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
 			this._closedByUser = false;
 			this._fatal = null;
 			this._onOnline = () => {
@@ -328,14 +332,38 @@
 		}
 
 		_transmit(frame) {
-			this._ws.send(JSON.stringify(frame));
 			const p = frame.id !== undefined ? this._pending.get(frame.id) : null;
+			let text;
+			try {
+				text = JSON.stringify(frame);
+			} catch (e) {
+				this._refuse(frame, p, new PubSubError('bad_request', 'the request cannot be serialized: ' + e.message));
+				return;
+			}
+			const max = this._maxFrame;
+			if (max > 0 && text.length > max / 3) {
+				const bytes = this._encoder ? this._encoder.encode(text).length : text.length;
+				if (bytes > max) {
+					this._refuse(frame, p, new PubSubError('limit', 'the request is ' + bytes + ' bytes; the server accepts at most ' + max));
+					return;
+				}
+			}
+			this._ws.send(text);
 			if (p) {
 				p.sent = true;
 				p.timer = setTimeout(() => {
 					this._pending.delete(frame.id);
 					p.reject(new PubSubError('timeout', 'no reply within ' + this.options.requestTimeout + ' ms'));
 				}, this.options.requestTimeout);
+			}
+		}
+
+		_refuse(frame, p, error) {
+			if (p) {
+				this._pending.delete(frame.id);
+				p.reject(error);
+			} else {
+				this._emit('error', error);
 			}
 		}
 
@@ -364,6 +392,7 @@
 			switch (msg.type) {
 				case 'welcome':
 					this.clientId = msg.clientId;
+					this._maxFrame = Number(msg.maxFrame) || 0;
 					this._attempt = 0;
 					this._startHeartbeat(msg.heartbeat);
 					this._emit('open', { clientId: msg.clientId });

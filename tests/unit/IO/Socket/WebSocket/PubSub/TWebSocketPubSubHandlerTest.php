@@ -130,7 +130,53 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame('welcome', $welcome[0]['type']);
 		self::assertSame($clientId, $welcome[0]['clientId']);
 		self::assertEquals(10, $welcome[0]['heartbeat']);
+		self::assertSame(TWebSocketPubSubHandler::DEFAULT_MAX_FRAME_SIZE, $welcome[0]['maxFrame'], 'The welcome announces the frame limit.');
 		self::assertSame([], $this->handler->getSubscriptions($connection));
+	}
+
+	public function testAFrameOverMaxFrameSizeIsRefusedBeforeItIsDecoded()
+	{
+		$this->handler->setAllowClientPublish(true);
+		$this->handler->setMaxFrameSize(1024);
+		[$connection, $stream] = $this->openClient();
+		$calls = 0;
+		$this->handler->attachEventHandler('onPublish', function () use (&$calls) {
+			$calls++;
+		});
+		$frame = json_encode(['type' => 'publish', 'id' => 'big', 'channel' => 'news', 'data' => str_repeat('x', 1100)]);
+		$this->request($connection, $frame);
+		$reply = $this->replies($stream);
+		self::assertCount(1, $reply);
+		self::assertSame(['type' => 'error', 'code' => TWebSocketPubSubException::LIMIT, 'message' => 'A pub/sub frame of ' . number_format(strlen($frame)) . ' bytes exceeds the 1,024-byte limit.'], $reply[0], 'The refusal carries no id: the frame is never decoded.');
+		self::assertSame(0, $calls, 'An oversized request runs nothing.');
+		self::assertFalse($connection->getIsClosing(), 'The connection stays open.');
+
+		$this->request($connection, ['type' => 'publish', 'id' => 'small', 'channel' => 'news', 'data' => 'ok']);
+		self::assertSame(1, $calls, 'A frame within the limit is served.');
+	}
+
+	public function testMaxFrameSizeZeroDecodesUpToTheServerLimit()
+	{
+		self::assertSame(TWebSocketPubSubHandler::DEFAULT_MAX_FRAME_SIZE, $this->handler->getMaxFrameSize());
+		$this->handler->setMaxFrameSize('-5');
+		self::assertSame(0, $this->handler->getMaxFrameSize(), 'A negative limit is treated as 0.');
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, ['type' => 'call', 'id' => 'c', 'method' => 'none', 'params' => str_repeat('x', 100000)]);
+		self::assertSame(TWebSocketPubSubException::NOT_FOUND, $this->replies($stream)[0]['code'], 'With no handler limit the frame is decoded and dispatched.');
+	}
+
+	public function testARequestOnAConnectionThisSideClosedIsIgnored()
+	{
+		[$connection, $stream] = $this->openClient();
+		$calls = 0;
+		$this->handler->attachEventHandler('onCall', function () use (&$calls) {
+			$calls++;
+		});
+		$connection->close(4401, 'unauthenticated');
+		$stream->reset();
+		$this->request($connection, ['type' => 'call', 'id' => 'c', 'method' => 'secret']);
+		self::assertSame(0, $calls, 'A refused client runs no request.');
+		self::assertSame([], $this->replies($stream));
 	}
 
 	public function testAConnectionTheServerRegisteredKeepsItsIdAndStaysRegisteredOnClose()
