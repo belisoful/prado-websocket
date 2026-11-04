@@ -22,9 +22,56 @@ class ChunkProbeDeflateExtension extends TPermessageDeflateExtension
 	}
 }
 
+/** Reports zlib as missing, which the loaded extension cannot be made to do. */
+class NoZlibDeflateExtension extends TPermessageDeflateExtension
+{
+	public static function isAvailable(): bool
+	{
+		return false;
+	}
+}
+
+/** Reports zlib as missing to the negotiator. */
+class NoZlibDeflateNegotiator extends TPermessageDeflateNegotiator
+{
+	public static function isAvailable(): bool
+	{
+		return false;
+	}
+}
+
 class TPermessageDeflateTest extends TestCase
 {
 	private const REPEATED = 'permessage-deflate permessage-deflate permessage-deflate permessage-deflate';
+
+	// ---- zlib availability ----------------------------------------------------
+
+	public function testIsAvailableReflectsTheZlibExtension()
+	{
+		self::assertSame(extension_loaded('zlib'), TPermessageDeflateExtension::isAvailable());
+		self::assertSame(extension_loaded('zlib'), TPermessageDeflateNegotiator::isAvailable());
+	}
+
+	public function testExtensionWithoutZlibIsRefusedWhenConstructed()
+	{
+		try {
+			new NoZlibDeflateExtension();
+			self::fail('An extension without zlib must be refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_permessage_deflate_zlib_missing', $e->getErrorCode());
+			self::assertStringContainsString('ext-zlib', $e->getMessage());
+		}
+	}
+
+	public function testNegotiatorWithoutZlibIsRefusedWhenConfigured()
+	{
+		try {
+			new NoZlibDeflateNegotiator();
+			self::fail('A negotiator without zlib must be refused at configuration time.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_permessage_deflate_zlib_missing', $e->getErrorCode());
+		}
+	}
 
 	// ---- Extension: identity --------------------------------------------------
 

@@ -169,7 +169,7 @@ class TWebSocketFrame extends TComponent
 		if ($this->_opcode !== TWebSocketOpcode::Close || strlen($this->_payload) < 2) {
 			return null;
 		}
-		return unpack('n', substr($this->_payload, 0, 2))[1];
+		return (ord($this->_payload[0]) << 8) | ord($this->_payload[1]);
 	}
 
 	/**

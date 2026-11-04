@@ -47,6 +47,9 @@ use Prado\TComponent;
  * The receive side always inflates with the maximum window, so a peer's `*_max_window_bits`
  * constrains only the matching send side.
  *
+ * Compression needs the zlib extension.  Without it the constructor throws, so a server or client
+ * configured for compression fails at configuration time; {@see isAvailable()} checks first.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc7692.html#section-7.1
  */
@@ -92,16 +95,30 @@ class TPermessageDeflateNegotiator extends TComponent implements IWebSocketExten
 	 * @param ?int $serverMaxWindowBits The server's DEFLATE window limit (9-15), or null for the maximum.
 	 * @param ?int $clientMaxWindowBits The client's DEFLATE window limit (9-15), or null for the maximum.
 	 * @param int $level The DEFLATE compression level (-1 for the zlib default, 0-9 otherwise).
+	 * @throws TWebSocketException When the zlib extension is not loaded.
 	 * @throws \Prado\Exceptions\TInvalidDataValueException When the level is not -1 or 0-9.
 	 */
 	public function __construct(bool $serverNoContextTakeover = false, bool $clientNoContextTakeover = false, ?int $serverMaxWindowBits = null, ?int $clientMaxWindowBits = null, int $level = -1)
 	{
+		if (!static::isAvailable()) {
+			throw new TWebSocketException('websocket_permessage_deflate_zlib_missing');
+		}
 		$this->_serverNoContextTakeover = $serverNoContextTakeover;
 		$this->_clientNoContextTakeover = $clientNoContextTakeover;
 		$this->_serverMaxWindowBits = $serverMaxWindowBits === null ? null : $this->clampWindowBits($serverMaxWindowBits);
 		$this->_clientMaxWindowBits = $clientMaxWindowBits === null ? null : $this->clampWindowBits($clientMaxWindowBits);
 		$this->_level = TPermessageDeflateExtension::ensureLevel($level);
 		parent::__construct();
+	}
+
+	/**
+	 * Returns whether the zlib extension, which permessage-deflate compresses with, is loaded.
+	 * @return bool Whether this negotiator can be constructed.
+	 * @since 1.2.0
+	 */
+	public static function isAvailable(): bool
+	{
+		return TPermessageDeflateExtension::isAvailable();
 	}
 
 	/**

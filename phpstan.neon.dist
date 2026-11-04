@@ -2,7 +2,8 @@ parameters:
     phpVersion:
         min: 80200
         max: 80500
-    level: 3
+    level: 4
+    treatPhpDocTypesAsCertain: false
     bootstrapFiles:
         - tests/test_tools/phpstan-bootstrap.php
     paths:
