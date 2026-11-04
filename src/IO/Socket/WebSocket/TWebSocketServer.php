@@ -154,6 +154,14 @@ class TWebSocketServer extends TSocketServer
 	public const HTTP2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 	/**
+	 * The bytes of HTTP/2 output queued on a transport above which the server pulls no more from the
+	 * session, so a peer that stops reading holds the output in its streams, where
+	 * MaxSendBufferBytes bounds it, rather than in an unbounded transport buffer.
+	 * @since 1.2.0
+	 */
+	public const HTTP2_OUTPUT_HIGH_WATER = 65536;
+
+	/**
 	 * Binds a listening server.  A `tls://` (or `ssl://`, `tlsv1.x://`) URI binds a plain TCP
 	 * listener marked {@see getIsSecure() secure}: each accepted transport inherits the context's
 	 * `ssl` options (`local_cert`, `alpn_protocols`, ...) and runs its TLS handshake non-blocking in
@@ -329,8 +337,9 @@ class TWebSocketServer extends TSocketServer
 	/**
 	 * Sets the seconds a peer has to complete the opening handshake.  A pending connection past this
 	 * deadline is dropped by {@see reapStaleHandshakes()}, so a silent or dribbling peer (slow-loris)
-	 * holds only its own socket, never the serve loop, and for no longer than this.  Default 10; 0
-	 * disables the bound (unsafe on a public listener).
+	 * holds only its own socket, never the serve loop, and for no longer than this.  An HTTP/2
+	 * transport is pending until its first WebSocket stream opens, so a peer that sends only the
+	 * preface is bounded too.  Default 10; 0 disables the bound (unsafe on a public listener).
 	 * @param float|int|string $value The handshake timeout in seconds.
 	 */
 	public function setHandshakeTimeout($value): void
@@ -351,7 +360,9 @@ class TWebSocketServer extends TSocketServer
 	 * Sets the maximum concurrent connections.  The bound applies to {@see getLoad() the load}: every
 	 * live transport (a client session, a pending handshake, an app-held link, and a connection an
 	 * {@see IWebSocketEndpoint} took over) plus every WebSocket stream multiplexed on an HTTP/2
-	 * transport.  A further connection is accepted, answered with a 503, and closed.  Admission
+	 * transport.  A further connection is accepted, answered with a 503, and closed; a further HTTP/2
+	 * stream is refused with 503, and each HTTP/2 session advertises the limit as
+	 * SETTINGS_MAX_CONCURRENT_STREAMS.  Admission
 	 * control at the edge (a proxy, or the OS `ulimit`) is still recommended for load shedding.
 	 * @param int|string $value The maximum, or 0 for unlimited.
 	 */
@@ -388,8 +399,9 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Sets the seconds a closing HTTP/1.1 session waits for the peer's Close (or for its own Close
-	 * frame to drain to a peer that stopped reading) before the server ends it.  A closing session is
-	 * not pinged by the idle reaper.  Default 5; 0 disables the bound.
+	 * frame to drain to a peer that stopped reading) before the server ends it.  A closing HTTP/2
+	 * stream is reset after the same time; its transport stays.  A closing session is not pinged by
+	 * the idle reaper.  Default 5; 0 disables the bound.
 	 * @param float|int|string $value The close timeout in seconds.
 	 */
 	public function setCloseTimeout($value): void
@@ -409,7 +421,9 @@ class TWebSocketServer extends TSocketServer
 	/**
 	 * Sets the seconds a session may be idle before the server pings it and, if the ping goes
 	 * unanswered for as long again, closes it — reclaiming a half-open connection whose peer vanished
-	 * without a Close.  A client that answers pings (or sends any frame) stays connected.  0 disables.
+	 * without a Close.  A client that answers pings (or sends any frame) stays connected.  An HTTP/2
+	 * transport is sent an HTTP/2 PING the same way, and one that carries no WebSocket stream is
+	 * ended once idle this long.  0 disables.
 	 * @param float|int|string $value The idle timeout in seconds.
 	 */
 	public function setIdleTimeout($value): void
@@ -914,9 +928,13 @@ class TWebSocketServer extends TSocketServer
 		$now = $this->getClock()->microtime();
 		foreach ($this->_sessions as $id => $session) {
 			if (isset($session['deadline']) && $now >= $session['deadline']) {
-				$this->forgetSession($session['transport']);
 				$this->log('Handshake deadline passed; the pending connection is dropped.', TLogger::NOTICE);
-				$session['transport']->close();
+				if (isset($session['protocol'])) {
+					$this->endHttp2Session($session['transport']);   // an HTTP/2 session that opened no WebSocket stream in time
+				} else {
+					$this->forgetSession($session['transport']);
+					$session['transport']->close();
+				}
 			} else {
 				$this->armSessionTimers($id);
 			}
@@ -939,6 +957,10 @@ class TWebSocketServer extends TSocketServer
 		foreach (array_column($this->_sessions, 'transport') as $transport) {
 			$id = spl_object_id($transport);
 			$session = $this->_sessions[$id] ?? null;
+			if ($session !== null && isset($session['protocol'])) {
+				$this->reapClosingHttp2Streams($transport, $session, $now);
+				continue;
+			}
 			if ($session === null || !isset($session['connection'])) {
 				continue;
 			}
@@ -975,8 +997,12 @@ class TWebSocketServer extends TSocketServer
 		foreach (array_column($this->_sessions, 'transport') as $transport) {
 			$id = spl_object_id($transport);
 			$session = $this->_sessions[$id] ?? null;
+			if ($session !== null && isset($session['protocol'])) {
+				$this->reapIdleHttp2Session($transport, $session, $now);
+				continue;
+			}
 			if ($session === null || !isset($session['connection'])) {
-				continue;   // HTTP/2 sessions carry their own keepalive through nghttp2 PING
+				continue;
 			}
 			$connection = $session['connection'];
 			if ($connection->getIsClosing() || $connection->getIsClosed()) {
@@ -1004,6 +1030,86 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Applies {@see getCloseTimeout() CloseTimeout} to the WebSocket streams of one HTTP/2 session: a
+	 * stream whose close handshake has not completed within the timeout is reset and closed.  The
+	 * session's `closing` deadline is the earliest pending one, so its timer runs this scan again.
+	 * @param TSocketStream $transport The session transport.
+	 * @param array<string, mixed> $session The session record.
+	 * @param float $now The current time on the server's clock.
+	 */
+	private function reapClosingHttp2Streams(TSocketStream $transport, array $session, float $now): void
+	{
+		$id = spl_object_id($transport);
+		$protocol = $session['protocol'];
+		$deadlines = $session['streamClosing'] ?? [];
+		$pending = [];
+		foreach ($protocol->getConnections() as $connection) {
+			if (!$connection->getIsClosing() && !$connection->getIsClosed()) {
+				continue;
+			}
+			$key = spl_object_id($connection);
+			$deadline = $deadlines[$key] ?? $now + $this->_closeTimeout;
+			if ($now >= $deadline) {
+				$this->log('Close deadline passed; the HTTP/2 stream is reset without the peer\'s Close.', TLogger::NOTICE);
+				try {
+					$protocol->endConnection($connection);
+				} catch (\Throwable $e) {
+					$this->log('HTTP/2 stream close failed: ' . $e->getMessage());
+				}
+				continue;
+			}
+			$pending[$key] = $deadline;
+		}
+		if (!isset($this->_sessions[$id])) {
+			return;
+		}
+		$this->_sessions[$id]['streamClosing'] = $pending;
+		if ($pending === []) {
+			unset($this->_sessions[$id]['closing']);
+			return;
+		}
+		$this->_sessions[$id]['closing'] = min($pending);
+		$this->armSessionTimers($id);
+	}
+
+	/**
+	 * Applies {@see getIdleTimeout() IdleTimeout} to one HTTP/2 session.  A session that carries no
+	 * WebSocket stream and has been quiet for the timeout is ended.  One with streams is sent an
+	 * HTTP/2 PING, and is ended when the timeout passes again with nothing received, the PING's
+	 * acknowledgement included.
+	 * @param TSocketStream $transport The session transport.
+	 * @param array<string, mixed> $session The session record.
+	 * @param float $now The current time on the server's clock.
+	 */
+	private function reapIdleHttp2Session(TSocketStream $transport, array $session, float $now): void
+	{
+		if ($now - ($session['active'] ?? $now) < $this->_idleTimeout) {
+			return;
+		}
+		$protocol = $session['protocol'];
+		try {
+			if ($protocol->getConnections() === []) {
+				$this->log('Idle HTTP/2 session ended: it carries no WebSocket stream.', TLogger::NOTICE);
+				$this->endHttp2Session($transport);
+				return;
+			}
+			if (($session['pinged'] ?? 0.0) > 0.0) {
+				if (($now - $session['pinged']) >= $this->_idleTimeout) {
+					$this->log('Idle HTTP/2 session reaped: the PING went unanswered.', TLogger::NOTICE);
+					$this->endHttp2Session($transport);
+				}
+				return;
+			}
+			$protocol->getSession()->ping();
+			$this->_sessions[spl_object_id($transport)]['pinged'] = $now;
+			$this->queueHttp2Output($transport, $protocol->send());
+		} catch (\Throwable $e) {
+			$this->log('Idle HTTP/2 session dropped: ' . $e->getMessage());
+			$this->dropSession($transport);
+		}
+	}
+
+	/**
 	 * Pulls each HTTP/2 session's pending protocol output and queues it, so bytes produced outside a
 	 * read pump (a cluster broadcast, or any out-of-band send between reads) reach the wire this loop
 	 * rather than waiting for the session's next inbound frame.  An HTTP/1.1 connection needs no such
@@ -1015,6 +1121,9 @@ class TWebSocketServer extends TSocketServer
 			$session = $this->_sessions[spl_object_id($transport)] ?? null;
 			if ($session === null || !isset($session['protocol'])) {
 				continue;
+			}
+			if (strlen($session['outbound'] ?? '') >= self::HTTP2_OUTPUT_HIGH_WATER) {
+				continue;   // the peer is not reading: leave the output in its streams, where MaxSendBufferBytes bounds it
 			}
 			try {
 				$this->queueHttp2Output($transport, $session['protocol']->send());
@@ -1068,10 +1177,15 @@ class TWebSocketServer extends TSocketServer
 		$secure = $this->needsCryptoHandshake($transport);
 		if ($this->_maxConnections > 0 && $this->getLoad() > $this->_maxConnections) {
 			$this->log('At capacity (' . $this->_maxConnections . '): a new connection is shed with 503.', TLogger::NOTICE);
-			if (!$secure) {
-				$transport->write(TWebSocketHandshake::buildRejection(503, 'Service Unavailable'));
+			try {
+				if (!$secure) {
+					$transport->write(TWebSocketHandshake::buildRejection(503, 'Service Unavailable'));
+				}
+			} catch (\Throwable $e) {
+				// The peer reset before the 503 could be written; it is shed all the same.
+			} finally {
+				$transport->close();   // always: a shed transport left open would count toward the load for good
 			}
-			$transport->close();
 			return;
 		}
 		// accept() hands back a blocking socket on Linux and inherits the listener's non-blocking mode
@@ -1326,13 +1440,40 @@ class TWebSocketServer extends TSocketServer
 		$protocol->setExtensions($this->_extensions);
 		$protocol->setMaxMessageSize($this->_maxMessageSize);
 		$protocol->setMaxSendBufferBytes($this->_maxSendBufferBytes);
+		$protocol->setMaxConcurrentStreams($this->_maxConnections);
+		$protocol->setAdmission(fn () => $this->_maxConnections <= 0 || $this->getLoad() < $this->_maxConnections);   // each stream counts toward MaxConnections
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
+		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->settleHttp2Handshake($transport));
 		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
-		$this->trackSession($transport, ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '']);
+		$session = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '', 'active' => $this->getClock()->microtime()];
+		if ($this->_handshakeTimeout > 0) {
+			$session['deadline'] = $session['active'] + $this->_handshakeTimeout;   // until its first WebSocket stream opens
+		}
+		$this->trackSession($transport, $session);
 		$this->queueHttp2Output($transport, $protocol->send());   // the initial SETTINGS, queued and drained non-blocking
 		if ($initial !== '') {
 			$this->feedHttp2Session($transport, $protocol, $initial);
+		}
+	}
+
+	/**
+	 * Clears an HTTP/2 session's handshake deadline once its first WebSocket stream opens.  Until then
+	 * the session is a pending handshake: a peer that sends only the preface, or opens no stream, is
+	 * dropped at {@see getHandshakeTimeout() HandshakeTimeout} like an HTTP/1.1 peer that never
+	 * completes its request.
+	 * @param TSocketStream $transport The session transport.
+	 */
+	private function settleHttp2Handshake(TSocketStream $transport): void
+	{
+		$id = spl_object_id($transport);
+		if (!isset($this->_sessions[$id]['deadline'])) {
+			return;
+		}
+		unset($this->_sessions[$id]['deadline']);
+		if (isset($this->_sessions[$id]['timer'])) {
+			$this->getReactor()->cancel($this->_sessions[$id]['timer']);
+			unset($this->_sessions[$id]['timer']);
 		}
 	}
 
@@ -1619,6 +1760,11 @@ class TWebSocketServer extends TSocketServer
 			$this->endHttp2Session($transport);
 			return;
 		}
+		if ($bytes !== '') {
+			$id = spl_object_id($transport);
+			$this->_sessions[$id]['active'] = $this->getClock()->microtime();   // any inbound frame (a PING ACK included) keeps the session alive
+			unset($this->_sessions[$id]['pinged']);
+		}
 		$this->feedHttp2Session($transport, $protocol, $bytes);
 	}
 
@@ -1635,7 +1781,8 @@ class TWebSocketServer extends TSocketServer
 			if ($bytes !== '') {
 				$protocol->receive($bytes);
 			}
-			$output = $protocol->send();
+			$id = spl_object_id($transport);
+			$output = strlen($this->_sessions[$id]['outbound'] ?? '') >= self::HTTP2_OUTPUT_HIGH_WATER ? '' : $protocol->send();   // see flushHttp2Output()
 		} catch (THttp2Exception | TWebSocketException $e) {
 			$this->log('HTTP/2 session ended on a session error: ' . $e->getMessage(), TLogger::NOTICE);
 			$this->endHttp2Session($transport);

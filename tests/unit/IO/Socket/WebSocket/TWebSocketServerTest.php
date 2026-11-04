@@ -411,6 +411,201 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	/**
+	 * Opens an HTTP/2 client transport to a server and submits its preface and SETTINGS.
+	 * @param TWebSocketServer $server The server.
+	 * @param array<int, int> $settings The client's SETTINGS.
+	 * @param int $streams The WebSocket streams to request.
+	 * @return array{0: TSocketStream, 1: TH2Session, 2: \Prado\IO\Http2\TH2Stream[]} The socket, the client session, and its streams.
+	 */
+	private function openHttp2(TWebSocketServer $server, array $settings = [], int $streams = 0): array
+	{
+		$socket = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client = new TH2Session(false);
+		$client->submitSettings($settings);
+		$opened = [];
+		for ($i = 0; $i < $streams; $i++) {
+			$opened[] = $client->request([':method' => 'CONNECT', ':protocol' => 'websocket', ':scheme' => 'https', ':path' => '/', ':authority' => 'h', 'sec-websocket-version' => '13']);
+		}
+		$socket->write($client->send());
+		return [$socket, $client, $opened];
+	}
+
+	/** Pumps a server until a condition holds or about two seconds pass. */
+	private function pumpUntil(TWebSocketServer $server, callable $done): void
+	{
+		for ($i = 0; $i < 100 && !$done(); $i++) {
+			$server->serveOnce(0, 20000);
+		}
+	}
+
+	public function testAnHttp2PeerThatOpensNoStreamIsDroppedAtTheHandshakeTimeout()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setHandshakeTimeout(0.2);
+		$server->setIdleTimeout(0);
+		$pri = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$pri->write('PRI ');   // four bytes select HTTP/2
+		[$preface] = $this->openHttp2($server);   // a full preface, but no stream
+		$this->pumpUntil($server, fn () => $server->getLoad() === 2);
+		self::assertSame(2, $server->getLoad(), 'Both transports were accepted.');
+		$this->pumpUntil($server, fn () => $server->getLoad() === 0);
+
+		self::assertSame(0, $server->getLoad(), 'An HTTP/2 transport with no WebSocket stream is a pending handshake, bounded by HandshakeTimeout.');
+		$pri->close();
+		$preface->close();
+		$server->close();
+	}
+
+	public function testAnIdleHttp2SessionIsPingedThenReaped()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setIdleTimeout(0.2);
+		[$socket] = $this->openHttp2($server, [], 1);
+		$this->pumpUntil($server, fn () => $server->getLoad() === 2);
+		self::assertSame(2, $server->getLoad(), 'The stream opened.');
+
+		$this->pumpUntil($server, fn () => $server->getLoad() === 0);   // the client never answers the PING
+		self::assertSame(0, $server->getLoad(), 'A silent HTTP/2 session is reaped after an unanswered PING.');
+		self::assertSame(1, $closed, 'Its stream is closed through the handler.');
+		$socket->close();
+		$server->close();
+	}
+
+	public function testAnHttp2StreamThatNeverCompletesItsCloseIsReset()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$connection = null;
+		$closed = 0;
+		$handler->attachEventHandler('onOpen', function ($sender) use (&$connection) {
+			$connection = $sender;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setIdleTimeout(0);
+		$server->setCloseTimeout(0.2);
+		[$socket] = $this->openHttp2($server, [], 1);
+		$this->pumpUntil($server, function () use (&$connection) {
+			return $connection !== null;
+		});
+		$connection->close(1000);   // the client never answers the Close
+
+		$this->pumpUntil($server, function () use (&$closed) {
+			return $closed === 1;
+		});
+		self::assertSame(1, $closed, 'A stream whose peer never completes the close handshake is ended at CloseTimeout.');
+		self::assertSame(1, $server->getLoad(), 'The transport stays; only the stream is gone.');
+		$socket->close();
+		$server->close();
+	}
+
+	public function testHttp2StreamsPastMaxConnectionsAreRefused()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$server->setHandler($handler);
+		$server->setMaxConnections(3);
+		[$socket] = $this->openHttp2($server, [], 20);
+		$this->pumpUntil($server, function () use (&$opened) {
+			return $opened >= 2;
+		});
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+
+		self::assertSame(2, $opened, 'The transport and two streams reach the cap of three; further streams are refused.');
+		self::assertSame(3, $server->getLoad());
+		$socket->close();
+		$server->close();
+	}
+
+	public function testMaxSendBufferBytesBoundsAnHttp2Stream()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$connection = null;
+		$handler->attachEventHandler('onOpen', function ($sender) use (&$connection) {
+			$connection = $sender;
+		});
+		$server->setHandler($handler);
+		$server->setMaxSendBufferBytes(256 << 10);
+		[$socket] = $this->openHttp2($server, [TNgHttp2::SETTINGS_INITIAL_WINDOW_SIZE => 0], 1);   // the peer grants no window
+		$this->pumpUntil($server, function () use (&$connection) {
+			return $connection !== null;
+		});
+
+		try {
+			for ($i = 0; $i < 20; $i++) {
+				$connection->sendBinary(str_repeat('x', 60000));
+				$server->serveOnce(0, 1000);
+			}
+			self::fail('A stream whose peer withholds its window overflows MaxSendBufferBytes.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_send_buffer_overflow', $e->getErrorCode());
+		}
+		self::assertLessThanOrEqual(256 << 10, $connection->getQueuedLength(), 'The stream holds no more than the limit.');
+		$socket->close();
+		$server->close();
+	}
+
+	public function testAThrowingOnCloseOnHttp2StillUnregistersEveryStream()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$handler->attachEventHandler('onClose', function () {
+			throw new \RuntimeException('handler bug in onClose');
+		});
+		$server->setHandler($handler);
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		$server->setCluster($cluster);
+		[$socket] = $this->openHttp2($server, [], 3);
+		$this->pumpUntil($server, function () use (&$opened) {
+			return $opened === 3;
+		});
+		self::assertSame(3, $cluster->getLocalClientCount());
+
+		$socket->close();
+		$this->pumpUntil($server, fn () => $server->getLoad() === 0);
+		self::assertSame(0, $cluster->getLocalClientCount(), 'Each stream leaves the cluster even when onClose throws.');
+		$server->close();
+	}
+
 	public function testForeignHostIsRejectedByServer()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
@@ -469,6 +664,41 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame([], $messages, 'A connection the application closed delivers nothing more to the handler.');
 		self::assertSame(1, $closed);
 		$client->close();
+		$server->close();
+	}
+
+	public function testAShedPeerThatResetsDoesNotHoldItsSlot()
+	{
+		if (!extension_loaded('sockets')) {
+			self::markTestSkipped('ext-sockets is needed to reset a connection (SO_LINGER 0).');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxConnections(1);
+		$held = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$held->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		for ($i = 0; $i < 10 && $server->getConnectionCount() === 0; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(1, $server->getLoad());
+
+		for ($k = 0; $k < 10; $k++) {
+			$socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+			socket_connect($socket, '127.0.0.1', $server->getPort());
+			socket_set_option($socket, SOL_SOCKET, SO_LINGER, ['l_onoff' => 1, 'l_linger' => 0]);
+			socket_close($socket);   // a reset: the 503 write fails
+			usleep(5000);
+			for ($i = 0; $i < 3; $i++) {
+				$server->serveOnce(0, 10000);
+			}
+		}
+		self::assertSame(1, $server->getLoad(), 'A shed peer is closed even when its 503 cannot be written.');
+
+		$held->close();
+		for ($i = 0; $i < 10 && $server->getLoad() > 0; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(0, $server->getLoad(), 'The slot is free again once the client leaves.');
 		$server->close();
 	}
 

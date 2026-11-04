@@ -281,6 +281,46 @@ class TWebSocketConnectionTest extends TestCase
 		$b->close();
 	}
 
+	public function testFeedALargeFrameInSmallPiecesIsLinear()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$server->setMaxMessageSize(10 << 20);
+		$payload = str_repeat('0123456789abcdef', 1 << 19);   // 8 MiB
+		$wire = TWebSocketFrameCodec::encode(TWebSocketFrame::binary($payload), "\x01\x02\x03\x04")
+			. TWebSocketFrameCodec::encode(TWebSocketFrame::text('next'), "\x05\x06\x07\x08");
+		$trickle = 256 << 10;
+		$start = microtime(true);
+		$messages = $server->feedMessages(substr($wire, 0, -$trickle));   // most of the frame at once
+		foreach (str_split(substr($wire, -$trickle), 64) as $piece) {   // then 4096 reads of 64 bytes: re-copying the buffered frame per read is ~32 GiB of memcpy
+			array_push($messages, ...$server->feedMessages($piece));
+		}
+		$elapsed = microtime(true) - $start;
+
+		self::assertCount(2, $messages);
+		self::assertSame($payload, $messages[0]->getPayload(), 'The frame is reassembled from its pieces.');
+		self::assertSame('next', $messages[1]->getPayload(), 'The frame after it, split across the same pieces, follows.');
+		self::assertLessThan(2.0, $elapsed, 'A frame trickled in small reads must not cost time quadratic in its size.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testFeedAfterThePeersCloseDiscardsTheBytes()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$close = TWebSocketFrameCodec::encode(TWebSocketFrame::close(TWebSocketCloseCode::Normal), "\x01\x02\x03\x04");
+		self::assertSame([], $server->feedMessages($close . str_repeat("\x82", 1 << 20)));
+		self::assertTrue($server->getIsClosed());
+		$before = memory_get_usage();
+		for ($i = 0; $i < 16; $i++) {
+			self::assertSame([], $server->feedMessages(str_repeat("\x82", 1 << 20)), 'Bytes after the peer\'s Close yield nothing.');
+		}
+		self::assertLessThan(1 << 20, memory_get_usage() - $before, 'Bytes after the peer\'s Close are not buffered.');
+		$a->close();
+		$b->close();
+	}
+
 	public function testFeedRejectsAMalformedHeaderBeforeItsPayloadArrives()
 	{
 		[$a, $b] = TSocketStream::pair();

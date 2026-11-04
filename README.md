@@ -224,12 +224,12 @@ Negotiation runs on every accept path: the `serveOnce()` loop, the synchronous `
 | `setHandshakeTimeout($seconds)` | 10.0 | Deadline for the opening handshake; a silent or dribbling client is dropped without ever blocking the loop |
 | `setIdleTimeout($seconds)` | 0 (off) | Pings, then reaps, a connection idle this long; runs on a quiet server too |
 | `setCloseTimeout($seconds)` | 5.0 | After the server sends Close, how long it waits for the peer's Close before ending the session; the queued Close is drained first |
-| `setMaxConnections($n)` | 0 (unlimited) | Bounds the load: every transport the server holds (sessions, pending handshakes, endpoint links, app-held connections) plus HTTP/2 streams; a further connection is accepted and shed with 503 |
+| `setMaxConnections($n)` | 0 (unlimited) | Bounds the load: every transport the server holds (sessions, pending handshakes, endpoint links, app-held connections) plus HTTP/2 streams; a further connection is accepted and shed with 503, and a further HTTP/2 stream is refused with 503 |
 | `setReactor($reactor)` | own | The `TSocketReactor` the loop runs on; supply one to multiplex other sources or timers with the server |
 | `setOrigins([...])` | `[]` (any) | Allowed `Origin` values; a disallowed origin is refused with 403 before upgrading |
 | `setAllowedHosts([...])` | `[]` (any) | Allowed `Host` values; a disallowed host is refused with 400 |
 
-These apply on both the HTTP/1.1 and HTTP/2 paths. Binding `tls://host:port` (with `ssl` context options for the certificate) runs each accepted socket's TLS handshake without blocking, under the handshake deadline; an ALPN `h2` selects HTTP/2 without a preface. Every refused upgrade, shed connection, deadline, idle reap and swallowed handler error is logged through `Prado::log()` under the server's class.
+These apply on both the HTTP/1.1 and HTTP/2 paths: an HTTP/2 transport is a pending handshake until its first WebSocket stream opens, an idle one is sent an HTTP/2 PING (and one carrying no stream is ended), a stream that never completes its close is reset at `CloseTimeout`, and `MaxSendBufferBytes` counts what a stream holds while its peer withholds flow-control window. Binding `tls://host:port` (with `ssl` context options for the certificate) runs each accepted socket's TLS handshake without blocking, under the handshake deadline; an ALPN `h2` selects HTTP/2 without a preface. Every refused upgrade, shed connection, deadline, idle reap and swallowed handler error is logged through `Prado::log()` under the server's class.
 
 ## Clustering (multi-node)
 

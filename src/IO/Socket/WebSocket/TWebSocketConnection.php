@@ -58,6 +58,9 @@ class TWebSocketConnection extends TComponent
 	/** The default maximum queued outbound bytes before a slow reader is dropped (16 MiB). */
 	public const DEFAULT_MAX_SEND_BUFFER = 16 * 1024 * 1024;
 
+	/** @var int The longest frame header: 2 bytes, an 8-byte extended length, and a 4-byte mask key. */
+	private const MAX_HEADER_LENGTH = 14;
+
 	/** @var float The longest single wait, in seconds, of {@see drainClose()} between polls of the clock. */
 	public const DRAIN_POLL_INTERVAL = 0.05;
 
@@ -76,8 +79,17 @@ class TWebSocketConnection extends TComponent
 	/** @var bool Whether the connection is closed (Close exchanged or stream ended). */
 	private bool $_closed = false;
 
-	/** @var string Unparsed bytes carried between {@see feed()} calls. */
+	/** @var string Unparsed bytes carried between {@see feed()} calls, starting at a frame boundary. */
 	private string $_readBuffer = '';
+
+	/** @var string[] Bytes received after {@see $_readBuffer} while a frame of known length is still arriving, joined once it is complete. */
+	private array $_readChunks = [];
+
+	/** @var int The total length of {@see $_readChunks}. */
+	private int $_readChunksLength = 0;
+
+	/** @var int The wire length of the frame at the start of {@see $_readBuffer} while it is still arriving, or 0 when unknown. */
+	private int $_awaitingLength = 0;
 
 	/** @var string Reassembly buffer for a fragmented message across {@see feed()} calls. */
 	private string $_messageBuffer = '';
@@ -253,13 +265,30 @@ class TWebSocketConnection extends TComponent
 	 */
 	private function writeAll(string $data): int
 	{
-		if ($this->_maxSendBufferBytes > 0 && strlen($this->_outbound) + strlen($data) > $this->_maxSendBufferBytes) {
+		if ($this->_maxSendBufferBytes > 0 && $this->getQueuedLength() + strlen($data) > $this->_maxSendBufferBytes) {
 			throw (new TWebSocketException('websocket_send_buffer_overflow', $this->_maxSendBufferBytes))
 				->setCloseCode(TWebSocketCloseCode::GoingAway);
 		}
 		$this->_outbound .= $data;
 		$this->flushOutbound();
 		return strlen($data);
+	}
+
+	/**
+	 * Returns the outbound bytes queued and not yet on the wire: this connection's own buffer, plus
+	 * what the transport itself still holds when it queues writes (an HTTP/2 stream, which accepts
+	 * every write and sends it as flow control allows, reports it with `getOutgoingLength()`).
+	 * {@see setMaxSendBufferBytes() MaxSendBufferBytes} bounds this total.
+	 * @return int The queued byte count.
+	 * @since 1.2.0
+	 */
+	public function getQueuedLength(): int
+	{
+		$queued = strlen($this->_outbound);
+		if (method_exists($this->_stream, 'getOutgoingLength')) {
+			$queued += $this->_stream->getOutgoingLength();
+		}
+		return $queued;
 	}
 
 	/**
@@ -519,7 +548,10 @@ class TWebSocketConnection extends TComponent
 	 * the connection {@see getIsClosed() closed}.
 	 *
 	 * The frames are decoded at an advancing offset and the buffer is compacted once per call, so a
-	 * read holding thousands of small frames costs time linear in its size.
+	 * read holding thousands of small frames costs time linear in its size.  A frame whose length is
+	 * known but whose bytes are still arriving is collected in pieces and joined once, so a large
+	 * frame trickled in small reads also costs time linear in its size.  Once the connection is
+	 * {@see getIsClosed() closed}, further bytes are discarded.
 	 *
 	 * @param string $bytes The bytes just read from the transport.
 	 * @throws TWebSocketException When a frame is malformed (the caller should close).
@@ -527,18 +559,36 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function feedMessages(string $bytes): array
 	{
+		if ($this->_closed) {
+			$this->_readBuffer = '';   // the close handshake is over: nothing after the peer's Close is read
+			return [];
+		}
+		if ($this->_awaitingLength > 0) {
+			// A frame of known length is still arriving: hold the piece, and join only once it is whole.
+			$this->_readChunks[] = $bytes;
+			$this->_readChunksLength += strlen($bytes);
+			if (strlen($this->_readBuffer) + $this->_readChunksLength < $this->_awaitingLength) {
+				return [];
+			}
+			$bytes = implode('', $this->_readChunks);
+			$this->_readChunks = [];
+			$this->_readChunksLength = 0;
+			$this->_awaitingLength = 0;
+		}
 		$buffer = $this->_readBuffer . $bytes;
 		$this->_readBuffer = '';
 		$available = strlen($buffer);
 		$offset = 0;
+		$awaiting = 0;
 		$messages = [];
 		try {
 			while (!$this->_closed && $offset < $available) {
 				$length = self::frameLengthAt($buffer, $offset);
 				if ($length === null || $offset + $length > $available) {
-					// The header or payload is still arriving: tryDecode() on the tail applies the
-					// header checks (mask state, control-frame rules, the size limit) that fail early.
-					TWebSocketFrameCodec::tryDecode(substr($buffer, $offset), $this->expectedMask(), $this->_maxMessageSize);
+					// The header or payload is still arriving: tryDecode() on the header applies the
+					// checks (mask state, control-frame rules, the size limit) that fail early.
+					TWebSocketFrameCodec::tryDecode(substr($buffer, $offset, self::MAX_HEADER_LENGTH), $this->expectedMask(), $this->_maxMessageSize);
+					$awaiting = $length ?? 0;
 					break;
 				}
 				$decoded = TWebSocketFrameCodec::tryDecode(substr($buffer, $offset, $length), $this->expectedMask(), $this->_maxMessageSize);
@@ -558,7 +608,12 @@ class TWebSocketConnection extends TComponent
 				}
 			}
 		} finally {
-			$this->_readBuffer = $offset === 0 ? $buffer : (string) substr($buffer, $offset);
+			if ($this->_closed) {
+				$this->_readBuffer = '';   // bytes behind the peer's Close are discarded, not held
+			} else {
+				$this->_readBuffer = $offset === 0 ? $buffer : (string) substr($buffer, $offset);
+				$this->_awaitingLength = $awaiting;
+			}
 		}
 		return $messages;
 	}
@@ -892,7 +947,8 @@ class TWebSocketConnection extends TComponent
 	/**
 	 * Sets the maximum queued outbound bytes tolerated for a slow reader before the connection is
 	 * dropped.  It bounds the memory one non-draining peer can hold, replacing an unbounded (or
-	 * blocking) wait; 0 is unlimited.
+	 * blocking) wait; 0 is unlimited.  The bound covers {@see getQueuedLength() what the transport
+	 * holds} too, so it applies to an HTTP/2 stream whose peer withholds flow-control window.
 	 * @param int $value The maximum queued outbound bytes.
 	 */
 	public function setMaxSendBufferBytes(int $value): void

@@ -16,6 +16,7 @@ use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketStream;
 use Prado\Prado;
 use Prado\TComponent;
+use Prado\Util\Log\TLogger;
 use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
@@ -93,6 +94,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/** @var string The bytes received while the session was busy, fed once it is not. */
 	private string $_deferred = '';
+
+	/** @var ?callable The capacity check a WebSocket stream must pass to open, or null for none. */
+	private $_admission;
 
 	/**
 	 * @param IWebSocketHandler $handler The handler each WebSocket stream is run through.
@@ -254,6 +258,80 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
+	 * Returns the capacity check a WebSocket stream must pass to open.
+	 * @return ?callable The check, called with the request {@see TH2Stream} and returning whether to
+	 *   admit it, or null to admit every valid request.
+	 * @since 1.2.0
+	 */
+	public function getAdmission(): ?callable
+	{
+		return $this->_admission;
+	}
+
+	/**
+	 * Sets the capacity check a WebSocket stream must pass to open.  A valid request it refuses is
+	 * answered with 503, so a peer cannot open streams past a server-wide connection limit on one
+	 * transport.  {@see TWebSocketServer} sets it from MaxConnections.
+	 * @param ?callable $value The check, called with the request {@see TH2Stream} and returning
+	 *   whether to admit it, or null to admit every valid request.
+	 * @since 1.2.0
+	 */
+	public function setAdmission(?callable $value): void
+	{
+		$this->_admission = $value;
+	}
+
+	/**
+	 * Advertises the most WebSocket streams the peer may open at once on this session
+	 * (SETTINGS_MAX_CONCURRENT_STREAMS), so a conforming client queues further streams rather than
+	 * having them refused.  Call it before the session's first {@see send()}.
+	 * @param int $value The limit, or 0 to advertise none.
+	 * @since 1.2.0
+	 */
+	public function setMaxConcurrentStreams(int $value): void
+	{
+		if ($value > 0) {
+			$this->_session->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => $value]);
+		}
+	}
+
+	/**
+	 * Ends one WebSocket connection's stream: the stream is reset, and the handler and service closes
+	 * are raised.  The server uses it to end a stream whose close handshake the peer never completes.
+	 * @param TWebSocketConnection $connection A connection of this session.
+	 * @since 1.2.0
+	 */
+	public function endConnection(TWebSocketConnection $connection): void
+	{
+		$streamId = array_search($connection, $this->_connections, true);
+		if ($streamId === false) {
+			return;
+		}
+		unset($this->_connections[$streamId]);
+		try {
+			$this->_session->resetStream($streamId, TNgHttp2::CANCEL);
+		} catch (\Throwable $e) {
+			// The stream was already closed; only the closes remain to raise.
+		}
+		$this->raiseClose($connection);
+	}
+
+	/**
+	 * Raises the handler close and then the service close for a connection.  A failing handler
+	 * close is logged, so the service close (the server's cluster unregister) still runs.
+	 * @param TWebSocketConnection $connection The closed connection.
+	 */
+	private function raiseClose(TWebSocketConnection $connection): void
+	{
+		try {
+			$this->_handler->onClose($connection);
+		} catch (\Throwable $e) {
+			Prado::log('Handler onClose failed on an HTTP/2 stream: ' . $e->getMessage(), TLogger::WARNING, static::class);
+		}
+		$this->onClose($connection);
+	}
+
+	/**
 	 * Returns the live WebSocket connections multiplexed on this session.
 	 * @return TWebSocketConnection[] The live connections.
 	 */
@@ -385,6 +463,10 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			$this->rejectStream($stream, '400');   // refuse a disallowed :authority
 			return;
 		}
+		if ($this->_admission !== null && !($this->_admission)($stream)) {
+			$this->rejectStream($stream, '503');   // at capacity: a stream counts toward the server's connection limit
+			return;
+		}
 		$subprotocol = TWebSocketHandshake::negotiateSubprotocol($headers, $this->_subprotocols);
 		$negotiated = TWebSocketHandshake::negotiateExtensions($headers, $this->_extensions);
 		$response = [':status' => '200'];
@@ -474,8 +556,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		}
 		unset($this->_connections[$stream->getStreamId()]);
 		$this->endLocalStream($stream);
-		$this->_handler->onClose($connection);
-		$this->onClose($connection);
+		$this->raiseClose($connection);
 	}
 
 	/**
@@ -504,8 +585,11 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		try {
 			foreach ($this->_connections as $streamId => $connection) {
 				unset($this->_connections[$streamId]);
-				$this->_handler->onClose($connection);
-				$this->onClose($connection);
+				try {
+					$this->raiseClose($connection);
+				} catch (\Throwable $e) {
+					Prado::log('HTTP/2 stream close failed during shutdown: ' . $e->getMessage(), TLogger::WARNING, static::class);   // the other streams still close
+				}
 			}
 		} finally {
 			$this->_deferred = '';
