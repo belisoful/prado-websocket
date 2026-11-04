@@ -210,15 +210,11 @@ class TWebSocketServerClusterTest extends TestCase
 		self::assertSame(0, $dialer->getPeerCount(), 'The dial returns immediately without blocking.');
 		self::assertSame(1, $dialer->getPendingCount(), 'The dial is in flight.');
 
-		// Drive the async connect and request send (no server accept yet, so nothing blocks).
-		for ($i = 0; $i < 40; $i++) {
+		// Drive the async connect and request send, interleaved with server pumps (accept + handshake),
+		// until both ends hold the peer; a slow tick costs pumps, and a dial that never completes ends the loop.
+		for ($i = 0; $i < 200 && ($dialer->getPeerCount() === 0 || $serverMesh->getPeerCount() === 0); $i++) {
 			$dialer->tick();
-			usleep(1000);
-		}
-		$server->serveOnce(0, 200000);   // accept + handshake (the request is already buffered)
-		for ($i = 0; $i < 40 && $dialer->getPeerCount() === 0; $i++) {
-			$dialer->tick();
-			usleep(1000);
+			$server->serveOnce(0, 10000);
 		}
 
 		self::assertSame(1, $dialer->getPeerCount(), 'The async dial establishes the peer.');

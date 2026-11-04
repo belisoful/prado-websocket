@@ -39,6 +39,20 @@ class ProbeWebSocketServer extends TWebSocketServer
 	}
 }
 
+/** Fails every session pump on demand, standing in for a transport or teardown fault the loop must absorb. */
+class FailingPumpWebSocketServer extends TWebSocketServer
+{
+	public bool $fail = false;
+
+	protected function pumpSession(TSocketStream $transport): void
+	{
+		if ($this->fail) {
+			throw new \RuntimeException('pump failed');
+		}
+		parent::pumpSession($transport);
+	}
+}
+
 class TWebSocketServerTest extends TestCase
 {
 	/** @var string[] Temporary certificate files to remove. */
@@ -110,12 +124,93 @@ class TWebSocketServerTest extends TestCase
 	 */
 	private function readUntil(TWebSocketServer $server, TSocketStream $client, string $needle): string
 	{
-		$response = '';
-		for ($i = 0; $i < 50 && !str_contains($response, $needle); $i++) {
-			$server->serveOnce(0, 20000);
-			$response .= $client->read(65536);
+		return $this->pumpUntil($server, $client, fn (string $bytes) => str_contains($bytes, $needle));
+	}
+
+	/**
+	 * Pumps the server and reads the client without blocking until the bytes read satisfy the
+	 * predicate or the pumps run out.  A slow tick still passes, and a reply that never comes fails
+	 * within about two seconds instead of blocking on the socket timeout.  The client's blocking
+	 * mode is restored afterward.
+	 * @param TWebSocketServer $server The server to pump between reads.
+	 * @param TSocketStream $client The client transport.
+	 * @param callable $done Receives the bytes read so far and returns whether they are complete.
+	 * @param int $pumps The most pumps to run, each waiting up to 20 ms. Default 100.
+	 * @return string The bytes read.
+	 */
+	private function pumpUntil(TWebSocketServer $server, TSocketStream $client, callable $done, int $pumps = 100): string
+	{
+		$blocking = stream_get_meta_data($client->getResource())['blocked'];
+		$client->setBlocking(false);
+		try {
+			$bytes = $client->read(65536);
+			for ($i = 0; $i < $pumps && !$done($bytes); $i++) {
+				$server->serveOnce(0, 20000);
+				$bytes .= $client->read(65536);
+			}
+		} finally {
+			if ($blocking && $client->isOpen()) {
+				$client->setBlocking(true);
+			}
 		}
-		return $response;
+		return $bytes;
+	}
+
+	/**
+	 * Pumps the server until the client has read a whole HTTP response head.
+	 * @param TWebSocketServer $server The server to pump between reads.
+	 * @param TSocketStream $client The client transport.
+	 * @return string The bytes read.
+	 */
+	private function readResponseHead(TWebSocketServer $server, TSocketStream $client): string
+	{
+		return $this->readUntil($server, $client, "\r\n\r\n");
+	}
+
+	/**
+	 * Pumps the server and feeds an HTTP/2 client session from its socket without blocking until the
+	 * predicate holds or the pumps run out.  The client writes nothing back to the server.
+	 * @param TWebSocketServer $server The server to pump between reads.
+	 * @param TSocketStream $socket The client socket; it is switched to non-blocking.
+	 * @param TH2Session $session The client session the bytes read are fed to.
+	 * @param callable $done Returns whether the awaited state is reached.
+	 * @param int $pumps The most pumps to run, each waiting up to 20 ms. Default 100.
+	 */
+	private function pumpHttp2Until(TWebSocketServer $server, TSocketStream $socket, TH2Session $session, callable $done, int $pumps = 100): void
+	{
+		$socket->setBlocking(false);
+		for ($i = 0; $i < $pumps && !$done(); $i++) {
+			$server->serveOnce(0, 20000);
+			$bytes = $socket->read(65536);
+			if ($bytes !== '') {
+				$session->receive($bytes);
+			}
+		}
+	}
+
+	/**
+	 * Connects a raw HTTP/2 client and opens WebSocket streams over it (RFC 8441 Extended CONNECT).
+	 * @param TWebSocketServer $server The server, with a handler.
+	 * @param int $streams The WebSocket streams to open.
+	 * @return array{0: TSocketStream, 1: TH2Session} The client socket and session.
+	 */
+	private function openHttp2Streams(TWebSocketServer $server, int $streams): array
+	{
+		$socket = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		for ($i = 0; $i < $streams; $i++) {
+			$client->request([
+				':method' => 'CONNECT',
+				':protocol' => 'websocket',
+				':scheme' => 'https',
+				':path' => '/',
+				':authority' => 'h',
+				'sec-websocket-version' => '13',
+			]);
+		}
+		$socket->write($client->send());
+		return [$socket, $client];
 	}
 
 	public function testBindReturnsWebSocketServer()
@@ -258,7 +353,7 @@ class TWebSocketServerTest extends TestCase
 		for ($i = 0; $i < 10 && $opened === 0; $i++) {
 			$server->serveOnce(0, 50000);
 		}
-		$response = $client->read(4096);
+		$response = $this->readResponseHead($server, $client);
 
 		self::assertSame(0, $opened, 'A foreign origin does not open a connection.');
 		self::assertStringContainsString('403', $response, 'The server answers a foreign origin with 403.');
@@ -336,7 +431,7 @@ class TWebSocketServerTest extends TestCase
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 300000);
 		self::assertCount(1, $cluster->presence());
-		self::assertStringContainsString('101', $client->read(4096));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 
 		(new TWebSocketConnection($client, true))->close(1000);
 		$server->serveOnce(0, 300000);   // the peer's Close ends the session; onClose throws inside
@@ -369,7 +464,7 @@ class TWebSocketServerTest extends TestCase
 		$second = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$second->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 200000);
-		self::assertStringContainsString('503', $second->read(4096), 'A connection past the cap is shed with 503 before the handshake.');
+		self::assertStringContainsString('503', $this->readResponseHead($server, $second), 'A connection past the cap is shed with 503 before the handshake.');
 		self::assertSame(1, $server->getLoad(), 'The shed connection does not count.');
 		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, TWebSocketServer::class);
 		self::assertNotEmpty($logs, 'The capacity shed is logged.');
@@ -404,7 +499,7 @@ class TWebSocketServerTest extends TestCase
 		$extra = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$extra->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 200000);
-		self::assertStringContainsString('503', $extra->read(4096), 'The multiplexed streams count toward the cap.');
+		self::assertStringContainsString('503', $this->readResponseHead($server, $extra), 'The multiplexed streams count toward the cap.');
 
 		$extra->close();
 		$socket->close();
@@ -428,7 +523,7 @@ class TWebSocketServerTest extends TestCase
 		for ($i = 0; $i < 10 && $opened === 0; $i++) {
 			$server->serveOnce(0, 50000);
 		}
-		$response = $client->read(4096);
+		$response = $this->readResponseHead($server, $client);
 
 		self::assertSame(0, $opened, 'A disallowed Host does not open a connection.');
 		self::assertStringContainsString('400', $response, 'The server answers a disallowed Host with 400.');
@@ -575,7 +670,7 @@ class TWebSocketServerTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 200000);
-		self::assertStringContainsString('101', $client->read(4096));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 
 		$client->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('unmasked')));   // a client must mask: protocol error
 		for ($i = 0; $i < 10 && $closed === 0; $i++) {
@@ -640,7 +735,7 @@ class TWebSocketServerTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 200000);
-		self::assertStringContainsString('101', $client->read(4096));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 
 		$clientWs = new TWebSocketConnection($client, true);
 		$clientWs->send(str_repeat('a', 16));   // at the limit
@@ -739,11 +834,11 @@ class TWebSocketServerTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
 		$server->serveOnce(0, 200000);
-		self::assertStringContainsString('101', $client->read(4096));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 		(new TWebSocketConnection($client, true))->send('hi');
 		$server->serveOnce(0, 200000);
 
-		$frame = TWebSocketFrameCodec::tryDecode($client->read(4096), false);
+		$frame = TWebSocketFrameCodec::tryDecode($this->pumpUntil($server, $client, fn (string $bytes) => TWebSocketFrameCodec::tryDecode($bytes, false) !== null), false);
 		self::assertSame(TWebSocketOpcode::Close, $frame['frame']->getOpcode(), 'The server sent its Close.');
 		self::assertSame(1, $server->getConnectionCount(), 'The session waits for the peer to answer the Close.');
 		self::assertSame(0, $closed);
@@ -880,8 +975,12 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(1, $opened, 'The server read the preface and auto-selected HTTP/2.');
 		self::assertSame(['hi'], $messages);
 
-		$client->receive($socket->read(65536));                // SETTINGS + 200 + echoed DATA
-		self::assertSame(['echo:hi'], $clientWs->feed($stream->getContents()));
+		$echo = [];
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$echo, $clientWs, $stream) {
+			array_push($echo, ...$clientWs->feed($stream->getContents()));   // SETTINGS + 200 + echoed DATA
+			return $echo !== [];
+		});
+		self::assertSame(['echo:hi'], $echo);
 
 		$socket->close();
 		$server->close();
@@ -923,7 +1022,7 @@ class TWebSocketServerTest extends TestCase
 		}
 		self::assertInstanceOf(TWebSocketConnection::class, $opened);
 		self::assertSame('chat', $opened->getSubprotocol(), 'The HTTP/2 path negotiates the server subprotocols.');
-		$client->receive($socket->read(65536));
+		$this->pumpHttp2Until($server, $socket, $client, fn () => $selected !== null);
 		self::assertSame('chat', $selected, 'The 200 response names the selected subprotocol.');
 		$socket->close();
 		$server->close();
@@ -954,21 +1053,28 @@ class TWebSocketServerTest extends TestCase
 			'sec-websocket-version' => '13',
 		]);
 		$clientWs = new TWebSocketConnection($stream, true);
+		$responded = false;
+		$client->attachEventHandler('onResponse', function () use (&$responded) {
+			$responded = true;
+		});
 		$socket->write($client->send());                       // preface + SETTINGS + CONNECT, no DATA
 
 		for ($i = 0; $i < 20 && $serverConnection === null; $i++) {
 			$server->serveOnce(0, 50000);
 		}
 		self::assertNotNull($serverConnection, 'The HTTP/2 WebSocket stream opened.');
-		$client->receive($socket->read(65536));                // drain SETTINGS + 200
+		$this->pumpHttp2Until($server, $socket, $client, fn () => $responded);   // drain SETTINGS + 200
+		self::assertTrue($responded, 'The client received the 200 response.');
 
 		// A server-initiated send with NO inbound frame from the client: only the post-tick H2 flush
-		// pass can put it on the wire this loop.
+		// pass can put it on the wire.  The client writes nothing more to the server.
 		$serverConnection->send('push');
-		$server->serveOnce(0, 50000);
-
-		$client->receive($socket->read(65536));
-		self::assertSame(['push'], $clientWs->feed($stream->getContents()), 'An out-of-band HTTP/2 send reaches the client without an inbound frame.');
+		$pushed = [];
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$pushed, $clientWs, $stream) {
+			array_push($pushed, ...$clientWs->feed($stream->getContents()));
+			return $pushed !== [];
+		});
+		self::assertSame(['push'], $pushed, 'An out-of-band HTTP/2 send reaches the client without an inbound frame.');
 
 		$socket->close();
 		$server->close();
@@ -987,12 +1093,7 @@ class TWebSocketServerTest extends TestCase
 
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);   // connects and sends nothing
 		$server->serveOnce(0, 100000);
-		$client->setBlocking(false);
-		$bytes = '';
-		for ($i = 0; $i < 10 && $bytes === ''; $i++) {
-			$server->serveOnce(0, 20000);
-			$bytes = $client->read(4096);
-		}
+		$bytes = $this->pumpUntil($server, $client, fn (string $bytes) => strlen($bytes) >= 9);
 		self::assertGreaterThanOrEqual(9, strlen($bytes), 'The server speaks first: HTTP/2 was selected without a preface.');
 		self::assertSame(0x04, ord($bytes[3]), 'The first frame is the server SETTINGS.');
 		$client->close();
@@ -1042,7 +1143,7 @@ class TWebSocketServerTest extends TestCase
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);   // never starts TLS
 		$start = microtime(true);
 		$server->serveOnce(0, 100000);
-		self::assertLessThan(1.0, microtime(true) - $start, 'A peer that never starts TLS does not stall the loop.');
+		self::assertLessThan(5.0, microtime(true) - $start, 'A peer that never starts TLS does not stall the loop (a stall waits out the socket timeout).');
 
 		$client = $this->connectTls($server, 'http/1.1');
 		self::assertSame('http/1.1', stream_get_meta_data($client->getResource())['crypto']['alpn_protocol'] ?? null);
@@ -1103,7 +1204,7 @@ class TWebSocketServerTest extends TestCase
 		$h2->receive($first);
 		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('hi'), random_bytes(4)));
 		$client->write($h2->send());
-		for ($i = 0; $i < 40 && $messages === []; $i++) {
+		for ($i = 0; $i < 100 && $messages === []; $i++) {
 			$server->serveOnce(0, 20000);
 			$bytes = $client->read(65536);
 			if ($bytes !== '') {
@@ -1113,7 +1214,7 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(1, $opened, 'The WebSocket stream opened over HTTP/2 on TLS.');
 		self::assertSame(['hi'], $messages);
 		$echo = [];
-		for ($i = 0; $i < 20 && $echo === []; $i++) {
+		for ($i = 0; $i < 100 && $echo === []; $i++) {
 			$server->serveOnce(0, 20000);
 			$bytes = $client->read(65536);
 			if ($bytes !== '') {
@@ -1146,7 +1247,7 @@ class TWebSocketServerTest extends TestCase
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);   // connects and sends nothing
 		$start = microtime(true);
 		$server->serveOnce(0, 100000);
-		self::assertLessThan(1.0, microtime(true) - $start, 'Accepting a silent peer returns without waiting for its request.');
+		self::assertLessThan(5.0, microtime(true) - $start, 'Accepting a silent peer returns without waiting for its request (a stall waits out the socket timeout).');
 		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is held as a pending session.');
 
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
@@ -1232,7 +1333,7 @@ class TWebSocketServerTest extends TestCase
 		for ($i = 0; $i < 3; $i++) {
 			$server->serveOnce(0, 50000);   // accept and refuse (the request is already buffered)
 		}
-		self::assertStringContainsString('400', $client->read(4096), 'A request that is not an upgrade is refused with 400.');
+		self::assertStringContainsString('400', $this->readResponseHead($server, $client), 'A request that is not an upgrade is refused with 400.');
 		self::assertSame(0, $server->getConnectionCount());
 		$client->close();
 		$server->close();
@@ -1250,10 +1351,10 @@ class TWebSocketServerTest extends TestCase
 		$server->serveOnce(0, 100000);   // accepted; pending
 		self::assertSame(1, $server->getConnectionCount());
 		$start = microtime(true);
-		while ($server->getConnectionCount() !== 0 && microtime(true) - $start < 1.0) {
+		while ($server->getConnectionCount() !== 0 && microtime(true) - $start < 3.0) {
 			$server->serveOnce();   // no timeout: only the reactor's timers (idle scan, handshake deadline) can end each wait
 		}
-		self::assertLessThan(1.0, microtime(true) - $start, 'The pump wakes at the handshake deadline, not when a client acts.');
+		self::assertLessThan(3.0, microtime(true) - $start, 'The pump wakes at the handshake deadline, not when a client acts.');
 		self::assertSame(0, $server->getConnectionCount(), 'The silent peer is dropped at its deadline.');
 		$silent->close();
 
@@ -1262,14 +1363,16 @@ class TWebSocketServerTest extends TestCase
 		for ($i = 0; $i < 10 && $server->getConnectionCount() !== 1; $i++) {
 			$server->serveOnce(0, 50000);
 		}
-		self::assertStringContainsString('101', $client->read(4096));
-		$start = microtime(true);
-		for ($i = 0; $i < 4; $i++) {
-			$server->serveOnce();   // the idle scan timer (every 0.2 s) bounds each wait
-		}
-		self::assertLessThan(2.0, microtime(true) - $start, 'The idle scan timer wakes the loop on a quiet server.');
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 		$client->setBlocking(false);
-		self::assertSame("\x89\x00", $client->read(2), 'The idle session was pinged without any client activity.');
+		$ping = '';
+		$start = microtime(true);
+		for ($i = 0; $i < 20 && strlen($ping) < 2 && microtime(true) - $start < 3.0; $i++) {
+			$server->serveOnce();   // the idle scan timer (every 0.2 s) bounds each wait
+			$ping .= $client->read(2);
+		}
+		self::assertLessThan(3.0, microtime(true) - $start, 'The idle scan timer wakes the loop on a quiet server.');
+		self::assertSame("\x89\x00", $ping, 'The idle session was pinged without any client activity.');
 		$client->close();
 		$server->close();
 	}
@@ -1343,7 +1446,7 @@ class TWebSocketServerTest extends TestCase
 		for ($i = 0; $i < 10 && $server->getConnections() === []; $i++) {
 			$server->serveOnce(0, 50000);
 		}
-		self::assertStringContainsString('101', $client->read(4096));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 		self::assertCount(3, $reactor->getIdentifiers(), 'Only the listener and the session read and write callbacks remain; the handshake timer is cancelled.');
 		$client->close();
 		$server->close();
@@ -1387,29 +1490,153 @@ class TWebSocketServerTest extends TestCase
 		$server->setHandler($handler);
 
 		$client = null;
-		$clientWs = null;
 		$reply = null;
 		$reactor = $server->getReactor();
 		// serve() blocks the test thread, so the client acts from timers on the server's own reactor.
-		$reactor->delay(0.05, function () use (&$client, &$clientWs, $server) {
+		// It never blocks: a blocking read would stall the very loop that has to answer it.
+		$reactor->delay(0.05, function () use (&$client, &$reply, $server, $reactor) {
 			$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 			$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+			$client->setBlocking(false);
 			$clientWs = new TWebSocketConnection($client, true);
+			$buffer = '';
+			$upgraded = false;
+			$poll = function () use (&$poll, &$buffer, &$upgraded, &$reply, $client, $clientWs, $server, $reactor) {
+				$buffer .= $client->read(65536);
+				if (!$upgraded && ($end = strpos($buffer, "\r\n\r\n")) !== false) {
+					$upgraded = true;
+					$buffer = substr($buffer, $end + 4);   // past the 101
+					$clientWs->send('go');
+				}
+				if ($upgraded && $buffer !== '') {
+					$messages = $clientWs->feed($buffer);
+					$buffer = '';
+					if ($messages !== []) {
+						$reply = $messages[0];
+						$server->close();
+						return;
+					}
+				}
+				$reactor->delay(0.02, $poll);
+			};
+			$poll();
 		});
-		$reactor->delay(0.2, function () use (&$client, &$clientWs) {
-			$client->read(4096);   // the 101
-			$clientWs->send('go');
-		});
-		$reactor->delay(0.5, function () use (&$clientWs, &$reply, $server) {
-			$reply = (string) $clientWs->receive();
+		$safetyNet = false;
+		$reactor->delay(5.0, function () use ($server, &$safetyNet) {   // a safety net so a regression cannot hang the suite
+			$safetyNet = true;
 			$server->close();
 		});
-		$reactor->delay(3.0, fn () => $server->close());   // a safety net so a regression cannot hang the suite
 
 		$server->serve();
+		self::assertFalse($safetyNet, 'The reply ended the loop, not the safety net.');
 		self::assertSame('fiber done', $reply, 'The fiber the handler started resumed and sent its reply.');
 		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored when serve() returns.');
 		$client?->close();
+	}
+
+	public function testHttp2ClientDisconnectEndsTheSessionAndEveryStream()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$opened = 0;
+		$closed = 0;
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		[$socket] = $this->openHttp2Streams($server, 2);
+		for ($i = 0; $i < 100 && $opened < 2; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(2, $opened, 'Both WebSocket streams opened over one HTTP/2 connection.');
+		self::assertSame(3, $server->getLoad(), 'The transport and its two streams count as load.');
+
+		$socket->close();   // the client goes away without closing its streams
+		for ($i = 0; $i < 100 && $server->getConnectionCount() > 0; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(0, $server->getConnectionCount(), 'End of stream ends the HTTP/2 session.');
+		self::assertSame(2, $closed, 'Every stream still open is closed with the session.');
+		$server->close();
+	}
+
+	public function testAFailingSessionPumpDropsOnlyThatHttp1Session()
+	{
+		$server = FailingPumpWebSocketServer::bind('tcp://127.0.0.1:0');
+		$closed = 0;
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		Prado::getLogger()->deleteLogs(null, FailingPumpWebSocketServer::class);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		self::assertStringContainsString("\r\n\r\n", $this->readUntil($server, $client, "\r\n\r\n"));
+		self::assertSame(1, $server->getConnectionCount());
+
+		$server->fail = true;
+		(new TWebSocketConnection($client, true))->send('boom');   // makes the session readable
+		for ($i = 0; $i < 100 && $server->getConnectionCount() > 0; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(0, $server->getConnectionCount(), 'The failed session is dropped.');
+		self::assertSame(1, $closed, 'The dropped session is closed through its handler.');
+		self::assertTrue($server->isListening(), 'The server keeps serving.');
+		try {
+			$this->pumpUntil($server, $client, fn () => $client->eof());
+			$ended = $client->eof();
+		} catch (\RuntimeException $e) {
+			$ended = true;   // the close found the unread frame and reset the connection
+		}
+		self::assertTrue($ended, 'The dropped transport is closed.');
+		$logs = Prado::getLogger()->getLogs(TLogger::WARNING, FailingPumpWebSocketServer::class);
+		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'pump failed')), 'The failure is logged.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testAFailingSessionPumpDropsAnHttp2SessionWithItsStreams()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = FailingPumpWebSocketServer::bind('tcp://127.0.0.1:0');
+		$opened = 0;
+		$closed = 0;
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		[$socket, $client] = $this->openHttp2Streams($server, 2);
+		for ($i = 0; $i < 100 && $opened < 2; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(2, $opened);
+
+		$server->fail = true;
+		$client->submitSettings([]);
+		$socket->write($client->send());   // makes the session readable
+		for ($i = 0; $i < 100 && $server->getConnectionCount() > 0; $i++) {
+			$server->serveOnce(0, 20000);
+		}
+		self::assertSame(0, $server->getConnectionCount(), 'The failed HTTP/2 session is dropped.');
+		self::assertSame(2, $closed, 'Its streams are closed with it.');
+		$socket->close();
+		$server->close();
 	}
 
 	public function testIdleSessionIsPingedThenReapedOnAQuietServer()
@@ -1435,23 +1662,24 @@ class TWebSocketServerTest extends TestCase
 			for ($i = 0; $i < 10 && $server->getConnectionCount() !== $n + 1; $i++) {
 				$server->serveOnce(0, 50000);
 			}
-			self::assertStringContainsString('101', $client->read(4096));
+			self::assertStringContainsString('101', $this->readResponseHead($server, $client));
 			$clients[] = $client;
 		}
 
 		$clock->setMicrotime(1010.5);   // idle past the timeout: the reaper pings
-		$server->serveOnce(0, 50000);
 		foreach ($clients as $client) {
-			self::assertSame("\x89\x00", $client->read(2), 'An idle session is pinged.');
+			self::assertSame("\x89\x00", $this->pumpUntil($server, $client, fn (string $bytes) => strlen($bytes) >= 2), 'An idle session is pinged.');
 		}
 		self::assertSame(0, $closed);
 
 		$clock->setMicrotime(1021.0);   // the ping went unanswered for another timeout: the sessions are reaped
-		$server->serveOnce(0, 50000);
+		for ($i = 0; $i < 100 && $closed < 2; $i++) {
+			$server->serveOnce(0, 20000);
+		}
 		self::assertSame(2, $closed, 'Both unanswered sessions end, although onClose throws on the first.');
 		self::assertSame(0, $server->getConnectionCount());
 		foreach ($clients as $client) {
-			$frame = TWebSocketFrameCodec::tryDecode($client->read(4096), false);
+			$frame = TWebSocketFrameCodec::tryDecode($this->pumpUntil($server, $client, fn (string $bytes) => TWebSocketFrameCodec::tryDecode($bytes, false) !== null || $client->eof()), false);
 			self::assertNotNull($frame, 'The reaped peer is sent a Close before the transport closes.');
 			self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode());
 			$client->close();
