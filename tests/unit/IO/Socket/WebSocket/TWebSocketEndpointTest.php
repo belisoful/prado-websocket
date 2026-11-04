@@ -70,7 +70,9 @@ class TWebSocketEndpointTest extends TestCase
 		});
 
 		$client = $this->upgrade($server, '/admin');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertSame(1, $endpoint->authCalls, 'The endpoint authenticated the upgrade.');
 		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted, 'The endpoint took over the upgraded connection.');
@@ -96,7 +98,9 @@ class TWebSocketEndpointTest extends TestCase
 		$server->addEndpoint($endpoint);
 
 		$client = $this->upgrade($server, '/admin');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertSame(1, $endpoint->authCalls);
 		self::assertNull($endpoint->accepted, 'A rejected upgrade is refused, not accepted.');
@@ -119,7 +123,9 @@ class TWebSocketEndpointTest extends TestCase
 		$server->addEndpoint($endpoint);
 
 		$client = $this->upgrade($server, '/chat');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertNull($endpoint->accepted, 'A non-matching path does not reach the endpoint.');
 		self::assertCount(1, $cluster->presence(), 'A non-matching path is a normal client.');
@@ -137,18 +143,24 @@ class TWebSocketEndpointTest extends TestCase
 		$server->addEndpoint($endpoint);
 
 		$link = $this->upgrade($server, '/admin');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted);
 		self::assertSame(1, $server->getLoad(), 'A connection an endpoint took over is still load.');
 
 		$second = $this->upgrade($server, '/admin');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 		self::assertStringContainsString('503', $second->read(4096), 'A further endpoint upgrade is shed at the cap.');
 
 		$endpoint->transport->close();   // the endpoint releases its link
 		self::assertSame(0, $server->getLoad(), 'A closed endpoint link leaves the load.');
 		$third = $this->upgrade($server, '/chat');
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 		self::assertStringContainsString('101', $third->read(4096), 'The freed slot admits a client.');
 
 		$link->close();

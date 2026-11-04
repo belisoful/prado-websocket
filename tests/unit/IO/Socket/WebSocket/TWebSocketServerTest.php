@@ -672,6 +672,30 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testAnHttp2ConnectionErrorEndsTheSession()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		[$socket] = $this->openHttp2($server, [], 1);
+		$this->pumpServerUntil($server, fn () => $server->getLoad() === 2);
+		self::assertSame(2, $server->getLoad());
+
+		$socket->write(str_repeat("\xff", 64));   // not an HTTP/2 frame: nghttp2 answers GOAWAY and is done
+		$this->pumpServerUntil($server, fn () => $server->getLoad() === 0);
+		self::assertSame(0, $server->getLoad(), 'A session nghttp2 has finished with is closed, not held open.');
+		self::assertSame(1, $closed, 'Its stream is closed through the handler.');
+		$socket->close();
+		$server->close();
+	}
+
 	public function testAThrowingOnCloseOnHttp2StillUnregistersEveryStream()
 	{
 		if (!TNgHttp2::isAvailable()) {

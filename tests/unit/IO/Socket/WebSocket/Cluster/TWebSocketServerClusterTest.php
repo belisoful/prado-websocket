@@ -55,7 +55,9 @@ class TWebSocketServerClusterTest extends TestCase
 
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 		self::assertCount(1, $cluster->presence());
 		self::assertStringContainsString('101', $client->read(4096));
 
@@ -128,7 +130,9 @@ class TWebSocketServerClusterTest extends TestCase
 		$key = TWebSocketHandshake::generateKey();
 		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertSame(1, $mesh->getPeerCount(), 'A /cluster upgrade joins the mesh as a peer.');
 		self::assertCount(0, $cluster->presence(), 'A peer is not registered as a client.');
@@ -150,7 +154,9 @@ class TWebSocketServerClusterTest extends TestCase
 		$key = TWebSocketHandshake::generateKey();
 		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertSame(1, $mesh->getPeerCount(), 'A peer proving the secret joins the mesh.');
 		$peer->close();
@@ -168,7 +174,9 @@ class TWebSocketServerClusterTest extends TestCase
 		$peer = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => 'forged']));
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 
 		self::assertSame(0, $mesh->getPeerCount(), 'A peer that cannot prove the secret is refused.');
 		$peer->close();
@@ -186,7 +194,9 @@ class TWebSocketServerClusterTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', $key));
-		$server->serveOnce(0, 300000);
+		for ($i = 0; $i < 100 && count($cluster->presence()) === 0; $i++) {
+			$server->serveOnce(0, 20000);   // the accept and the request can land in different ticks
+		}
 
 		self::assertCount(1, $cluster->presence(), 'A non-cluster path is still a client.');
 		self::assertSame(0, $mesh->getPeerCount(), 'A client is not a mesh peer.');
@@ -234,7 +244,9 @@ class TWebSocketServerClusterTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', $key));
-		$server->serveOnce(0, 300000);
+		for ($tick = 0; $tick < 5; $tick++) {
+			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
+		}
 		self::assertCount(1, $cluster->presence());
 
 		// Close without reading the 101; the unread receive buffer turns the close into a reset, so

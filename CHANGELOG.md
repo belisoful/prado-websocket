@@ -11,6 +11,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - `IWebSocketClusterAware`. `TWebSocketModule` gives its cluster to a cluster-aware handler and re-raises the pub/sub request events as its own `onSubscribe`, `onPublish`, `onSend` and `onCall`.
 - Error codes: `websocket_pubsub_frame_too_large`, `websocket_pubsub_frame_malformed`, `websocket_pubsub_type_unknown`, `websocket_pubsub_channel_invalid`, `websocket_pubsub_field_required`, `websocket_pubsub_subscription_limit`, `websocket_pubsub_forbidden`, `websocket_pubsub_client_unknown`, `websocket_pubsub_method_unknown`, `websocket_pubsub_internal_error`.
 - Error codes: `websocket_module_event_loop_invalid`, `websocket_module_event_loop_class_invalid`.
+- `TPermessageDeflateExtension::isAvailable()` and `TPermessageDeflateNegotiator::isAvailable()` report whether ext-zlib is loaded. Error codes: `websocket_permessage_deflate_zlib_missing`, `websocket_permessage_deflate_deflate_failed`.
 - Playwright specs for the browser client against the pub/sub handler (`tests/playwright/pubsub.spec.js`); `ws-server.php` serves pub/sub with `WS_PUBSUB=1`.
 - `examples/chat`: a multi-room chat on `TWebSocketPubSubHandler` and `prado-pubsub.js`, with history, whispers and reconnection. It runs as a standalone server or as a PRADO application (`websocket/serve`), and `tests/playwright/chat-example.spec.js` covers both versions.
 
@@ -25,6 +26,8 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - A large frame received in small reads costs time linear in its size; each read copied the whole buffered frame, so a peer trickling a frame near `MaxMessageSize` could occupy the event loop. Bytes received after the peer's Close are discarded rather than buffered without limit.
 
 ### Fixed
+- An HTTP/2 session that nghttp2 has finished with, after a peer's connection error (a malformed frame) or a completed GOAWAY, is closed once its GOAWAY is sent. Before, the transport and its streams were held open.
+- Socket tests no longer block on a reply the server has not yet sent: they pump the server until the bytes arrive, so a slow tick passes and a real failure fails within seconds. This was the intermittent 60 s failure on PHP 8.5.
 - A throwing handler `onClose` on an HTTP/2 stream no longer skips the cluster unregister of that stream, or of the transport's other streams when it ends.
 
 ### Changed
@@ -33,7 +36,12 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - The development dependency on `belisoful/prado-http2` is `^1.3`, the release CI builds against.
 - `THttp2WebSocketProtocol` holds bytes received while its HTTP/2 session is busy and feeds them, in order, once the outer `receive()` or `send()` returns; a `send()` made during another `send()` returns `''`. `prado-http2` 1.3 refuses to re-enter a session's nghttp2 call (`http2_session_busy`), and a handler that waits on the event loop outside a fiber of its own ticks the reactor from inside that call. Before, the server's next read of that transport threw and ended the whole HTTP/2 connection.
 - Playwright is `@playwright/test` 1.62.1, as PRADO pins; 1.60.0 cannot install browsers on Ubuntu 26.04.
-- Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0.
+- Development tools are pinned to PRADO's exact versions: `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.3. PHPStan runs at level 4 with `treatPhpDocTypesAsCertain: false`, as PRADO does, and phpunit reports every error and deprecation (`error_reporting=-1`). The unused `phpdocumentor/shim` is removed.
+- permessage-deflate needs ext-zlib up front: without it, constructing `TPermessageDeflateNegotiator` or `TPermessageDeflateExtension` throws `websocket_permessage_deflate_zlib_missing`, so a server or module configured for compression fails at configuration rather than with a fatal `Error` after negotiation. A `deflate_add()` failure throws `websocket_permessage_deflate_deflate_failed`.
+- CI runs php-cs-fixer and phpstan from `vendor/bin` at the pinned versions and adds a PHP 8.4 leg against the Packagist `belisoful/prado-http2` release. The Autobahn job builds the same prado-http2 revision as the unit jobs, pins its Docker image by digest, has a 30-minute timeout, loads ffi, and fails a report with fewer than 500 cases. Workflows have read-only permissions and cancel superseded runs.
+- `.gitattributes` keeps tests, CI and tool configs out of the Composer dist; `agents/` and `examples/` ship.
+- `.nvmrc` pins Node 24, as PRADO does.
+- README marks pub/sub and the PHP 8.2 minimum as 1.2.0 (unreleased), and its `tryDecode()` example uses the returned `frame` and `length`.
 - Runs on PRADO's event loop API (pradosoft/prado#1377). `TSocketReactor` is now an `IEventLoop`: `TWebSocketServer` schedules its handshake and close deadlines with `delay()`, its idle scan with `repeat()`, and cancels them with `cancel()`, so timer identifiers are strings. A deadline timer that fires before the server's clock reaches the deadline re-arms itself, and a server that moves to another reactor with `setReactor()` re-arms its pending handshake and close deadlines there.
 - `config/errorMessages.txt` entries are ICU MessageFormat patterns, as PRADO now formats them with `MessageFormatter` (pradosoft/prado#1437). A quoted placeholder is written `''{0}''`; the single-quoted `'{0}'` the file used rendered a literal `{0}` in every message that named a value. A unit test checks that each entry is a valid pattern that renders every argument, that the file defines exactly the codes `src/` throws, and that each message is a sentence.
 - `websocket_frame_incomplete` and `websocket_pubsub_subscription_limit` use ICU `plural`, so a count of one reads "1 byte" and "1 subscription", and a count of 1000 or more is grouped ("16,384 bytes").

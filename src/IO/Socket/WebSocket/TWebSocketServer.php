@@ -1646,6 +1646,7 @@ class TWebSocketServer extends TSocketServer
 		$id = spl_object_id($transport);
 		$buffer = $this->_sessions[$id]['outbound'] ?? '';
 		if ($buffer === '') {
+			$this->endFinishedHttp2Session($transport);
 			return;
 		}
 		$length = strlen($buffer);
@@ -1664,6 +1665,24 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$this->_sessions[$id]['outbound'] = $sent >= $length ? '' : substr($buffer, $sent);
+		if ($sent >= $length) {
+			$this->endFinishedHttp2Session($transport);
+		}
+	}
+
+	/**
+	 * Ends an HTTP/2 session that nghttp2 has finished with: after a connection error (a malformed
+	 * frame) or a completed GOAWAY exchange the session wants no more I/O, so once its last output
+	 * (the GOAWAY) is on the wire the transport is closed rather than held open.
+	 * @param TSocketStream $transport The session transport, with no output queued.
+	 */
+	private function endFinishedHttp2Session(TSocketStream $transport): void
+	{
+		$protocol = $this->_sessions[spl_object_id($transport)]['protocol'] ?? null;
+		if ($protocol !== null && !$protocol->getSession()->wantsIo()) {
+			$this->log('HTTP/2 session ended: the peer\'s connection error or GOAWAY finished it.', TLogger::NOTICE);
+			$this->endHttp2Session($transport);
+		}
 	}
 
 	/**
