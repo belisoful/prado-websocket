@@ -13,6 +13,7 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\IResource;
+use Prado\IO\Process\TProcess;
 use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpointLimits;
@@ -58,8 +59,15 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  * {@see setSslContext() SslContext} options and the URI's host as the peer name; the WebSocket
  * handshake follows.  A connecting dial is one of the {@see getWriteSources() write sources}, so the
  * server's writability check advances it, and a handshaking one advances when it is readable.  Every
- * step runs under the {@see setTimeout() Timeout}.  A hostname resolves synchronously, since PHP has
- * no non-blocking resolver: use IP addresses in Peers and Advertise to keep every dial off the loop.
+ * step runs under the {@see setTimeout() Timeout}.
+ *
+ * A hostname resolves without blocking the loop either.  PHP has no non-blocking resolver, so a
+ * short child process ({@see startResolver()}) runs the system resolver (`/etc/hosts`, the search
+ * domains, a container's service names) and writes the addresses to its stdout, which is one of
+ * the {@see getSources() sources}; the dial then connects to the first address, keeping the
+ * hostname as the TLS peer name.  The lookup runs under the dial {@see setTimeout() Timeout}, one per
+ * host at a time, and its result is cached for {@see RESOLVE_TTL} seconds; a dial that fails drops
+ * the cached address, so a peer that moved is looked up again.
  *
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
  * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
@@ -131,6 +139,17 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	public const ANNOUNCE_INTERVAL = 1.0;
 
+	/**
+	 * The seconds a hostname's resolved addresses are reused before it is looked up again.
+	 * @since 1.2.0
+	 */
+	public const RESOLVE_TTL = 60.0;
+
+	/** The resolver child's program: the system resolver's IPv4 addresses, else the IPv6 ones, as JSON. */
+	private const RESOLVER_CODE = '$h = $argv[1] ?? \'\'; $a = @gethostbynamel($h) ?: [];'
+		. ' if ($a === [] && function_exists(\'dns_get_record\')) { foreach (@dns_get_record($h, DNS_AAAA) ?: [] as $r) { if (isset($r[\'ipv6\'])) { $a[] = $r[\'ipv6\']; } } }'
+		. ' echo json_encode(array_values(array_unique($a)));';
+
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
@@ -139,6 +158,15 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 
 	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, secure: bool, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id; `state` is 'connecting', 'securing' (the TLS handshake), or 'handshaking' (the WebSocket upgrade). */
 	private array $_pending = [];
+
+	/** @var array<string, array{process: TProcess, buffer: string, deadline: float, spawned: int, uris: array<string, true>}> In-flight hostname lookups, keyed by host; `spawned` is the {@see \hrtime()} it started; `uris` are the dials waiting on it. */
+	private array $_resolving = [];
+
+	/** @var array<string, array{address: string, expires: float}> Resolved hostnames, keyed by host. */
+	private array $_resolved = [];
+
+	/** @var TProcess[] Resolver children abandoned at their deadline, closed once they exit. */
+	private array $_reaping = [];
 
 	/** @var array<string, array<string, mixed>> The local clients' presence, for snapshotting to new peers. */
 	private array $_localPresence = [];
@@ -297,6 +325,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		foreach ($this->_pending as $pending) {
 			$pending['transport']->close();
 		}
+		foreach ($this->_resolving as $lookup) {
+			$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
+		}
+		$this->_resolving = [];
 		$this->_peers = [];
 		$this->_pending = [];
 		$this->_seen = [];
@@ -319,6 +351,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		if ($this->_cluster === null) {
 			return;
 		}
+		$this->advanceResolvers();
 		$this->advancePending();
 		foreach ($this->_peers as $id => $peer) {
 			if (!$peer['verified'] && $this->getMonotonicClock()->seconds() > $peer['authDeadline']) {
@@ -429,12 +462,20 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Returns the peer and in-flight-dial transports to fold into the server's event loop.
-	 * @return \Prado\IO\IResource[] The transports to select on.
+	 * Returns the peer and in-flight-dial transports, and the stdout of each hostname lookup, to fold
+	 * into the server's event loop.
+	 * @return \Prado\IO\IResource[] The transports and pipes to select on.
 	 */
 	public function getSources(): array
 	{
-		return array_merge(array_column($this->_peers, 'transport'), array_column($this->_pending, 'transport'));
+		$sources = array_merge(array_column($this->_peers, 'transport'), array_column($this->_pending, 'transport'));
+		foreach ($this->_resolving as $lookup) {
+			$stdout = $lookup['process']->getStdout();
+			if ($stdout !== null && is_resource($stdout->getResource())) {
+				$sources[] = $stdout;
+			}
+		}
+		return $sources;
 	}
 
 	/**
@@ -758,15 +799,23 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 				return;   // a dial to this peer is already in flight; do not open a duplicate link
 			}
 		}
+		$address = TSocketAddress::parse($uri);
+		$host = trim((string) $address->getHost(), '[]');
+		if (isset($this->_resolving[$host]['uris'][$uri])) {
+			return;   // waiting on the lookup of its host
+		}
+		$ip = $this->addressOf($host);
+		if ($ip === null) {
+			$this->resolve($host, $uri);   // connectPeer() runs again once the host resolves
+			return;
+		}
 		$this->_knownUris[$uri] = true;
 		$secure = !preg_match('#^tcp://#i', $uri);
 		$context = null;
-		$target = $uri;
+		// Connect to the address over TCP: stream_socket_client() would resolve a hostname, and run a
+		// TLS handshake inside the connect, both blocking; advanceDial() drives the TLS handshake.
+		$target = 'tcp://' . (str_contains($ip, ':') ? '[' . $ip . ']' : $ip) . ':' . $address->getPort();
 		if ($secure) {
-			// stream_socket_client() would run the TLS handshake inside the connect and block; connect over
-			// TCP and drive the handshake from advanceDial() instead.
-			$target = 'tcp://' . substr($uri, (int) strpos($uri, '://') + 3);
-			$host = trim((string) TSocketAddress::parse($uri)->getHost(), '[]');
 			$context = stream_context_create(['ssl' => $this->_sslContext + ['peer_name' => $host]]);
 		}
 		$transport = TSocketStream::connect($target, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT, $context);
@@ -1274,6 +1323,190 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$this->_pending[$id]['transport']->close();
 		unset($this->_pending[$id]);
 		unset($this->_knownUris[$uri]);
+		unset($this->_resolved[trim((string) TSocketAddress::parse($uri)->getHost(), '[]')]);   // a peer that moved is looked up again
+	}
+
+	// =========================================================================
+	// Hostname resolution
+	// =========================================================================
+
+	/**
+	 * Returns the address to connect to for a host: the host itself when it is an IP address, or a
+	 * cached lookup that has not expired.
+	 * @param string $host The URI host, without IPv6 brackets.
+	 * @return ?string The IP address, or null when the host must be looked up.
+	 */
+	private function addressOf(string $host): ?string
+	{
+		if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+			return $host;
+		}
+		$cached = $this->_resolved[$host] ?? null;
+		if ($cached !== null && $this->getMonotonicClock()->seconds() < $cached['expires']) {
+			return $cached['address'];
+		}
+		unset($this->_resolved[$host]);
+		return null;
+	}
+
+	/**
+	 * Starts looking up a host for a dial, or adds the dial to the lookup in flight.  A host that is not
+	 * a valid DNS name is refused without a lookup.
+	 * @param string $host The hostname.
+	 * @param string $uri The peer URI waiting on it.
+	 * @throws \Prado\Exceptions\TInvalidDataValueException When the host is not a valid hostname.
+	 */
+	private function resolve(string $host, string $uri): void
+	{
+		if (!preg_match('/^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/', $host)) {
+			throw new TInvalidDataValueException('websocket_backplane_mesh_host_invalid', $host);
+		}
+		$this->_knownUris[$uri] = true;
+		if (!isset($this->_resolving[$host])) {
+			$process = $this->startResolver($host);
+			$this->_resolving[$host] = ['process' => $process, 'buffer' => '', 'deadline' => $this->getMonotonicClock()->seconds() + $this->_timeout, 'spawned' => \hrtime(true), 'uris' => []];
+		}
+		$this->_resolving[$host]['uris'][$uri] = true;
+	}
+
+	/**
+	 * Starts the child process that looks up a host.  It runs the PHP binary without an ini file,
+	 * passes the host as an argument (no shell), and writes the host's addresses to its stdout as a
+	 * JSON list; its stdout is non-blocking.  A subclass may run another resolver that writes the
+	 * same output.
+	 * @param string $host The hostname.
+	 * @throws \Prado\Exceptions\TIOException When the process cannot be started.
+	 * @return TProcess The running resolver.
+	 * @since 1.2.0
+	 */
+	protected function startResolver(string $host): TProcess
+	{
+		$process = TProcess::open([PHP_BINARY, '-n', '-r', self::RESOLVER_CODE, '--', $host], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']]);
+		$process->getStdin()?->close();
+		$process->getStderr()?->close();   // the program suppresses its warnings; nothing is read here
+		$stdout = $process->getStdout();
+		if ($stdout !== null) {
+			stream_set_blocking($stdout->getResource(), false);
+		}
+		return $process;
+	}
+
+	/**
+	 * Reads each lookup's output.  A lookup that has written its addresses and exited is cached and
+	 * its dials are started; one past the dial {@see getTimeout() Timeout}, or that found no address,
+	 * fails its dials.  Resolver children abandoned earlier are closed once they exit.
+	 */
+	private function advanceResolvers(): void
+	{
+		foreach ($this->_reaping as $i => $process) {
+			if (!$process->getIsRunning()) {
+				$process->close();
+				unset($this->_reaping[$i]);
+			}
+		}
+		foreach (array_keys($this->_resolving) as $host) {
+			$lookup = $this->_resolving[$host];
+			$stdout = $lookup['process']->getStdout();
+			$resource = $stdout?->getResource();
+			$done = !is_resource($resource);
+			if (!$done) {
+				$chunk = @fread($resource, 4096);
+				if (is_string($chunk) && $chunk !== '') {
+					$lookup['buffer'] .= $chunk;
+					$this->_resolving[$host]['buffer'] = $lookup['buffer'];
+				}
+				$done = feof($resource) || strlen($lookup['buffer']) > 65536;
+			}
+			if ($done) {
+				unset($this->_resolving[$host]);
+				$this->settleResolver($host, $lookup);
+			} elseif ($this->getMonotonicClock()->seconds() > $lookup['deadline']) {
+				unset($this->_resolving[$host]);
+				$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
+				$this->failLookup($host, $lookup['uris'], 'the lookup timed out');
+			}
+		}
+	}
+
+	/**
+	 * Caches a finished lookup's first address and starts its dials, or fails them when it found none.
+	 * @param string $host The hostname.
+	 * @param array{process: TProcess, buffer: string, deadline: float, spawned: int, uris: array<string, true>} $lookup The lookup.
+	 */
+	private function settleResolver(string $host, array $lookup): void
+	{
+		$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
+		$addresses = json_decode($lookup['buffer'], true);
+		$address = null;
+		foreach (is_array($addresses) ? $addresses : [] as $candidate) {
+			if (is_string($candidate) && filter_var($candidate, FILTER_VALIDATE_IP) !== false) {
+				$address = $candidate;
+				break;
+			}
+		}
+		if ($address === null) {
+			$this->failLookup($host, $lookup['uris'], 'it has no address');
+			return;
+		}
+		$this->_resolved[$host] = ['address' => $address, 'expires' => $this->getMonotonicClock()->seconds() + self::RESOLVE_TTL];
+		foreach (array_keys($lookup['uris']) as $uri) {
+			unset($this->_knownUris[$uri]);
+			try {
+				$this->connectPeer($uri);
+			} catch (\Throwable $e) {
+				Prado::log("Mesh peer {$uri} could not be dialed: " . $e->getMessage(), TLogger::NOTICE, static::class);
+			}
+		}
+	}
+
+	/**
+	 * Fails the dials waiting on a lookup, so a seed is re-dialed later and a gossiped peer when it
+	 * is announced again.
+	 * @param string $host The hostname.
+	 * @param array<string, true> $uris The dials waiting on it.
+	 * @param string $reason Why the lookup failed, for the log.
+	 */
+	private function failLookup(string $host, array $uris, string $reason): void
+	{
+		Prado::log("Mesh peer host {$host} could not be resolved: {$reason}", TLogger::NOTICE, static::class);
+		foreach (array_keys($uris) as $uri) {
+			unset($this->_knownUris[$uri]);
+		}
+	}
+
+	/**
+	 * Lets go of a resolver child without waiting for it: an exited one is closed, and a running one
+	 * has its pipes closed and is closed once it exits, since closing a running process waits for it.
+	 * One known to be running its program (it has written output, or a second has passed) is sent
+	 * SIGTERM; a signal sent just after the fork can reach this process on some platforms.  The age is
+	 * real time ({@see \hrtime()}), not the injectable monotonic clock.
+	 * @param TProcess $process The resolver.
+	 * @param int $spawned The {@see \hrtime()} it was started.
+	 * @param bool $hasOutput Whether it has written output.
+	 */
+	private function abandonResolver(TProcess $process, int $spawned, bool $hasOutput): void
+	{
+		if (!$process->getIsRunning()) {
+			$process->close();
+			return;
+		}
+		foreach ($process->getPipes() as $pipe) {
+			$pipe->close();
+		}
+		if ($hasOutput || \hrtime(true) - $spawned >= 1_000_000_000) {
+			$process->terminate();
+		}
+		$this->_reaping[] = $process;
+	}
+
+	/**
+	 * Returns the number of hostname lookups in flight.
+	 * @return int The lookup count.
+	 * @since 1.2.0
+	 */
+	public function getResolvingCount(): int
+	{
+		return count($this->_resolving);
 	}
 
 	/**

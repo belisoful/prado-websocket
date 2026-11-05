@@ -52,6 +52,7 @@ websocket_close_code_not_sendable		= WebSocket Close code {0} is not a sendable 
 websocket_permessage_deflate_level_invalid	= WebSocket permessage-deflate compression level {0} must be -1 (zlib default) or 0-9.
 websocket_backplane_mesh_secret_required	= TMeshBackplane requires a Secret; without one no peer can join, so the mesh cannot open.
 websocket_backplane_mesh_peer_pattern_invalid	= TMeshBackplane PeerPattern ''{0}'' is not a valid regular expression.
+websocket_backplane_mesh_host_invalid	= TMeshBackplane cannot dial ''{0}'': it is not a valid hostname.
 websocket_backplane_multiple			= TWebSocketModule accepts a single <backplane> element; a second backplane ''{0}'' is configured.
 websocket_module_node_id_immutable		= TWebSocketModule NodeId cannot change after the cluster is created.
 websocket_service_not_upgrade			= The request is not a valid WebSocket upgrade.
