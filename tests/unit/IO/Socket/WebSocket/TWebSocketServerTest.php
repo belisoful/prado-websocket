@@ -2531,4 +2531,26 @@ class TWebSocketServerTest extends TestCase
 		}
 		$server->close();
 	}
+
+	public function testAServeOnceHostShutsTheSessionsDownItself()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setShutdownTimeout(0);   // no drain: each session ends once its Close is written
+		$client = $this->upgradedClient($server);
+
+		$server->shutdownSessions();
+
+		self::assertSame(1, $closed, 'The session ends through onClose.');
+		self::assertSame(0, $server->getConnectionCount());
+		$frame = TWebSocketFrameCodec::tryDecode($client->read(4096), false);
+		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode(), 'The peer is sent 1001 Going Away.');
+		$client->close();
+		$server->close();
+	}
 }

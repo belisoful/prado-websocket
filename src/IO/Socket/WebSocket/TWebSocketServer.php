@@ -757,7 +757,8 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Closes the live sessions as {@see serve()} ends.  A pending handshake is closed at once.  Each
+	 * Closes the live sessions; {@see serve()} calls it as it ends, and a host that drives the loop
+	 * with {@see serveOnce()} calls it when it stops.  A pending handshake is closed at once.  Each
 	 * open WebSocket, HTTP/1.1 or HTTP/2 stream, is sent a Close with 1001 (Going Away), and the loop
 	 * keeps running until every close handshake completes, {@see getShutdownTimeout() ShutdownTimeout}
 	 * passes, or a wait passes with no I/O.  A session that completes its handshake ends normally.
@@ -766,7 +767,7 @@ class TWebSocketServer extends TSocketServer
 	 * is closed.  A failure on one session is logged and ends only that session.
 	 * @since 1.2.0
 	 */
-	protected function shutdownSessions(): void
+	public function shutdownSessions(): void
 	{
 		if ($this->_sessions === []) {
 			return;
@@ -868,8 +869,8 @@ class TWebSocketServer extends TSocketServer
 	 * reactor is not made the {@see TAsync::getLoop() TAsync loop}, so a fiber a handler starts with
 	 * {@see TAsync::run()} resumes only once the host calls `TAsync::setLoop($server->getReactor())`.
 	 * No reactor ErrorHandler is installed, so an exception from an application timer leaves
-	 * serveOnce().  The live sessions stay open when the host stops pumping; {@see shutdownSessions()}
-	 * closes them.
+	 * serveOnce().  The live sessions stay open when the host stops pumping until it calls
+	 * {@see shutdownSessions()}.
 	 * @param ?int $seconds Tick timeout in seconds; null waits until activity or the nearest reactor
 	 *   timer, bounded by {@see CLUSTER_TICK_INTERVAL} when a cluster is present.
 	 * @param int $microseconds Additional tick timeout microseconds.
