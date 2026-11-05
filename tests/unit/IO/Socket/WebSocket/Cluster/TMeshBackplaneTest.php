@@ -827,6 +827,18 @@ class TMeshBackplaneTest extends TestCase
 		$b->close();
 	}
 
+	public function testLinkLimitsAreTheEndpointLimitsAndApplyToDialedLinks()
+	{
+		$mesh = new TMeshBackplane();
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE, $mesh->getEndpointMaxMessageSize());
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER, $mesh->getEndpointMaxSendBufferBytes());
+		$mesh->setLinkMaxMessageSize('20971520');
+		$mesh->setLinkMaxSendBufferBytes(-1);
+		self::assertSame(20971520, $mesh->getLinkMaxMessageSize());
+		self::assertSame(20971520, $mesh->getEndpointMaxMessageSize(), 'The server applies the link limit to the links it accepts.');
+		self::assertSame(0, $mesh->getLinkMaxSendBufferBytes(), 'A negative value clamps to unlimited.');
+	}
+
 	public function testOpenRequiresASecret()
 	{
 		[$mesh] = $this->makeNode('A');

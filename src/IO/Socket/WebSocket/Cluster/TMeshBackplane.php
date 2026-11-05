@@ -15,7 +15,7 @@ use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\IResource;
 use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketStream;
-use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
+use Prado\IO\Socket\WebSocket\IWebSocketEndpointLimits;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
@@ -95,13 +95,18 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  * replayed handshake cannot buffer a full
  * {@see \Prado\IO\Socket\WebSocket\TWebSocketConnection::getMaxMessageSize() MaxMessageSize}.
  *
+ * Both ends of a link apply {@see getLinkMaxMessageSize() LinkMaxMessageSize} and
+ * {@see getLinkMaxSendBufferBytes() LinkMaxSendBufferBytes}, not the server's client limits, so an
+ * envelope that carries a client message near the client limit, larger once base64-encoded, does
+ * not drop the link.
+ *
  * Durations within the process (the heartbeat, scan and re-dial intervals, the dial and challenge
  * deadlines, and the liveness of each node, from local receipt times) are measured on the
  * {@see getMonotonicClock() MonotonicClock}, so a wall-clock step neither expires nor extends them.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
-class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, IWebSocketEndpoint
+class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, IWebSocketEndpointLimits
 {
 	use TApplicationClockAwareTrait;
 	use TMonotonicClockAwareTrait;
@@ -209,6 +214,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 
 	/** @var string The PCRE an announced peer URI must match to be dialed; '' dials any. */
 	private string $_peerPattern = '';
+
+	/** @var int The maximum message size of a peer link, in bytes; 0 for unlimited. */
+	private int $_linkMaxMessageSize = TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE;
+
+	/** @var int The maximum queued outbound bytes of a peer link; 0 for unlimited. */
+	private int $_linkMaxSendBufferBytes = TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER;
 
 	/** @var string This backplane's incarnation, announced in each node announce; '' until first used. */
 	private string $_incarnation = '';
@@ -705,7 +716,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 
 	/**
 	 * Indicates whether an upgrade targets the mesh peer path, so the server hands it here as a peer
-	 * link rather than a client.  Implements {@see IWebSocketEndpoint}.
+	 * link rather than a client.  Implements {@see \Prado\IO\Socket\WebSocket\IWebSocketEndpoint}.
 	 * @param ?string $target The request target (path).
 	 * @return bool Whether the target is the mesh {@see getPath() Path}.
 	 */
@@ -716,7 +727,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 
 	/**
 	 * Joins an authenticated, upgraded connection to the mesh as a peer.  Implements
-	 * {@see IWebSocketEndpoint}.
+	 * {@see \Prado\IO\Socket\WebSocket\IWebSocketEndpoint}.
 	 * @param TWebSocketConnection $connection The upgraded peer connection.
 	 * @param TSocketStream $transport The connection transport.
 	 * @param array<string, mixed> $request The parsed upgrade request.
@@ -1241,6 +1252,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		}
 		unset($this->_pending[$id]);
 		$link = Prado::createComponent(TWebSocketConnection::class, $transport, true);
+		$link->setMaxMessageSize($this->_linkMaxMessageSize);
+		$link->setMaxSendBufferBytes($this->_linkMaxSendBufferBytes);
 		$this->addPeer($link, $transport, $pending['uri']);
 		if ($response['body'] !== '') {
 			$this->ingest(spl_object_id($link), $response['body']);   // frames sent right after the 101
@@ -1432,6 +1445,76 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	{
 		$this->_sslContext = TPropertyValue::ensureArray($value);
 		return $this;
+	}
+
+	/**
+	 * Returns the maximum message size of a peer link.
+	 * @return int The maximum size in bytes, or 0 for unlimited.
+	 * @since 1.2.0
+	 */
+	public function getLinkMaxMessageSize(): int
+	{
+		return $this->_linkMaxMessageSize;
+	}
+
+	/**
+	 * Sets the maximum message size of a peer link, applied to the links this node dials and, through
+	 * {@see getEndpointMaxMessageSize()}, to those the server accepts for it.  Set the same value on
+	 * every node, above the client `MaxMessageSize` by the envelope's base64 overhead (a third).
+	 * Default {@see \Prado\IO\Socket\WebSocket\TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE}.
+	 * @param int|string $value The maximum size in bytes, or 0 for unlimited.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setLinkMaxMessageSize($value): static
+	{
+		$this->_linkMaxMessageSize = max(0, TPropertyValue::ensureInteger($value));
+		return $this;
+	}
+
+	/**
+	 * Returns the maximum queued outbound bytes of a peer link.
+	 * @return int The maximum queued bytes, or 0 for unlimited.
+	 * @since 1.2.0
+	 */
+	public function getLinkMaxSendBufferBytes(): int
+	{
+		return $this->_linkMaxSendBufferBytes;
+	}
+
+	/**
+	 * Sets the maximum queued outbound bytes of a peer link, applied to dialed and accepted links.
+	 * Default {@see \Prado\IO\Socket\WebSocket\TWebSocketConnection::DEFAULT_MAX_SEND_BUFFER}.
+	 * @param int|string $value The maximum queued bytes, or 0 for unlimited.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setLinkMaxSendBufferBytes($value): static
+	{
+		$this->_linkMaxSendBufferBytes = max(0, TPropertyValue::ensureInteger($value));
+		return $this;
+	}
+
+	/**
+	 * Returns {@see getLinkMaxMessageSize() LinkMaxMessageSize}, the limit the server applies to a
+	 * peer link it accepts for this endpoint.
+	 * @return ?int The maximum size in bytes, or 0 for unlimited.
+	 * @since 1.2.0
+	 */
+	public function getEndpointMaxMessageSize(): ?int
+	{
+		return $this->_linkMaxMessageSize;
+	}
+
+	/**
+	 * Returns {@see getLinkMaxSendBufferBytes() LinkMaxSendBufferBytes}, the limit the server applies
+	 * to a peer link it accepts for this endpoint.
+	 * @return ?int The maximum queued bytes, or 0 for unlimited.
+	 * @since 1.2.0
+	 */
+	public function getEndpointMaxSendBufferBytes(): ?int
+	{
+		return $this->_linkMaxSendBufferBytes;
 	}
 
 	/**

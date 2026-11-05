@@ -126,6 +126,33 @@ class TMeshBackplaneServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testAnAcceptedLinkKeepsTheMeshLimitAboveTheClientLimit()
+	{
+		[$server, $serverMesh] = $this->meshServer('tcp://127.0.0.1:0');
+		$server->setMaxMessageSize(1000);   // the client limit
+		$local = new TWebSocketConnection($stream = new TBufferStream(), false);
+		$server->getCluster()->register($local);
+		$dialer = new TMeshBackplane();
+		$dialer->setSecret('shh');
+		$dialerCluster = new TWebSocketCluster('dialer', $dialer);
+		$dialer->connectPeer('tcp://127.0.0.1:' . $server->getPort());
+		$this->pumpUntilLinked($server, $serverMesh, $dialer);
+		for ($i = 0; $i < 20; $i++) {   // complete the challenge exchange
+			$dialer->tick();
+			$server->serveOnce(0, 5000);
+		}
+
+		$dialerCluster->broadcast(random_bytes(900), true);   // client-legal, but over 1000 bytes once base64-encoded in an envelope
+		for ($i = 0; $i < 50 && $stream->getSize() === 0; $i++) {
+			$dialer->tick();
+			$server->serveOnce(0, 5000);
+		}
+		self::assertSame(1, $serverMesh->getPeerCount(), 'The accepted link is not dropped for an envelope over the client limit.');
+		self::assertGreaterThan(900, $stream->getSize(), 'The broadcast reaches the server node\'s client.');
+		$dialer->close();
+		$server->close();
+	}
+
 	public function testAPlainMeshDialCompletesThroughTheServer()
 	{
 		[$server, $serverMesh] = $this->meshServer('tcp://127.0.0.1:0');
