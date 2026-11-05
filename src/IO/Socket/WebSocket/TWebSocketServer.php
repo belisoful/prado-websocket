@@ -59,6 +59,12 @@ use Psr\Http\Message\StreamInterface;
  * connection, or the idle reaper gave up on it) keeps its transport until the Close frame has
  * drained and the peer's Close arrives, and at most for {@see getCloseTimeout() CloseTimeout}.
  *
+ * One connection's failure fails only that connection.  An exception from the handler raises its
+ * {@see IWebSocketHandler::onError()} and closes the WebSocket with 1011 (Internal Server Error),
+ * as the synchronous {@see IWebSocketHandler::handleConnection()} loop does; on HTTP/2 only that
+ * stream closes.  When {@see serve()} ends, every live WebSocket is closed with 1001 (Going Away)
+ * and given {@see getShutdownTimeout() ShutdownTimeout} to complete its close handshake.
+ *
  * The handshake, close, and idle timeouts are measured on the server's
  * {@see getMonotonicClock() MonotonicClock}, so a wall-clock change neither lengthens nor shortens
  * them, and the server's {@see getClock() Clock} does not move them.  The default reactor shares
@@ -120,6 +126,9 @@ class TWebSocketServer extends TSocketServer
 
 	/** @var float The seconds a closing session waits for the peer's Close before it is ended; 0 disables. */
 	private float $_closeTimeout = 5.0;
+
+	/** @var float The seconds {@see serve()} waits, as it ends, for live sessions to complete their close handshake. */
+	private float $_shutdownTimeout = 2.0;
 
 	/** @var ?TSocketReactor The event loop the server runs on, created on first use. */
 	private ?TSocketReactor $_reactor = null;
@@ -422,6 +431,29 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the shutdown timeout.
+	 * @return float The seconds {@see serve()} waits, as it ends, for live sessions to close.
+	 * @since 1.2.0
+	 */
+	public function getShutdownTimeout(): float
+	{
+		return $this->_shutdownTimeout;
+	}
+
+	/**
+	 * Sets the seconds {@see serve()} waits, as it ends, for the live sessions to complete the close
+	 * handshake {@see shutdownSessions()} starts with 1001 (Going Away).  Sessions still open after
+	 * it are ended without the peer's Close, so a stuck peer cannot hold the shutdown.  Default 2;
+	 * 0 ends every session at once, after its Close frame is written.
+	 * @param float|int|string $value The shutdown timeout in seconds.
+	 * @since 1.2.0
+	 */
+	public function setShutdownTimeout($value): void
+	{
+		$this->_shutdownTimeout = max(0, (float) $value);
+	}
+
+	/**
 	 * Returns the idle session timeout.
 	 * @return float The timeout in seconds, or 0 when idle reaping is disabled.
 	 */
@@ -636,6 +668,17 @@ class TWebSocketServer extends TSocketServer
 	 * loop is restored on exit.  A handler that waits on the main fiber (an `await()` or a
 	 * {@see TAsync::sleep()} outside a fiber of its own) ticks the reactor from inside its callback, so
 	 * a handler starts its waits in a fiber instead.
+	 *
+	 * While it serves, a reactor with no {@see TSocketReactor::getErrorHandler() ErrorHandler} gets
+	 * {@see handleLoopError()}, so an exception from an application timer (`TAsync` `delay()` or
+	 * `repeat()`) or from a fiber the loop resumes is logged and the loop carries on.  A host that set
+	 * its own handler keeps it.  The handler is removed on exit.
+	 *
+	 * When the loop ends ({@see close()}, a stop signal through a {@see TWebSocketModule}, or an
+	 * exception), {@see shutdownSessions()} closes the live sessions with 1001 (Going Away) and waits
+	 * up to {@see getShutdownTimeout() ShutdownTimeout} for their close handshakes.  The cluster then
+	 * closes and the server detaches from the reactor; each tear-down step runs even when an earlier
+	 * one throws.
 	 * @param ?int $seconds Per-pump tick timeout in seconds; null waits until activity or the nearest
 	 *   reactor timer (a handshake, close or idle deadline), blocking only when nothing is pending.
 	 * @param ?callable $afterEach Called after each pump, for a host with work to run between ticks
@@ -643,11 +686,16 @@ class TWebSocketServer extends TSocketServer
 	 */
 	public function serve(?int $seconds = null, ?callable $afterEach = null): void
 	{
+		$reactor = $this->getReactor();
 		$this->attachReactor();
 		$priorLoop = TAsync::getLoop();
-		TAsync::setLoop($this->getReactor());
-		$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
+		TAsync::setLoop($reactor);
+		$ownsErrorHandler = $reactor->getErrorHandler() === null;
+		if ($ownsErrorHandler) {
+			$reactor->setErrorHandler(fn (\Throwable $error) => $this->handleLoopError($error));
+		}
 		try {
+			$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
 			while ($this->isListening()) {
 				$this->serveOnce($seconds);
 				if ($afterEach !== null) {
@@ -655,16 +703,151 @@ class TWebSocketServer extends TSocketServer
 				}
 			}
 		} finally {
-			TAsync::setLoop($priorLoop);
-			$this->_cluster?->close();
-			$this->detachReactor();
+			try {
+				$this->shutdownSessions();
+			} finally {
+				TAsync::setLoop($priorLoop);
+				if ($ownsErrorHandler) {
+					$reactor->setErrorHandler(null);
+				}
+				try {
+					$this->_cluster?->close();
+				} catch (\Throwable $e) {
+					$this->log('Cluster close failed: ' . $e->getMessage());
+				} finally {
+					$this->detachReactor();
+				}
+			}
 		}
+	}
+
+	/**
+	 * Handles an exception a reactor callback threw while {@see serve()} runs, as the reactor's
+	 * {@see TSocketReactor::setErrorHandler() ErrorHandler}: an application timer, or a fiber the loop
+	 * resumed.  The server's own callbacks contain their failures; this logs the exception at ERROR
+	 * level, and the loop carries on.  Override it to report or rethrow.
+	 * @param \Throwable $error The exception the callback threw.
+	 * @since 1.2.0
+	 */
+	protected function handleLoopError(\Throwable $error): void
+	{
+		$this->log('An event loop callback failed: ' . $error::class . ': ' . $error->getMessage(), TLogger::ERROR);
+	}
+
+	/**
+	 * Closes the live sessions as {@see serve()} ends.  A pending handshake is closed at once.  Each
+	 * open WebSocket, HTTP/1.1 or HTTP/2 stream, is sent a Close with 1001 (Going Away), and the loop
+	 * keeps running until every close handshake completes, {@see getShutdownTimeout() ShutdownTimeout}
+	 * passes, or a wait passes with no I/O.  A session that completes its handshake ends normally.
+	 * The rest are ended then, an HTTP/2 transport with a GOAWAY first.  Every WebSocket ends through
+	 * the handler's {@see IWebSocketHandler::onClose()} and leaves the cluster, and every transport
+	 * is closed.  A failure on one session is logged and ends only that session.
+	 * @since 1.2.0
+	 */
+	protected function shutdownSessions(): void
+	{
+		if ($this->_sessions === []) {
+			return;
+		}
+		$this->log('Shutting down: ' . count($this->_sessions) . ' sessions are closed with 1001 Going Away.', TLogger::INFO);
+		foreach (array_column($this->_sessions, 'transport') as $transport) {
+			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+			if ($session === null) {
+				continue;
+			}
+			try {
+				if (isset($session['protocol'])) {
+					foreach ($session['protocol']->getConnections() as $connection) {
+						$connection->close(TWebSocketCloseCode::GoingAway);   // a no-op on a stream already closing
+					}
+					$this->queueHttp2Output($transport, $session['protocol']->send());
+				} elseif (isset($session['connection'])) {
+					$session['connection']->close(TWebSocketCloseCode::GoingAway);
+					$this->settleHttp1Session($transport, $session['connection']);
+				} else {
+					$this->forgetSession($transport);   // a pending handshake has no WebSocket to close
+					$transport->close();
+				}
+			} catch (\Throwable $e) {
+				$this->log('Session dropped during shutdown: ' . $e->getMessage());
+				$this->dropSession($transport);
+			}
+		}
+		$this->drainSessions();
+		$remaining = array_column($this->_sessions, 'transport');
+		if ($remaining !== []) {
+			$this->log('Shutdown: ' . count($remaining) . ' sessions are ended without completing the close handshake.', TLogger::NOTICE);
+		}
+		foreach ($remaining as $transport) {
+			$protocol = $this->_sessions[spl_object_id($transport)]['protocol'] ?? null;
+			if ($protocol !== null) {
+				try {
+					$protocol->getSession()->goaway();
+					$this->queueHttp2Output($transport, $protocol->send());   // best effort: whatever the socket takes now
+				} catch (\Throwable $e) {
+					// The transport cannot take the GOAWAY; the session still ends below.
+				}
+			}
+			$this->dropSession($transport);
+		}
+	}
+
+	/**
+	 * Runs the loop while sessions complete the close handshakes {@see shutdownSessions()} started.
+	 * It returns once no session has a WebSocket open or output queued, once
+	 * {@see getShutdownTimeout() ShutdownTimeout} has passed, or once a wait for the time remaining
+	 * ends with no source ready.
+	 */
+	private function drainSessions(): void
+	{
+		if ($this->_shutdownTimeout <= 0) {
+			return;
+		}
+		$clock = $this->getMonotonicClock();
+		$deadline = $clock->seconds() + $this->_shutdownTimeout;
+		while ($this->hasClosingSessions()) {
+			$remaining = $deadline - $clock->seconds();
+			if ($remaining <= 0) {
+				return;
+			}
+			$this->_clusterTicked = false;
+			$ready = $this->getReactor()->tick($remaining);
+			$this->afterTick();
+			if ($ready === 0) {
+				return;   // nothing moved for the rest of the wait (or a timer cut it short): stop waiting on silent peers
+			}
+		}
+	}
+
+	/**
+	 * Indicates whether a session still has a WebSocket open or output queued, so the shutdown drain
+	 * has something to wait for.
+	 * @return bool Whether a session is still closing.
+	 */
+	private function hasClosingSessions(): bool
+	{
+		foreach ($this->_sessions as $session) {
+			if (isset($session['connection']) || ($session['outbound'] ?? '') !== '') {
+				return true;
+			}
+			if (isset($session['protocol']) && $session['protocol']->getConnections() !== []) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
 	 * Runs one pump of the event loop: one reactor tick (readiness, due timers, dispatch) followed by
 	 * the per-tick housekeeping (the cluster tick, HTTP/2 output, close-deadline stamping, and write
 	 * arming).  This is the testable unit of {@see serve()}.
+	 *
+	 * A host that drives the loop with serveOnce() owns what {@see serve()} sets up around it.  The
+	 * reactor is not made the {@see TAsync::getLoop() TAsync loop}, so a fiber a handler starts with
+	 * {@see TAsync::run()} resumes only once the host calls `TAsync::setLoop($server->getReactor())`.
+	 * No reactor ErrorHandler is installed, so an exception from an application timer leaves
+	 * serveOnce().  The live sessions stay open when the host stops pumping; {@see shutdownSessions()}
+	 * closes them.
 	 * @param ?int $seconds Tick timeout in seconds; null waits until activity or the nearest reactor
 	 *   timer, bounded by {@see CLUSTER_TICK_INTERVAL} when a cluster is present.
 	 * @param int $microseconds Additional tick timeout microseconds.

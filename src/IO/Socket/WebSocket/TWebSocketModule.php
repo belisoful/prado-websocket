@@ -49,7 +49,8 @@ use Prado\Xml\TXmlElement;
  *    {@see setAllowedHosts() AllowedHosts}, {@see setPermessageDeflate() PermessageDeflate};
  *  - the limits {@see setMaxMessageSize() MaxMessageSize}, {@see setMaxSendBufferBytes() MaxSendBufferBytes},
  *    {@see setHandshakeTimeout() HandshakeTimeout},
- *    {@see setIdleTimeout() IdleTimeout}, {@see setCloseTimeout() CloseTimeout} and
+ *    {@see setIdleTimeout() IdleTimeout}, {@see setCloseTimeout() CloseTimeout},
+ *    {@see setShutdownTimeout() ShutdownTimeout} and
  *    {@see setMaxConnections() MaxConnections} (unset ones keep the server's defaults);
  *  - the {@see getCluster() cluster coordinator}, which makes the server one node of a cluster over
  *    the configured {@see Cluster\IWebSocketBackplane backplane} (a `<backplane>` child element, or
@@ -133,6 +134,9 @@ class TWebSocketModule extends TSocketServerModule
 
 	/** @var ?float The close timeout, or null for the server default. */
 	private ?float $_closeTimeout = null;
+
+	/** @var ?float The shutdown timeout, or null for the server default. */
+	private ?float $_shutdownTimeout = null;
 
 	/** @var ?int The maximum connections, or null for the server default. */
 	private ?int $_maxConnections = null;
@@ -251,6 +255,9 @@ class TWebSocketModule extends TSocketServerModule
 		if ($this->_closeTimeout !== null) {
 			$server->setCloseTimeout($this->_closeTimeout);
 		}
+		if ($this->_shutdownTimeout !== null) {
+			$server->setShutdownTimeout($this->_shutdownTimeout);
+		}
 		if ($this->_maxConnections !== null) {
 			$server->setMaxConnections($this->_maxConnections);
 		}
@@ -259,7 +266,9 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Drives the server's reactor loop until {@see stop()} closes the server, delivering caught
-	 * process signals between ticks.  The reactor is the module's {@see getEventLoop() EventLoop},
+	 * process signals between ticks.  As the loop ends, the server closes its live WebSockets with
+	 * 1001 (Going Away) and raises their `onClose` ({@see TWebSocketServer::shutdownSessions()})
+	 * before the module closes the transports.  The reactor is the module's {@see getEventLoop() EventLoop},
 	 * created by {@see createReactor()} unless one was set, so a subclass or the application can
 	 * register other sources or timers in the same loop.
 	 * @param TSocketServer $server The listening server, a {@see TWebSocketServer}.
@@ -690,6 +699,29 @@ class TWebSocketModule extends TSocketServerModule
 	public function setCloseTimeout($value): static
 	{
 		$this->_closeTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
+		return $this;
+	}
+
+	/**
+	 * Returns the shutdown timeout applied to the server.
+	 * @return ?float The seconds, or null for the server default.
+	 * @since 1.2.0
+	 */
+	public function getShutdownTimeout(): ?float
+	{
+		return $this->_shutdownTimeout;
+	}
+
+	/**
+	 * Sets the shutdown timeout applied to the server ({@see TWebSocketServer::setShutdownTimeout()}):
+	 * the seconds a stopping server gives its live WebSockets to complete the 1001 close handshake.
+	 * @param null|float|int|string $value The seconds, or null for the server default.
+	 * @return static The current module.
+	 * @since 1.2.0
+	 */
+	public function setShutdownTimeout($value): static
+	{
+		$this->_shutdownTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
 		return $this;
 	}
 
