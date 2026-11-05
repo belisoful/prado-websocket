@@ -147,12 +147,20 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		$this->request($connection, $frame);
 		$reply = $this->replies($stream);
 		self::assertCount(1, $reply);
-		self::assertSame(['type' => 'error', 'code' => TWebSocketPubSubException::LIMIT, 'message' => 'A pub/sub frame of ' . number_format(strlen($frame)) . ' bytes exceeds the 1,024-byte limit.'], $reply[0], 'The refusal carries no id: the frame is never decoded.');
+		self::assertSame(['type' => 'error', 'id' => 'big', 'code' => TWebSocketPubSubException::LIMIT, 'message' => 'A pub/sub frame of ' . number_format(strlen($frame)) . ' bytes exceeds the 1,024-byte limit.'], $reply[0], 'The refusal carries the id a scan finds; the frame is never decoded.');
 		self::assertSame(0, $calls, 'An oversized request runs nothing.');
 		self::assertFalse($connection->getIsClosing(), 'The connection stays open.');
 
 		$this->request($connection, ['type' => 'publish', 'id' => 'small', 'channel' => 'news', 'data' => 'ok']);
 		self::assertSame(1, $calls, 'A frame within the limit is served.');
+	}
+
+	public function testAnOversizedFrameKeepsOnlyAnIdWithinTheLimit()
+	{
+		$this->handler->setMaxFrameSize(1024);
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, json_encode(['type' => 'publish', 'channel' => 'news', 'data' => str_repeat('x', 1100), 'id' => 'late']));
+		self::assertArrayNotHasKey('id', $this->replies($stream)[0], 'An id past the first MaxFrameSize bytes is not scanned.');
 	}
 
 	public function testMaxFrameSizeZeroDecodesUpToTheServerLimit()
@@ -278,7 +286,20 @@ class TWebSocketPubSubHandlerTest extends TestCase
 			'float id' => ['{"type":"ping","id":1.5}', false],
 			'array id' => ['{"type":"ping","id":["a"]}', false],
 			'valid id, no type' => ['{"id":"9"}', true],
-			'too deep' => ['{"type":"call","id":"9","method":"m","params":' . str_repeat('[', 40) . str_repeat(']', 40) . '}', false],
+			'too deep' => ['{"type":"call","id":"9","method":"m","params":' . str_repeat('[', 40) . str_repeat(']', 40) . '}', true],
+			'too deep, id last' => ['{"type":"call","method":"m","params":' . str_repeat('[', 40) . str_repeat(']', 40) . ',"id":"9"}', true],
+			'lone surrogate, id last' => ['{"type":"publish","channel":"room:1","data":{"text":"a\\ud83d","q":"\\"}"},"id":"9"}', true],
+			'lone surrogate, spaced id' => ['{ "id" : "9" , "type":"publish","data":"\\ud800"}', true],
+			'lone surrogate, escaped id key' => ['{"\\u0069d":"9","type":"publish","data":"\\ud800"}', true],
+			'lone surrogate, nested id only' => ['{"type":"publish","data":{"id":"9"},"x":"\\ud800"}', false],
+			'lone surrogate, malformed id' => ['{"type":"publish","id":["9"],"x":"\\ud800"}', false],
+			'lone surrogate, id too long' => ['{"type":"publish","id":"' . str_repeat('x', 65) . '","x":"\\ud800"}', false],
+			'truncated before the id ends' => ['{"type":"publish","id":9', false],
+			'unterminated string' => ['{"type":"publish","x":"\\ud800,"id":"9"}', false],
+			'unbalanced data' => ['{"type":"publish","data":[1,"id":"9"}', false],
+			'no colon' => ['{"type" "publish","id":"9"}', false],
+			'no comma' => ['{"type":"publish" "id":"9"}', false],
+			'not an object' => ['["id","9"', false],
 		];
 	}
 
@@ -293,17 +314,86 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $replies[0]['code']);
 		self::assertStringContainsString('JSON object', $replies[0]['message']);
 		if ($keepsId) {
-			self::assertSame('9', $replies[0]['id'], 'A well-formed id is echoed.');
+			self::assertSame('9', $replies[0]['id'], 'A well-formed top-level id is echoed, decoded or found by the scan.');
 		} else {
 			self::assertArrayNotHasKey('id', $replies[0], 'A malformed id is not echoed.');
 		}
 	}
 
-	public function testPingIsAnsweredWithPongAndNoAck()
+	public function testAnUndecodableFrameKeepsAnIntegerId()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, '{"type":"publish","data":"\\ud800","id":42}');
+		self::assertSame(42, $this->replies($stream)[0]['id']);
+	}
+
+	public function testPingIsAnsweredWithPong()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, ['type' => 'ping']);
+		self::assertSame([['type' => 'pong']], $this->replies($stream));
+	}
+
+	public function testAPingWithAnIdIsAcked()
 	{
 		[$connection, $stream] = $this->openClient();
 		$this->request($connection, ['type' => 'ping', 'id' => 'p1']);
-		self::assertSame([['type' => 'pong']], $this->replies($stream));
+		self::assertSame([['type' => 'ack', 'id' => 'p1']], $this->replies($stream), 'A request with an id gets exactly one ack.');
+	}
+
+	public function testAnIntegerIdOutsideTheIntegerRangeIsEchoedAsAString()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, '{"type":"ping","id":123456789012345678901234567890}');
+		self::assertSame([['type' => 'ack', 'id' => '123456789012345678901234567890']], $this->replies($stream));
+	}
+
+	public function testAStringIdIsLimitedInBytes()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, ['type' => 'ping', 'id' => str_repeat('é', 32)]);
+		self::assertSame([['type' => 'ack', 'id' => str_repeat('é', 32)]], $this->replies($stream), 'A 64-byte id is accepted.');
+		$this->request($connection, ['type' => 'ping', 'id' => str_repeat('é', 32) . 'x']);
+		$reply = $this->replies($stream)[0];
+		self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $reply['code'], 'A 33-character, 65-byte id is refused.');
+		self::assertStringContainsString('64 bytes', $reply['message']);
+	}
+
+	public static function nonFiniteFrames(): array
+	{
+		return [
+			'exponent' => ['{"type":"publish","id":"n","channel":"room","data":{"v":[1e400]}}'],
+			'negative exponent sign' => ['{"type":"call","id":"n","method":"m","params":-1E+400}'],
+			'long mantissa' => ['{"type":"call","id":"n","method":"m","params":' . str_repeat('9', 310) . '.5}'],
+			'long mantissa, small exponent' => ['{"type":"call","id":"n","method":"m","params":' . str_repeat('9', 300) . '.5e10}'],
+		];
+	}
+
+	/** @dataProvider nonFiniteFrames */
+	public function testANumberOutOfFloatRangeIsABadRequest(string $raw)
+	{
+		$this->handler->setAllowClientPublish(true);
+		[$connection, $stream] = $this->openClient();
+		$called = false;
+		$this->handler->attachEventHandler('onCall', function () use (&$called) {
+			$called = true;
+		});
+		$this->request($connection, $raw);
+		$reply = $this->replies($stream);
+		self::assertCount(1, $reply, 'Nothing is published.');
+		self::assertSame(['type' => 'error', 'id' => 'n', 'code' => TWebSocketPubSubException::BAD_REQUEST], array_slice($reply[0], 0, 3, true));
+		self::assertStringContainsString('too large', $reply[0]['message']);
+		self::assertFalse($called);
+	}
+
+	public function testFiniteExponentsAndLongDigitRunsAreServed()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->setResult($param->getData());
+		});
+		$this->request($connection, '{"type":"call","id":"c","method":"echo","params":[1e308,"3e400","' . str_repeat('1', 400) . '",1e-400]}');
+		self::assertSame([['type' => 'ack', 'id' => 'c', 'data' => [1.0E+308, '3e400', str_repeat('1', 400), 0]]], $this->replies($stream));
 	}
 
 	public function testAnUnknownTypeIsAnsweredWithUnknownType()
@@ -492,6 +582,90 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame([['type' => 'message', 'channel' => 'room', 'from' => $clientId, 'data' => 'QUIET']], $this->replies($stream));
 	}
 
+	public static function relayedData(): array
+	{
+		return [
+			'empty object' => ['{}'],
+			'object with list keys' => ['{"0":"x","1":"y"}'],
+			'big integer' => ['123456789012345678901234567890'],
+			'nested, with whitespace' => ['{ "a" : [ 1.0, -0, {} ], "b\\u0041": "\\u00e9\\"/" }'],
+			'string' => ['"a,b}c"'],
+			'empty list' => ['[]'],
+		];
+	}
+
+	/** @dataProvider relayedData */
+	public function testAPublishRelaysTheDataAsTheClientSentIt(string $data)
+	{
+		$this->handler->setAllowClientPublish(true);
+		[$alice, $aliceOut, $aliceId] = $this->openClient();
+		[$bob, $bobOut] = $this->openClient();
+		$this->request($bob, ['type' => 'subscribe', 'channel' => 'room']);
+		$this->frames($bobOut);
+		$this->request($alice, '{"type":"publish","channel":"room","data": ' . $data . ' ,"id":"p"}');
+		$frames = $this->frames($bobOut);
+		self::assertCount(1, $frames);
+		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $data . '}', $frames[0]->getPayload());
+		self::assertSame([['type' => 'ack', 'id' => 'p']], $this->replies($aliceOut));
+		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $data . '}', $this->backplane->published[0]->getPayload(), 'Other nodes get the same frame.');
+	}
+
+	public function testTheEventSeesArraysAndBigIntegersAsStrings()
+	{
+		$this->handler->setAllowClientPublish(true);
+		[$connection] = $this->openClient();
+		$seen = null;
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) use (&$seen) {
+			$seen = $param->getData();
+		});
+		$this->request($connection, '{"type":"publish","channel":"room","data":{"o":{},"n":123456789012345678901234567890,"i":7}}');
+		self::assertSame(['o' => [], 'n' => '123456789012345678901234567890', 'i' => 7], $seen);
+	}
+
+	public function testOfDuplicateDataMembersTheDecodedOneIsRelayed()
+	{
+		$this->handler->setAllowClientPublish(true);
+		[$connection, $stream] = $this->openClient();
+		$this->request($connection, ['type' => 'subscribe', 'channel' => 'room']);
+		$seen = null;
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) use (&$seen) {
+			$seen = $param->getData();
+		});
+		$this->frames($stream);
+		$this->request($connection, '{"type":"publish","channel":"room","data":"first","d\\u0061ta":"second"}');
+		self::assertSame('second', $seen, 'json_decode keeps the last duplicate.');
+		self::assertSame('second', $this->replies($stream)[0]['data'], 'The relay is the member the event saw.');
+	}
+
+	public function testDataReplacedAfterTheChangeFlagResetsIsEncoded()
+	{
+		[$connection, $stream, $clientId] = $this->openClient();
+		$this->request($connection, ['type' => 'subscribe', 'channel' => 'room']);
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->setAllowed(true);
+			$param->setData(['text' => 'stamped']);
+		});
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->resetParameterChanged();   // as a re-raise of the event with the same parameter does
+		});
+		$this->frames($stream);
+		$this->request($connection, '{"type":"publish","channel":"room","data":{"text":"raw"}}');
+		self::assertSame([['type' => 'message', 'channel' => 'room', 'from' => $clientId, 'data' => ['text' => 'stamped']]], $this->replies($stream));
+	}
+
+	public function testDataSetToAnEqualValueIsRelayedAsSent()
+	{
+		[$connection, $stream, $clientId] = $this->openClient();
+		$this->request($connection, ['type' => 'subscribe', 'channel' => 'room']);
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->setAllowed(true);
+			$param->setData([]);
+		});
+		$this->frames($stream);
+		$this->request($connection, '{"type":"publish","channel":"room","data":{}}');
+		self::assertSame('{"type":"message","channel":"room","from":"' . $clientId . '","data":{}}', $this->frames($stream)[0]->getPayload());
+	}
+
 	public function testPublishWithoutDataPublishesNull()
 	{
 		$this->handler->setAllowClientPublish(true);
@@ -542,6 +716,15 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		});
 		$this->request($alice, ['type' => 'send', 'to' => $bobId, 'data' => 'original']);
 		self::assertSame('rewritten', $this->replies($bobOut)[0]['data']);
+	}
+
+	public function testASendRelaysTheDataAsTheClientSentIt()
+	{
+		$this->handler->setAllowClientSend(true);
+		[$alice, , $aliceId] = $this->openClient();
+		[, $bobOut, $bobId] = $this->openClient();
+		$this->request($alice, '{"type":"send","to":"' . $bobId . '","data":{"0":"x","n":{}}}');
+		self::assertSame('{"type":"message","from":"' . $aliceId . '","data":{"0":"x","n":{}}}', $this->frames($bobOut)[0]->getPayload());
 	}
 
 	public function testSendToARemoteClientRoutesThroughTheBackplane()
@@ -640,6 +823,22 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertStringContainsString('"method"', $reply['message']);
 	}
 
+	public function testAGuardThatDisallowsACallDeniesIt()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->setAllowed(false);
+		});
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) {
+			$param->setResult('secret');
+		});
+		$this->request($connection, ['type' => 'call', 'id' => 'c', 'method' => 'admin.read']);
+		$reply = $this->replies($stream)[0];
+		self::assertSame(['type' => 'error', 'id' => 'c', 'code' => TWebSocketPubSubException::FORBIDDEN], array_slice($reply, 0, 3, true));
+		self::assertStringContainsString('admin.read', $reply['message']);
+		self::assertArrayNotHasKey('data', $reply);
+	}
+
 	public function testAHandlerRefusesACallWithItsOwnReplyCode()
 	{
 		[$connection, $stream] = $this->openClient();
@@ -680,9 +879,45 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame(TWebSocketPubSubException::INTERNAL, $this->replies($stream)[0]['code']);
 	}
 
-	public function testATransportFailureIsRethrown()
+	public function testAWebSocketExceptionFromAHandlerIsAnsweredInternal()
+	{
+		[$connection, $stream] = $this->openClient();
+		$this->handler->attachEventHandler('onCall', function () {
+			throw new TWebSocketException('websocket_write_failed');
+		});
+		$this->request($connection, ['type' => 'call', 'id' => 'c', 'method' => 'io']);
+		self::assertSame(['type' => 'error', 'id' => 'c', 'code' => TWebSocketPubSubException::INTERNAL], array_slice($this->replies($stream)[0], 0, 3, true));
+		self::assertFalse($connection->getIsClosing(), 'The requester keeps its session.');
+		self::assertNotNull($this->handler->getClientId($connection));
+	}
+
+	public function testAFailedWriteToAnotherClientIsAnsweredInternal()
+	{
+		[$alice, $aliceOut] = $this->openClient();
+		[$bob, $bobOut] = $this->openClient();
+		$bob->setMaxSendBufferBytes(8);
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) use ($bob) {
+			$bob->send(str_repeat('x', 64));   // overflows bob's send buffer
+			$param->setResult(true);
+		});
+		$this->request($alice, ['type' => 'call', 'id' => 'c', 'method' => 'notify']);
+		self::assertSame(TWebSocketPubSubException::INTERNAL, $this->replies($aliceOut)[0]['code']);
+		self::assertFalse($alice->getIsClosing());
+		self::assertSame([], $this->frames($bobOut));
+	}
+
+	public function testAFailureToWriteTheRequestersOwnReplyIsRethrown()
 	{
 		[$connection] = $this->openClient();
+		$connection->setMaxSendBufferBytes(8);
+		$this->expectException(TWebSocketException::class);
+		$this->request($connection, ['type' => 'ping', 'id' => 'p']);
+	}
+
+	public function testAFailureToWriteTheRequestersErrorReplyIsRethrown()
+	{
+		[$connection] = $this->openClient();
+		$connection->setMaxSendBufferBytes(8);
 		$this->handler->attachEventHandler('onCall', function () {
 			throw new TWebSocketException('websocket_write_failed');
 		});
@@ -807,7 +1042,7 @@ class TWebSocketPubSubHandlerTest extends TestCase
 			$replies[] = json_decode($message->getPayload(), true);
 		}
 		self::assertSame('welcome', $replies[0]['type']);
-		self::assertSame(['type' => 'pong'], $replies[1]);
+		self::assertSame(['type' => 'ack', 'id' => '1'], $replies[1]);
 		self::assertNull($this->handler->getClientId($serverWs), 'The client is forgotten when the loop ends.');
 		$a->close();
 		$b->close();

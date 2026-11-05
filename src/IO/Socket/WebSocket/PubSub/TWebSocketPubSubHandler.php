@@ -30,8 +30,10 @@ use Prado\Util\Log\TLogger;
  * ({@see getClientScriptPath()}).
  *
  * Each message is one JSON object with a string `type`.  A request carrying an `id` (a string of
- * 1 to {@see MAX_ID_LENGTH} characters, or an integer) receives exactly one `ack` or `error` with
- * that id; a request without one is answered only when it fails.
+ * 1 to {@see MAX_ID_LENGTH} bytes, or an integer) receives exactly one `ack` or `error` with that
+ * id; a request without one is answered only when it fails.  A frame that cannot be decoded is
+ * answered with the `id` a bounded scan of its top-level members finds, so the client's request
+ * settles.
  *
  * | Client → server | Fields | Effect |
  * |---|---|---|
@@ -40,7 +42,7 @@ use Prado\Util\Log\TLogger;
  * | `publish` | `channel`, `data` | Publishes cluster-wide, through {@see onPublish}. |
  * | `send` | `to`, `data` | Sends to one client cluster-wide, through {@see onSend}. |
  * | `call` | `method`, `params` | Calls {@see onCall}; the `ack` carries the result as `data`. |
- * | `ping` | none | Answered with `pong`. |
+ * | `ping` | none | Answered with `pong`; with an `id`, with `ack` instead. |
  *
  * | Server → client | Fields | When |
  * |---|---|---|
@@ -48,23 +50,33 @@ use Prado\Util\Log\TLogger;
  * | `ack` | `id`, `data`? | A request with an `id` succeeded. |
  * | `error` | `id`?, `code`, `message` | A request failed; `code` is a {@see TWebSocketPubSubException} reply code. |
  * | `message` | `data`, `channel`?, `from`? | A channel publish (with `channel`), or a direct send or broadcast (without). |
- * | `pong` | none | A `ping` arrived. |
+ * | `pong` | none | A `ping` without an `id` arrived. |
  *
  * Request handling:
  *  - a connection that did not negotiate {@see SUBPROTOCOL} → closed with 1002 (ProtocolError);
  *  - a Binary message → closed with 1003 (UnsupportedData);
- *  - a frame over {@see getMaxFrameSize() MaxFrameSize} bytes → `limit`, without an `id`, since the
- *    frame is refused before it is decoded (the browser client refuses such a request itself);
- *  - a channel outside {@see CHANNEL_PATTERN}, or a malformed frame → `bad_request`;
+ *  - a frame over {@see getMaxFrameSize() MaxFrameSize} bytes → `limit`, refused before it is
+ *    decoded, with the `id` found in its first MaxFrameSize bytes (the browser client refuses such
+ *    a request itself);
+ *  - a channel outside {@see CHANNEL_PATTERN}, a malformed frame, or a number outside the range of
+ *    a float (`1e400`) → `bad_request`;
  *  - a subscribe past {@see getMaxSubscriptions() MaxSubscriptions} → `limit`;
  *  - publish → denied unless {@see getAllowClientPublish() AllowClientPublish} or an `onPublish` handler allows it;
  *  - send → denied unless {@see getAllowClientSend() AllowClientSend} or an `onSend` handler allows it;
  *  - subscribe → allowed unless an `onSubscribe` handler denies it;
- *  - a call no `onCall` handler answers → `not_found`;
- *  - an application exception other than {@see TWebSocketPubSubException} → logged, replied `internal`.
+ *  - call → denied when an `onCall` handler sets Allowed to false; a call no handler answers → `not_found`;
+ *  - an application exception other than {@see TWebSocketPubSubException}, including a
+ *    {@see TWebSocketException} from another connection → logged, replied `internal`;
+ *  - a failure to write the requester's own reply → rethrown, so the server ends that connection.
  *
  * A publish reaches every subscriber of the channel, the publisher included.  Delivery is
  * at-most-once: a client that is reconnecting misses what is published meanwhile.
+ *
+ * A request is decoded to PHP arrays: a JSON object and a list both arrive as an array, and an
+ * integer outside the 64-bit range arrives as its decimal string.  A publish or send relays the
+ * `data` the client sent as its original JSON text, so `{}`, an object with numeric keys, and a
+ * large integer reach the receivers unchanged; Data an event handler replaced is encoded from the
+ * PHP value.
  *
  * The {@see onOpen} event is raised before the `welcome` frame, so a handler that authenticates
  * the client can close it (4401 or 4403 stop the browser client from reconnecting) or subscribe it
@@ -107,7 +119,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	/** The pattern a client-supplied channel name must match. */
 	public const CHANNEL_PATTERN = '/^[A-Za-z0-9_.:\/-]{1,128}$/';
 
-	/** The maximum length of a string request id. */
+	/** The maximum length in bytes of a string request id. */
 	public const MAX_ID_LENGTH = 64;
 
 	/** The maximum nesting depth of a decoded frame. */
@@ -124,6 +136,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 
 	/** The json_encode flags of every outgoing frame. */
 	private const JSON_FLAGS = JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+
+	/** The JSON whitespace characters. */
+	private const JSON_WHITESPACE = " \t\n\r";
 
 	/** @var ?TWebSocketCluster The cluster requests route through, created on first use when unset. */
 	private ?TWebSocketCluster $_cluster = null;
@@ -175,7 +190,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	/**
 	 * Decodes and dispatches one request frame, replying `ack` or `error`.  A Binary message closes
 	 * the connection with 1003.  A message on a connection that was not admitted, or that this side
-	 * has closed (an `onOpen` handler refusing the client), is ignored.
+	 * has closed (an `onOpen` handler refusing the client), is ignored.  A failure while the request
+	 * runs, a {@see TWebSocketException} from another connection included, is logged and answered
+	 * `internal`; only a failure to write this connection's own reply is rethrown.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @param string $message The received message payload.
 	 * @param int $opcode The message's opcode (a {@see TWebSocketOpcode} value).
@@ -196,11 +213,13 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 			$limit = $this->getMaxFrameSize();
 			if ($limit > 0 && strlen($message) > $limit) {
 				// Refused before decoding: json_decode() of a large frame takes tens of times its size in memory.
+				$id = $this->scanRequestId($message);
 				throw (new TWebSocketPubSubException('websocket_pubsub_frame_too_large', strlen($message), $limit))
 					->setReplyCode(TWebSocketPubSubException::LIMIT);
 			}
-			$frame = json_decode($message, true, self::MAX_JSON_DEPTH);
+			$frame = json_decode($message, true, self::MAX_JSON_DEPTH, JSON_BIGINT_AS_STRING);
 			if (!is_array($frame)) {
+				$id = $this->scanRequestId($message);
 				throw new TWebSocketPubSubException('websocket_pubsub_frame_malformed', self::MAX_ID_LENGTH);
 			}
 			$id = $frame['id'] ?? null;
@@ -208,21 +227,31 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 				$id = $this->isValidId($id) ? $id : null;
 				throw new TWebSocketPubSubException('websocket_pubsub_frame_malformed', self::MAX_ID_LENGTH);
 			}
-			if ($frame['type'] === 'ping') {
+			if (self::holdsNonFiniteNumber($message, $frame)) {
+				throw new TWebSocketPubSubException('websocket_pubsub_number_out_of_range');
+			}
+			if ($id === null && $frame['type'] === 'ping') {
 				$this->reply($connection, ['type' => 'pong']);
 				return;
 			}
-			$result = $this->dispatchRequest($connection, $clientId, $frame);
+			try {
+				$result = $this->dispatchRequest($connection, $clientId, $frame, $message);
+			} catch (TWebSocketPubSubException $e) {
+				throw $e;   // a refusal, replied below
+			} catch (\Throwable $e) {
+				// A handler's failure, another connection's transport failure among them, fails this request only.
+				$this->replyInternal($connection, $clientId, $id, $e);
+				return;
+			}
 			if ($id !== null) {
 				$this->reply($connection, $result === null ? ['type' => 'ack', 'id' => $id] : ['type' => 'ack', 'id' => $id, 'data' => $result]);
 			}
 		} catch (TWebSocketPubSubException $e) {
 			$this->replyError($connection, $id, $e);
 		} catch (TWebSocketException $e) {
-			throw $e;   // a transport failure belongs to the connection, not to the request
+			throw $e;   // this connection's own reply failed: a transport failure of the connection
 		} catch (\Throwable $e) {
-			Prado::log('Pub/sub request from client ' . $clientId . ' failed: ' . $e->getMessage(), TLogger::ERROR, static::class);
-			$this->replyError($connection, $id, (new TWebSocketPubSubException('websocket_pubsub_internal_error'))->setReplyCode(TWebSocketPubSubException::INTERNAL));
+			$this->replyInternal($connection, $clientId, $id, $e);
 		}
 	}
 
@@ -423,21 +452,23 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	// =========================================================================
 
 	/**
-	 * Routes a validated frame to its request method.
+	 * Routes a validated frame to its request method.  A `ping` that carries an `id` is acked here.
 	 * @param TWebSocketConnection $connection The requesting connection.
 	 * @param string $clientId The requesting client id.
 	 * @param array<mixed> $frame The decoded frame; its `type` is a string.
+	 * @param string $message The frame's JSON text, from which a publish or send relays its `data`.
 	 * @throws TWebSocketPubSubException When the type is unknown or the request fails.
 	 * @return mixed The `ack` data, or null for none.
 	 */
-	protected function dispatchRequest(TWebSocketConnection $connection, string $clientId, array $frame): mixed
+	protected function dispatchRequest(TWebSocketConnection $connection, string $clientId, array $frame, string $message = ''): mixed
 	{
 		return match ($frame['type']) {
 			'subscribe' => $this->requestSubscribe($connection, $clientId, $frame),
 			'unsubscribe' => $this->requestUnsubscribe($connection, $frame),
-			'publish' => $this->requestPublish($connection, $clientId, $frame),
-			'send' => $this->requestSend($connection, $clientId, $frame),
+			'publish' => $this->requestPublish($connection, $clientId, $frame, $message),
+			'send' => $this->requestSend($connection, $clientId, $frame, $message),
 			'call' => $this->requestCall($connection, $clientId, $frame),
+			'ping' => null,
 			default => throw (new TWebSocketPubSubException('websocket_pubsub_type_unknown', $frame['type']))
 				->setReplyCode(TWebSocketPubSubException::UNKNOWN_TYPE),
 		};
@@ -484,20 +515,22 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Handles `publish`: raises {@see onPublish} and publishes the resulting Data.
+	 * Handles `publish`: raises {@see onPublish} and publishes the resulting Data
+	 * ({@see encodeRelay()}).
 	 * @param TWebSocketConnection $connection The requesting connection.
 	 * @param string $clientId The requesting client id.
 	 * @param array<mixed> $frame The decoded frame.
+	 * @param string $message The frame's JSON text; empty to encode the Data.
 	 * @throws TWebSocketPubSubException When the channel is invalid or the request is denied.
 	 * @return mixed Null.
 	 */
-	protected function requestPublish(TWebSocketConnection $connection, string $clientId, array $frame): mixed
+	protected function requestPublish(TWebSocketConnection $connection, string $clientId, array $frame, string $message = ''): mixed
 	{
 		$channel = $this->ensureChannel($frame);
 		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientPublish()))->setChannel($channel);
 		$this->onPublish($connection, $param);
 		$this->assertAllowed($param, 'publish', $channel);
-		$this->publish($channel, $param->getData(), $clientId);
+		$this->getCluster()->publish($channel, $this->encodeRelay($param, $frame['data'] ?? null, $message, $channel, $clientId));
 		return null;
 	}
 
@@ -506,10 +539,11 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	 * @param TWebSocketConnection $connection The requesting connection.
 	 * @param string $clientId The requesting client id.
 	 * @param array<mixed> $frame The decoded frame.
+	 * @param string $message The frame's JSON text; empty to encode the Data.
 	 * @throws TWebSocketPubSubException When the target is missing or unknown, or the request is denied.
 	 * @return mixed Null.
 	 */
-	protected function requestSend(TWebSocketConnection $connection, string $clientId, array $frame): mixed
+	protected function requestSend(TWebSocketConnection $connection, string $clientId, array $frame, string $message = ''): mixed
 	{
 		$to = $frame['to'] ?? null;
 		if (!is_string($to) || $to === '') {
@@ -518,7 +552,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientSend()))->setTo($to);
 		$this->onSend($connection, $param);
 		$this->assertAllowed($param, 'send', $to);
-		if (!$this->sendTo($to, $param->getData(), $clientId)) {
+		if (!$this->getCluster()->sendToClient($to, $this->encodeRelay($param, $frame['data'] ?? null, $message, null, $clientId))) {
 			throw (new TWebSocketPubSubException('websocket_pubsub_client_unknown', $to))
 				->setReplyCode(TWebSocketPubSubException::NOT_FOUND);
 		}
@@ -526,11 +560,12 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Handles `call`: raises {@see onCall} and returns the handler's Result.
+	 * Handles `call`: raises {@see onCall} and returns the handler's Result.  A handler that sets
+	 * Allowed to false denies the call, even when another handler answered it.
 	 * @param TWebSocketConnection $connection The requesting connection.
 	 * @param string $clientId The requesting client id.
 	 * @param array<mixed> $frame The decoded frame.
-	 * @throws TWebSocketPubSubException When the method is missing or no handler answers it.
+	 * @throws TWebSocketPubSubException When the method is missing, the call is denied, or no handler answers it.
 	 * @return mixed The call result.
 	 */
 	protected function requestCall(TWebSocketConnection $connection, string $clientId, array $frame): mixed
@@ -541,11 +576,36 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		}
 		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['params'] ?? null))->setMethod($method);
 		$this->onCall($connection, $param);
+		$this->assertAllowed($param, 'call', $method);
 		if (!$param->getHandled()) {
 			throw (new TWebSocketPubSubException('websocket_pubsub_method_unknown', $method))
 				->setReplyCode(TWebSocketPubSubException::NOT_FOUND);
 		}
 		return $param->getResult();
+	}
+
+	/**
+	 * Encodes the `message` frame that relays a client publish or send.  Data no event handler
+	 * replaced is relayed as the JSON text of the request's `data` member, so `{}`, an object with
+	 * numeric keys, and an integer outside the 64-bit range reach the receivers as sent; replaced
+	 * Data is encoded with {@see encodeMessage()}.
+	 * @param TWebSocketPubSubEventParameter $param The request parameter.
+	 * @param mixed $data The request's decoded `data`.
+	 * @param string $message The request frame's JSON text; empty to encode the Data.
+	 * @param ?string $channel The channel, or null for a direct send.
+	 * @param string $from The sending client id.
+	 * @throws \JsonException When replaced Data cannot be encoded.
+	 * @return string The JSON frame.
+	 * @since 1.2.0
+	 */
+	protected function encodeRelay(TWebSocketPubSubEventParameter $param, mixed $data, string $message, ?string $channel, string $from): string
+	{
+		// Compared by value: ParameterChanged resets when TWebSocketModule re-raises the event with the same parameter.
+		$json = $message !== '' && $param->getData() === $data ? self::findMember($message, 'data') : null;
+		if ($json === null) {
+			return self::encodeMessage($param->getData(), $channel, $from);
+		}
+		return substr(self::encodeMessage(null, $channel, $from), 0, -5) . $json . '}';   // replaces the trailing `null}`
 	}
 
 	/**
@@ -581,11 +641,159 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	/**
 	 * Returns whether a request id is absent or well formed.
 	 * @param mixed $id The `id` field.
-	 * @return bool Whether the id is null, an integer, or a string of 1 to {@see MAX_ID_LENGTH} characters.
+	 * @return bool Whether the id is null, an integer, or a string of 1 to {@see MAX_ID_LENGTH} bytes.
 	 */
 	protected function isValidId(mixed $id): bool
 	{
 		return $id === null || is_int($id) || (is_string($id) && $id !== '' && strlen($id) <= self::MAX_ID_LENGTH);
+	}
+
+	/**
+	 * Returns the `id` of a frame that was not decoded, found by a scan of its top-level members
+	 * that does not validate the JSON.  The scan reads at most {@see getMaxFrameSize() MaxFrameSize}
+	 * bytes, or {@see DEFAULT_MAX_FRAME_SIZE} when that is 0.
+	 * @param string $message The frame's text.
+	 * @return null|int|string The well-formed id, or null when none is found.
+	 * @since 1.2.0
+	 */
+	protected function scanRequestId(string $message): null|int|string
+	{
+		$limit = $this->getMaxFrameSize() ?: self::DEFAULT_MAX_FRAME_SIZE;
+		$json = self::findMember(strlen($message) > $limit ? substr($message, 0, $limit) : $message, 'id');
+		$id = $json === null ? null : json_decode($json, false, 1, JSON_BIGINT_AS_STRING);
+		return (is_int($id) || is_string($id)) && $this->isValidId($id) ? $id : null;
+	}
+
+	/**
+	 * Logs a failed request and answers it `internal`, without the failure's detail.
+	 * @param TWebSocketConnection $connection The connection.
+	 * @param string $clientId The requesting client id.
+	 * @param null|int|string $id The request id, or null for none.
+	 * @param \Throwable $error The failure.
+	 * @throws TWebSocketException When the reply cannot be written.
+	 */
+	private function replyInternal(TWebSocketConnection $connection, string $clientId, null|int|string $id, \Throwable $error): void
+	{
+		Prado::log('Pub/sub request from client ' . $clientId . ' failed: ' . $error->getMessage(), TLogger::ERROR, static::class);
+		$this->replyError($connection, $id, (new TWebSocketPubSubException('websocket_pubsub_internal_error'))->setReplyCode(TWebSocketPubSubException::INTERNAL));
+	}
+
+	/**
+	 * Returns whether a decoded frame holds a float out of range (`1e400` decodes to INF).  The
+	 * frame is walked only when its text has an exponent or a run of 309 digits.
+	 * @param string $message The frame's text.
+	 * @param array<mixed> $frame The decoded frame.
+	 * @return bool Whether a decoded number is infinite.
+	 */
+	private static function holdsNonFiniteNumber(string $message, array $frame): bool
+	{
+		if (!preg_match('/\d[eE]|\d{309}/', $message)) {
+			return false;
+		}
+		$found = false;
+		array_walk_recursive($frame, function ($value) use (&$found) {
+			$found = $found || (is_float($value) && !is_finite($value));
+		});
+		return $found;
+	}
+
+	/**
+	 * Returns the JSON text of a top-level member of a JSON object, without decoding it.  Brackets
+	 * are matched outside strings and nothing is validated, so the text of a frame json_decode()
+	 * refused is scanned too.  The scan stops at the first malformed or truncated member; of
+	 * duplicate names, the last one scanned wins, as in json_decode().
+	 * @param string $json The JSON object text.
+	 * @param string $name The member name.
+	 * @return ?string The member's value as JSON text, or null when it is not found.
+	 */
+	private static function findMember(string $json, string $name): ?string
+	{
+		$length = strlen($json);
+		$i = strspn($json, self::JSON_WHITESPACE);
+		if ($i >= $length || $json[$i] !== '{') {
+			return null;
+		}
+		$found = null;
+		for ($i++; ; $i++) {
+			$i += strspn($json, self::JSON_WHITESPACE, $i);
+			if ($i >= $length || $json[$i] !== '"' || ($keyEnd = self::skipString($json, $i)) === null) {
+				return $found;
+			}
+			$key = substr($json, $i, $keyEnd - $i);
+			$i = $keyEnd + strspn($json, self::JSON_WHITESPACE, $keyEnd);
+			if ($i >= $length || $json[$i] !== ':') {
+				return $found;
+			}
+			$start = $i + 1 + strspn($json, self::JSON_WHITESPACE, $i + 1);
+			if (($end = self::skipValue($json, $start)) === null) {
+				return $found;
+			}
+			$i = $end + strspn($json, self::JSON_WHITESPACE, $end);
+			if ($i >= $length || ($json[$i] !== ',' && $json[$i] !== '}')) {
+				return $found;
+			}
+			if ((str_contains($key, '\\') ? json_decode($key) : substr($key, 1, -1)) === $name) {
+				$found = substr($json, $start, $end - $start);
+			}
+			if ($json[$i] === '}') {
+				return $found;
+			}
+		}
+	}
+
+	/**
+	 * Returns the offset after a JSON string.
+	 * @param string $json The JSON text.
+	 * @param int $i The offset of the opening quote.
+	 * @return ?int The offset after the closing quote, or null when the string is unterminated.
+	 */
+	private static function skipString(string $json, int $i): ?int
+	{
+		$length = strlen($json);
+		for ($k = $i + 1; $k < $length; $k += 2) {   // a backslash skips the character it escapes
+			$k += strcspn($json, '"\\', $k);
+			if ($k < $length && $json[$k] === '"') {
+				return $k + 1;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Returns the offset after a JSON value, matching brackets outside strings.  A scalar must be
+	 * followed by a delimiter, so one cut off at the end of the text is not taken whole.
+	 * @param string $json The JSON text.
+	 * @param int $i The offset of the value.
+	 * @return ?int The offset after the value, or null when it is unterminated.
+	 */
+	private static function skipValue(string $json, int $i): ?int
+	{
+		$length = strlen($json);
+		if ($i >= $length) {
+			return null;
+		}
+		if ($json[$i] === '"') {
+			return self::skipString($json, $i);
+		}
+		if ($json[$i] !== '{' && $json[$i] !== '[') {
+			$end = $i + strcspn($json, self::JSON_WHITESPACE . ',]}', $i);
+			return $end > $i && $end < $length ? $end : null;
+		}
+		$depth = 0;
+		for ($k = $i; ($k += strcspn($json, '{}[]"', $k)) < $length;) {
+			if ($json[$k] === '"') {
+				if (($k = self::skipString($json, $k)) === null) {
+					return null;
+				}
+				continue;
+			}
+			$depth += ($json[$k] === '{' || $json[$k] === '[') ? 1 : -1;
+			$k++;
+			if ($depth === 0) {
+				return $k;
+			}
+		}
+		return null;
 	}
 
 	/**
