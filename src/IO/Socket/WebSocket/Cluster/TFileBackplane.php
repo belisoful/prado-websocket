@@ -16,6 +16,7 @@ use Prado\TComponent;
 use Prado\TPropertyValue;
 use Prado\Util\Log\TLogger;
 use Prado\Util\Clock\TApplicationClockAwareTrait;
+use Prado\Util\Clock\TMonotonicClockAwareTrait;
 
 /**
  * TFileBackplane class.
@@ -34,26 +35,37 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  *    This is the shared registry a late-joining node reads in {@see open()} to converge, while live
  *    changes also flow as presence envelopes through the log.
  *
+ * Each {@see tick()} reads up to {@see getDrainLimit() DrainLimit} new log entries.  A tick that stops
+ * at the limit with entries left reports a backlog ({@see IWebSocketPolledBackplane}), so the server
+ * ticks again at once.  An idle server polls once per its cluster tick interval.
+ *
  * Each node refreshes its clients' presence files every third of the {@see getPresenceTtl()
- * PresenceTtl}.  A file left unrefreshed for twice the TTL belonged to a node that crashed: the node
- * that finds it removes it and logs a presence drop, so every node forgets the client.  A node that
- * stalled and finds its file removed writes and announces it again.  {@see open()} replaces the
- * node's presence: it removes what a previous incarnation of the node id left and logs a
- * {@see TWebSocketEnvelope::NODE_DOWN} about the node before announcing its current clients.
+ * PresenceTtl}, timed on the {@see getMonotonicClock() MonotonicClock}.  File modification times are
+ * compared across processes, so they are written and read on the wall {@see getClock() Clock}, which
+ * every node sharing the directory must keep in step.  A file left unrefreshed for twice the TTL
+ * belonged to a node that crashed: the node that finds it removes it and logs a presence drop, so
+ * every node forgets the client.  A node that stalled and finds its file removed writes and announces
+ * it again.  {@see open()} replaces the node's presence: it removes what a previous incarnation of the
+ * node id left and logs a {@see TWebSocketEnvelope::NODE_DOWN} about the node before announcing its
+ * current clients.
  *
  * The log grows without bound, so this driver suits development, tests, and small clusters; a
  * high-throughput deployment uses a service-backed driver (Redis).
  *
  * The spool is created owner-only ({@see DIR_MODE}/{@see FILE_MODE}) and {@see open()} refuses a
- * directory that is a symlink, owned by another user, or writable by group or others — so another
+ * directory that is a symlink, owned by another user, or accessible by group or others, so another
  * local user can neither read the cluster's traffic and presence nor redirect its writes through a
- * planted symlink.
+ * planted symlink.  The files are opened by path, so each parent directory must also be safe from
+ * other users: {@see open()} logs a warning for a parent that another user owns, or that group or
+ * others can write without the sticky bit, since such a user could rename the spool and put another
+ * in its place.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
-class TFileBackplane extends TComponent implements IWebSocketBackplane
+class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 {
 	use TApplicationClockAwareTrait;
+	use TMonotonicClockAwareTrait;
 
 	/** The log file name within the directory. */
 	public const LOG_FILE = 'messages.log';
@@ -82,8 +94,14 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	/** @var int The seconds a presence file may go unrefreshed before it is reaped as a crashed node's. */
 	private int $_presenceTtl = 30;
 
-	/** @var float The last {@see \Prado\Util\Clock\IClock::microtime()} the presence heartbeat ran. */
-	private float $_lastPresenceBeat = 0.0;
+	/** @var ?float The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} the presence heartbeat last ran, or null before the first. */
+	private ?float $_lastPresenceBeat = null;
+
+	/** @var int The most log entries one tick reads; 0 for unlimited. */
+	private int $_drainLimit = 10000;
+
+	/** @var bool Whether the last tick stopped with log entries left to read. */
+	private bool $_backlog = false;
 
 	/**
 	 * Binds the owning coordinator.
@@ -136,6 +154,41 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	}
 
 	/**
+	 * Returns the most log entries one tick reads.
+	 * @return int The drain limit, or 0 for unlimited.
+	 * @since 1.2.0
+	 */
+	public function getDrainLimit(): int
+	{
+		return $this->_drainLimit;
+	}
+
+	/**
+	 * Sets the most log entries one tick reads.  A tick that reaches it with entries left reports a
+	 * backlog, so the server ticks again at once; the limit bounds the memory and time one tick takes.
+	 * Default 10000; 0 for unlimited.
+	 * @param int|string $value The drain limit.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setDrainLimit($value): static
+	{
+		$this->_drainLimit = max(0, TPropertyValue::ensureInteger($value));
+		return $this;
+	}
+
+	/**
+	 * Indicates whether the last {@see tick()} stopped with log entries left to read.  Implements
+	 * {@see IWebSocketPolledBackplane}.
+	 * @return bool Whether the log holds entries the last tick did not read.
+	 * @since 1.2.0
+	 */
+	public function getHasBacklog(): bool
+	{
+		return $this->_backlog;
+	}
+
+	/**
 	 * Joins the cluster: creates the directory layout, starts reading the log from its current end
 	 * (so prior traffic is not replayed), replaces this node's presence, and seeds the presence mirror
 	 * from the registry.
@@ -148,6 +201,7 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		}
 		$this->ensureSecureDirectory($this->_directory);   // create-and-lock or verify the base spool
 		$this->ensureSecureDirectory($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR);
+		$this->checkParentDirectories($this->_directory);
 		clearstatcache();
 
 		$log = $this->logPath();
@@ -233,6 +287,36 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	}
 
 	/**
+	 * Logs a warning for each parent directory of the spool that another user could use to swap the
+	 * spool after {@see open()} verified it: one owned by a user other than root and this process, or
+	 * writable by group or others without the sticky bit.  The spool's own checks hold only while its
+	 * parents are safe, since every file is reopened by path.  Without the posix extension only the
+	 * permissions are checked.
+	 * @param string $path The spool directory.
+	 */
+	private function checkParentDirectories(string $path): void
+	{
+		$real = realpath($path);
+		if ($real === false) {
+			return;
+		}
+		$euid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+		for ($parent = dirname($real); ; $parent = dirname($parent)) {
+			clearstatcache(true, $parent);
+			$perms = @fileperms($parent);
+			$owner = @fileowner($parent);
+			$writable = $perms !== false && ($perms & 0o022) !== 0 && ($perms & 0o1000) === 0;
+			$foreign = $euid !== null && $owner !== false && $owner !== 0 && $owner !== $euid;
+			if ($writable || $foreign) {
+				Prado::log("File backplane spool {$path} has an unsafe parent directory {$parent}: " . ($writable ? 'group or others can write it without the sticky bit' : 'another user owns it') . '; another local user could replace the spool', TLogger::WARNING, static::class);
+			}
+			if (dirname($parent) === $parent) {
+				return;
+			}
+		}
+	}
+
+	/**
 	 * Leaves the cluster.  The coordinator has already dropped its clients' presence, so there is
 	 * nothing further to release.
 	 */
@@ -242,10 +326,12 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	}
 
 	/**
-	 * Reads and delivers the log entries appended since the last tick.
+	 * Reads and delivers the log entries appended since the last tick, up to {@see getDrainLimit()
+	 * DrainLimit}.
 	 */
 	public function tick(): void
 	{
+		$this->_backlog = false;
 		if ($this->_directory === null || $this->_cluster === null) {
 			return;
 		}
@@ -266,11 +352,16 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 			$this->_offset = 0;   // the log was truncated or rotated; re-read the fresh, smaller log from its start
 		}
 		fseek($fp, $this->_offset);
+		$read = 0;
 		while (($line = fgets($fp)) !== false) {
 			$this->_offset += strlen($line);   // the offset advances by what was read, so no position query can fail
 			$line = rtrim($line, "\n");
 			if ($line !== '' && ($envelope = TWebSocketEnvelope::decode($line)) !== null) {
 				$envelopes[] = $envelope;
+			}
+			if ($this->_drainLimit > 0 && ++$read >= $this->_drainLimit) {
+				$this->_backlog = $this->_offset < $stat['size'];   // the rest is read on the next tick, which the server runs at once
+				break;
 			}
 		}
 		flock($fp, LOCK_UN);
@@ -295,10 +386,11 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 	 */
 	private function presenceHousekeeping(): void
 	{
-		$now = $this->getClock()->microtime();
-		if (($now - $this->_lastPresenceBeat) < ($this->_presenceTtl / 3)) {
+		$now = $this->getMonotonicClock()->seconds();
+		if ($this->_lastPresenceBeat !== null && ($now - $this->_lastPresenceBeat) < ($this->_presenceTtl / 3)) {
 			return;
 		}
+
 		$this->_lastPresenceBeat = $now;
 		foreach ($this->_localClients as $clientId => $meta) {
 			$path = $this->presencePath((string) $clientId);
@@ -324,7 +416,11 @@ class TFileBackplane extends TComponent implements IWebSocketBackplane
 		}
 		$cutoff = $this->getClock()->time() - 2 * $this->_presenceTtl;
 		$reaped = [];
+		clearstatcache();   // touch() leaves a stale cached mtime behind
 		foreach ($this->presenceFiles() as $file) {
+			if (isset($this->_localClients[rawurldecode(basename($file))])) {
+				continue;   // a live local client's file is this node's to refresh, never to reap
+			}
 			if ((int) @filemtime($file) < $cutoff) {
 				$meta = json_decode((string) @file_get_contents($file), true);
 				$reaped[$file] = is_array($meta) ? (string) ($meta['node'] ?? '') : '';
