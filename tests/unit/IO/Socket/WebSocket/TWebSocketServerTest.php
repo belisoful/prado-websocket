@@ -53,6 +53,77 @@ class FailingPumpWebSocketServer extends TWebSocketServer
 	}
 }
 
+/** Adopts a transport as an HTTP/2 session, so a test drives the session's output path directly. */
+class AdoptingWebSocketServer extends TWebSocketServer
+{
+	public function adoptHttp2(TSocketStream $transport): void
+	{
+		$this->acceptHttp2Session($transport);
+	}
+}
+
+/** A backplane whose open or close fails, standing in for an unreachable Redis or spool. */
+class FailingBackplane extends TNullBackplane
+{
+	public function __construct(private bool $failOpen = false, private bool $failClose = false)
+	{
+		parent::__construct();
+	}
+
+	public function open(): void
+	{
+		if ($this->failOpen) {
+			throw new \RuntimeException('open failed');
+		}
+	}
+
+	public function close(): void
+	{
+		if ($this->failClose) {
+			throw new \RuntimeException('close failed');
+		}
+	}
+}
+
+/** A backplane with one selectable source, a socket pair end, whose tick reads what the peer end wrote. */
+class SourceBackplane extends TNullBackplane
+{
+	/** @var resource The end a test writes cluster traffic to. */
+	public $peer;
+	public string $received = '';
+	private TSocketStream $_source;
+
+	public function __construct()
+	{
+		parent::__construct();
+		[$local, $this->peer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+		$this->_source = new TSocketStream($local);
+		$this->_source->setBlocking(false);
+	}
+
+	public function getSources(): array
+	{
+		return [$this->_source];
+	}
+
+	public function tick(): void
+	{
+		$this->received .= $this->_source->read(65536);
+	}
+}
+
+/** Counts the write arming calls the server makes, so a test can bound its per-tick reactor work. */
+class CountingReactor extends TSocketReactor
+{
+	public int $wantWrites = 0;
+
+	public function wantWrite(\Prado\IO\IResource $source, bool $want = true): void
+	{
+		$this->wantWrites++;
+		parent::wantWrite($source, $want);
+	}
+}
+
 class TWebSocketServerTest extends TestCase
 {
 	/** @var string[] Temporary certificate files to remove. */
@@ -1753,6 +1824,7 @@ class TWebSocketServerTest extends TestCase
 	public function testServeMakesTheReactorTheTAsyncLoopSoAHandlerFiberResumes()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setShutdownTimeout(0.1);   // the in-process client does not answer the shutdown Close
 		$prior = TAsync::getLoop();
 		$handler = new TWebSocketHandler();
 		$handler->attachEventHandler('onMessage', function ($connection) use ($server) {
@@ -1960,6 +2032,546 @@ class TWebSocketServerTest extends TestCase
 		}
 		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, TWebSocketServer::class);
 		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'Idle session reaped')), 'The idle reap is logged.');
+		$server->close();
+	}
+
+	/**
+	 * Reads WebSocket frames from a raw client until a Close arrives or the pumps run out, skipping
+	 * an HTTP response head when one is still unread.
+	 * @param TWebSocketServer $server The server to pump between reads.
+	 * @param TSocketStream $client The client transport.
+	 * @return array{0: string[], 1: ?int} The text payloads read and the Close code (null for none).
+	 */
+	private function readFramesUntilClose(TWebSocketServer $server, TSocketStream $client): array
+	{
+		$messages = [];
+		$code = null;
+		$this->pumpUntil($server, $client, function (string $bytes) use (&$messages, &$code, $client) {
+			$messages = [];
+			if (str_starts_with($bytes, 'HTTP/')) {
+				$head = strpos($bytes, "\r\n\r\n");
+				$bytes = $head === false ? '' : substr($bytes, $head + 4);
+			}
+			while (($decoded = TWebSocketFrameCodec::tryDecode($bytes, false)) !== null) {
+				$bytes = substr($bytes, $decoded['length']);
+				if ($decoded['frame']->getOpcode() === TWebSocketOpcode::Close) {
+					$code = $decoded['frame']->getCloseCode();
+					return true;
+				}
+				$messages[] = $decoded['frame']->getPayload();
+			}
+			return $client->eof();
+		});
+		return [$messages, $code];
+	}
+
+	public function testAThrowingOnMessageFailsTheHttp1SessionWith1011AndRaisesOnError()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$messages = [];
+		$errors = [];
+		$closed = 0;
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$messages) {
+			$messages[] = $msg->getPayload();
+			if ($msg->getPayload() === 'boom') {
+				throw new \RuntimeException('handler bug in onMessage');
+			}
+		});
+		$handler->attachEventHandler('onError', function ($conn, $e) use (&$errors) {
+			$errors[] = $e;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
+		$clientWs = new TWebSocketConnection($client, true);
+		$clientWs->send('boom');
+		$clientWs->send('after');   // in the same read as the throwing message
+
+		[, $code] = $this->readFramesUntilClose($server, $client);
+		self::assertSame(TWebSocketCloseCode::InternalServerError, $code, 'The peer is sent a Close with 1011, not a bare TCP close.');
+		self::assertSame(['boom'], $messages, 'Nothing is dispatched after the handler failed the connection.');
+		self::assertCount(1, $errors, 'onError is raised with the handler exception, as on the synchronous path.');
+		self::assertInstanceOf(\RuntimeException::class, $errors[0]);
+		self::assertSame('handler bug in onMessage', $errors[0]->getMessage());
+
+		$this->pumpServerUntil($server, fn () => $closed > 0);
+		self::assertSame(1, $closed, 'The failed session ends through onClose once its Close is on the wire.');
+		self::assertSame(0, $server->getConnectionCount());
+		$client->close();
+		$server->close();
+	}
+
+	public function testAThrowingOnMessageFailsOnlyItsHttp2Stream()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$closed = 0;
+		$errors = [];
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$handler->attachEventHandler('onMessage', function ($connection, $message) {
+			if ((string) $message === 'boom') {
+				throw new \RuntimeException('handler bug in onMessage');
+			}
+			$connection->send("echo:$message");
+		});
+		$handler->attachEventHandler('onError', function ($conn, $e) use (&$errors) {
+			$errors[] = $e;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		$server->setCluster($cluster);
+
+		[$socket, $client, $streams] = $this->openHttp2($server, [], 2);
+		$this->pumpServerUntil($server, function () use (&$opened) {
+			return $opened === 2;
+		});
+		self::assertSame(2, $opened);
+		[$failing, $healthy] = $streams;
+		$failingWs = new TWebSocketConnection($failing, true);
+		$failingCode = null;
+		$failingWs->attachEventHandler('onClose', function ($sender, $frame) use (&$failingCode) {
+			$failingCode = $frame->getCloseCode();
+		});
+		$healthyWs = new TWebSocketConnection($healthy, true);
+		$failingWs->send('boom');
+		$socket->write($client->send());
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$failingCode, $failingWs, $failing) {
+			$failingWs->feed($failing->getContents());
+			return $failingCode !== null;
+		});
+		self::assertSame(TWebSocketCloseCode::InternalServerError, $failingCode, 'The failing stream is closed with 1011.');
+		self::assertCount(1, $errors, 'onError is raised for the failing stream.');
+		self::assertSame(1, $closed, 'Only the failing stream is closed.');
+		self::assertSame(2, $server->getLoad(), 'The transport and the other stream stay up.');
+		self::assertSame(1, $cluster->getLocalClientCount(), 'Only the failing stream leaves the cluster.');
+
+		$healthyWs->send('still here');
+		$socket->write($client->send());
+		$echo = [];
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$echo, $healthyWs, $healthy) {
+			array_push($echo, ...$healthyWs->feed($healthy->getContents()));
+			return $echo !== [];
+		});
+		self::assertSame(['echo:still here'], $echo, 'The other WebSocket on the transport carries on.');
+		$socket->close();
+		$server->close();
+	}
+
+	public function testAThrowingOnOpenRollsBackOnlyItsHttp2Stream()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$closed = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			if (++$opened === 1) {
+				throw new \RuntimeException('handler bug in onOpen');
+			}
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		$server->setCluster($cluster);
+
+		[$socket] = $this->openHttp2($server, [], 2);
+		$this->pumpServerUntil($server, function () use (&$opened) {
+			return $opened === 2;
+		});
+		self::assertSame(2, $opened, 'The second stream opens although the first stream\'s onOpen threw.');
+		self::assertSame(1, $closed, 'The rolled-back stream raises onClose.');
+		self::assertSame(2, $server->getLoad(), 'The transport and the second stream stay up.');
+		self::assertSame(1, $cluster->getLocalClientCount(), 'The rolled-back stream leaves no cluster presence.');
+		$socket->close();
+		$server->close();
+	}
+
+	public function testABrokenPipeUnderPradosErrorHandlerEndsTheHttp2SessionAsAWriteFailure()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = new AdoptingWebSocketServer();
+		$server->setHandler(new TWebSocketHandler());
+		Prado::getLogger()->deleteLogs(null, AdoptingWebSocketServer::class);
+		[$local, $remote] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+		fclose($remote);   // the peer is gone: the first write is EPIPE
+		$transport = new TSocketStream($local);
+		set_error_handler([Prado::class, 'phpErrorHandler']);   // PRADO's handler raises the write's EPIPE notice as TPhpErrorException
+		try {
+			$server->adoptHttp2($transport);   // queues and drains the initial SETTINGS
+		} finally {
+			restore_error_handler();
+		}
+		self::assertFalse($transport->isOpen(), 'The session ends on the write failure.');
+		self::assertSame(0, $server->getLoad());
+		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, AdoptingWebSocketServer::class);
+		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'write failure')), 'The broken pipe is handled as the documented write failure.');
+	}
+
+	/**
+	 * Reads a client without blocking until a whole frame has arrived or the stream ends, waiting up
+	 * to about two seconds, for bytes a server sent before it stopped pumping.
+	 * @param TSocketStream $client The client transport.
+	 * @return string The bytes read.
+	 */
+	private function readFrameWithoutServer(TSocketStream $client): string
+	{
+		$client->setBlocking(false);
+		$bytes = '';
+		for ($i = 0; $i < 100 && TWebSocketFrameCodec::tryDecode($bytes, false) === null && !$client->eof(); $i++) {
+			$read = [$client->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);
+			$bytes .= $client->read(4096);
+		}
+		return $bytes;
+	}
+
+	/**
+	 * Connects a raw client and completes its upgrade by pumping the server.
+	 * @param TWebSocketServer $server The server.
+	 * @return TSocketStream The upgraded client transport, non-blocking.
+	 */
+	private function upgradedClient(TWebSocketServer $server): TSocketStream
+	{
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
+		$client->setBlocking(false);
+		return $client;
+	}
+
+	public function testServeClosesLiveSessionsWith1001AndCompletesTheirCloseHandshakeOnShutdown()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		$server->setCluster($cluster);
+		Prado::getLogger()->deleteLogs(null, TWebSocketServer::class);
+		$client = $this->upgradedClient($server);
+		self::assertSame(1, $cluster->getLocalClientCount());
+
+		// The client answers the server's Close from the server's own reactor, as a live peer would.
+		$clientWs = new TWebSocketConnection($client, true);
+		$code = null;
+		$clientWs->attachEventHandler('onClose', function ($sender, $frame) use (&$code) {
+			$code = $frame->getCloseCode();
+		});
+		$watch = $server->getReactor()->onReadable($client->getResource(), function () use ($client, $clientWs) {
+			$bytes = $client->read(65536);
+			if ($bytes !== '') {
+				$clientWs->feedMessages($bytes);   // a Close is echoed back
+			}
+		});
+		$server->serve(0, fn () => $server->close());   // one pump, then the server stops
+		$server->getReactor()->cancel($watch);
+
+		self::assertSame(TWebSocketCloseCode::GoingAway, $code, 'The live session is sent a Close with 1001 Going Away.');
+		self::assertSame(1, $closed, 'The session ends through onClose.');
+		self::assertSame(0, $cluster->getLocalClientCount(), 'The session leaves the cluster.');
+		self::assertSame(0, $server->getConnectionCount(), 'The transport is closed.');
+		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, TWebSocketServer::class);
+		self::assertSame([], array_values(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'without completing'))), 'The peer completed the close handshake within the shutdown timeout.');
+		$client->close();
+	}
+
+	public function testShutdownEndsSessionsWhosePeerNeverAnswersAndClosesPendingHandshakes()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setShutdownTimeout(0.2);
+		Prado::getLogger()->deleteLogs(null, TWebSocketServer::class);
+		$silent = $this->upgradedClient($server);
+		$pending = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);   // connects, sends nothing
+		$this->pumpServerUntil($server, fn () => $server->getConnectionCount() === 2);
+		self::assertSame(2, $server->getConnectionCount());
+
+		$server->serve(0, fn () => $server->close());
+
+		self::assertSame(1, $closed, 'A peer that never answers is ended at the shutdown timeout, through onClose.');
+		self::assertSame(0, $server->getConnectionCount(), 'Every transport is closed, the pending handshake too.');
+		$frame = TWebSocketFrameCodec::tryDecode($this->readFrameWithoutServer($silent), false);
+		self::assertNotNull($frame, 'The silent peer was still sent the Close.');
+		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode());
+		self::assertSame('', $this->readFrameWithoutServer($pending));
+		self::assertTrue($pending->eof(), 'The pending handshake is closed.');
+		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, TWebSocketServer::class);
+		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'without completing')), 'The forced end is logged.');
+		$silent->close();
+		$pending->close();
+	}
+
+	public function testShutdownClosesEveryHttp2StreamWith1001()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$closed = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setShutdownTimeout(0.2);
+		$cluster = new TWebSocketCluster('n1', new TNullBackplane());
+		$server->setCluster($cluster);
+		[$socket, $client, $streams] = $this->openHttp2($server, [], 2);
+		$this->pumpServerUntil($server, function () use (&$opened) {
+			return $opened === 2;
+		});
+		self::assertSame(2, $opened);
+
+		$server->serve(0, fn () => $server->close());
+
+		self::assertSame(2, $closed, 'Every stream ends through onClose.');
+		self::assertSame(0, $cluster->getLocalClientCount(), 'Every stream leaves the cluster.');
+		self::assertSame(0, $server->getConnectionCount(), 'The HTTP/2 transport is closed.');
+		$codes = [];
+		$clients = [];
+		foreach ($streams as $n => $stream) {
+			$clients[$n] = new TWebSocketConnection($stream, true);
+			$clients[$n]->attachEventHandler('onClose', function ($sender, $frame) use (&$codes, $n) {
+				$codes[$n] = $frame->getCloseCode();
+			});
+		}
+		$socket->setBlocking(false);
+		for ($i = 0; $i < 100 && !$socket->eof(); $i++) {
+			$read = [$socket->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);
+			$bytes = $socket->read(65536);   // the server has closed: what it sent arrives, then end of stream
+			if ($bytes !== '') {
+				$client->receive($bytes);
+			}
+		}
+		foreach ($streams as $n => $stream) {
+			$clients[$n]->feed($stream->getContents());
+		}
+		self::assertSame([TWebSocketCloseCode::GoingAway, TWebSocketCloseCode::GoingAway], $codes, 'Each stream is sent a Close with 1001 Going Away.');
+		self::assertTrue($socket->eof(), 'The transport is closed after the GOAWAY.');
+		$socket->close();
+	}
+
+	public function testAThrowingLoopCallbackIsLoggedAndServeCarriesOn()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$reactor = $server->getReactor();
+		Prado::getLogger()->deleteLogs(null, TWebSocketServer::class);
+		$after = false;
+		$reactor->delay(0.01, function () {
+			throw new \RuntimeException('application timer bug');
+		});
+		$reactor->delay(0.05, function () use ($server, &$after) {
+			$after = true;   // the loop survived the throw
+			$server->close();
+		});
+		$safetyNet = $reactor->delay(5.0, fn () => $server->close());
+
+		$server->serve();
+		$reactor->cancel($safetyNet);
+
+		self::assertTrue($after, 'serve() keeps running after a loop callback throws.');
+		$logs = Prado::getLogger()->getLogs(TLogger::ERROR, TWebSocketServer::class);
+		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'application timer bug')), 'The exception is logged.');
+		self::assertNull($reactor->getErrorHandler(), 'The error handler is removed when serve() returns.');
+	}
+
+	public function testServeKeepsAHostsErrorHandler()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$reactor = $server->getReactor();
+		$caught = [];
+		$hostHandler = function (\Throwable $e) use (&$caught) {
+			$caught[] = $e->getMessage();
+		};
+		$reactor->setErrorHandler($hostHandler);
+		$reactor->delay(0.01, function () use ($server) {
+			$server->close();
+			throw new \RuntimeException('to the host');
+		});
+		$server->serve();
+		self::assertSame(['to the host'], $caught, 'The host\'s error handler receives the exception.');
+		self::assertNotNull($reactor->getErrorHandler(), 'The host\'s error handler stays set.');
+	}
+
+	public function testServeRestoresTheLoopAndDetachesWhenTheClusterFailsToOpen()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setCluster(new TWebSocketCluster('n1', new FailingBackplane(failOpen: true)));
+		$prior = TAsync::getLoop();
+		try {
+			$server->serve();
+			self::fail('The open failure propagates.');
+		} catch (\RuntimeException $e) {
+			self::assertSame('open failed', $e->getMessage());
+		}
+		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored.');
+		self::assertFalse($server->getReactor()->isRegistered($server), 'The server detached from the reactor.');
+		self::assertNull($server->getReactor()->getErrorHandler(), 'The error handler is removed.');
+		$server->close();
+	}
+
+	public function testAThrowingClusterCloseStillDetachesAndRestoresTheLoop()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setCluster(new TWebSocketCluster('n1', new FailingBackplane(failClose: true)));
+		$prior = TAsync::getLoop();
+		Prado::getLogger()->deleteLogs(null, TWebSocketServer::class);
+		$server->serve(0, fn () => $server->close());
+		self::assertSame($prior, TAsync::getLoop(), 'The prior TAsync loop is restored.');
+		self::assertFalse($server->getReactor()->isRegistered($server), 'The server detached from the reactor.');
+		self::assertSame([], $server->getReactor()->getIdentifiers(), 'No server callback is left on the reactor.');
+		$logs = Prado::getLogger()->getLogs(TLogger::WARNING, TWebSocketServer::class);
+		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'close failed')), 'The close failure is logged.');
+	}
+
+	public function testAHandlerWaitingOnTheMainFiberSeesItsSessionsMessagesInOrderAndBeforeOnClose()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		TAsync::setLoop($server->getReactor());   // as serve() does
+		$handler = new TWebSocketHandler();
+		$events = [];
+		$clientWs = null;
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$events, &$clientWs) {
+			$payload = $msg->getPayload();
+			$events[] = $payload;
+			if ($payload === 'msg:1') {
+				$clientWs->send('msg:2');   // the peer keeps sending while this handler waits
+				$clientWs->send('msg:3');
+				$clientWs->close(1000);
+				TAsync::sleep(0.1);   // a wait on the main fiber: the reactor ticks from inside this handler
+				$events[] = 'msg:1 done';
+			}
+		});
+		$handler->attachEventHandler('onClose', function () use (&$events) {
+			$events[] = 'onClose';
+		});
+		$server->setHandler($handler);
+		$client = $this->upgradedClient($server);
+		$client->setBlocking(true);
+		$clientWs = new TWebSocketConnection($client, true);
+		$clientWs->send('msg:1');
+		$this->pumpServerUntil($server, function () use (&$events) {
+			return in_array('onClose', $events, true);
+		});
+
+		self::assertSame(['msg:1', 'msg:1 done', 'msg:2', 'msg:3', 'onClose'], $events, 'The session\'s input waits for the handler: in order, one at a time, onClose last.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testAReadableClusterSourceIsDrainedDuringAMainFiberWait()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		TAsync::setLoop($server->getReactor());   // as serve() does
+		$backplane = new SourceBackplane();
+		$server->setCluster(new TWebSocketCluster('n1', $backplane));
+		$handler = new TWebSocketHandler();
+		$seenDuringWait = null;
+		$handler->attachEventHandler('onMessage', function () use ($server, $backplane, &$seenDuringWait) {
+			fwrite($backplane->peer, 'one');   // cluster traffic arrives while the handler waits
+			$server->getReactor()->delay(0.05, fn () => fwrite($backplane->peer, 'two'));
+			TAsync::sleep(0.15);
+			$seenDuringWait = $backplane->received;
+		});
+		$server->setHandler($handler);
+		$client = $this->upgradedClient($server);
+		$client->setBlocking(true);
+		(new TWebSocketConnection($client, true))->send('wait');
+		$this->pumpServerUntil($server, function () use (&$seenDuringWait) {
+			return $seenDuringWait !== null;
+		});
+
+		self::assertSame('onetwo', $seenDuringWait, 'The cluster ticks on every reactor tick of the wait, so its source is read rather than spun on.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testIdleSessionsCostTheReactorNoWriteArmingPerTick()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$reactor = new CountingReactor();
+		$server->setReactor($reactor);
+		$handler = new TWebSocketHandler();
+		$connections = [];
+		$handler->attachEventHandler('onOpen', function ($connection) use (&$connections) {
+			$connections[] = $connection;
+		});
+		$server->setHandler($handler);
+		$clients = [];
+		for ($n = 0; $n < 3; $n++) {
+			$clients[] = $this->upgradedClient($server);
+		}
+		$reactor->wantWrites = 0;
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 1000);
+		}
+		self::assertSame(0, $reactor->wantWrites, 'A session whose write state did not change is not re-armed or disarmed each tick.');
+
+		$connections[0]->send('out of band');   // queued output, if the socket does not take it at once
+		$server->serveOnce(0, 1000);
+		$message = TWebSocketFrameCodec::tryDecode($this->pumpUntil($server, $clients[0], fn (string $bytes) => TWebSocketFrameCodec::tryDecode($bytes, false) !== null), false);
+		self::assertSame('out of band', $message['frame']->getPayload(), 'Output still reaches the peer.');
+		foreach ($clients as $client) {
+			$client->close();
+		}
+		$server->close();
+	}
+
+	public function testAServeOnceHostShutsTheSessionsDownItself()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$server->setShutdownTimeout(0);   // no drain: each session ends once its Close is written
+		$client = $this->upgradedClient($server);
+
+		$server->shutdownSessions();
+
+		self::assertSame(1, $closed, 'The session ends through onClose.');
+		self::assertSame(0, $server->getConnectionCount());
+		$frame = TWebSocketFrameCodec::tryDecode($this->readFrameWithoutServer($client), false);
+		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode(), 'The peer is sent 1001 Going Away.');
+		$client->close();
 		$server->close();
 	}
 }

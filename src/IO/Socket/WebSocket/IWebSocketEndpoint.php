@@ -44,7 +44,9 @@ interface IWebSocketEndpoint
 
 	/**
 	 * Takes over an authenticated, upgraded connection.  The server has written the 101 response and
-	 * set the transport non-blocking; the endpoint owns the connection from here.
+	 * set the transport non-blocking; the endpoint owns the connection from here.  The connection
+	 * carries the server's MaxMessageSize and MaxSendBufferBytes, or the limits the endpoint declares
+	 * through {@see IWebSocketEndpointLimits}.
 	 * @param TWebSocketConnection $connection The upgraded connection.
 	 * @param TSocketStream $transport The connection transport.
 	 * @param array<string, mixed> $request The parsed upgrade request.

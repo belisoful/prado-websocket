@@ -14,7 +14,9 @@ use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateExtension;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
+use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\Socket\WebSocket\TWebSocketMessage;
@@ -91,6 +93,7 @@ class TWebSocketModuleTest extends TestCase
 		$module->setHandshakeTimeout('2.5');
 		$module->setIdleTimeout(30);
 		$module->setCloseTimeout('1');
+		$module->setShutdownTimeout('0.5');
 		$module->setMaxConnections(100);
 		$module->setNodeId('edge-1');
 		$mesh = new TMeshBackplane();
@@ -111,6 +114,8 @@ class TWebSocketModuleTest extends TestCase
 			self::assertSame(2.5, $server->getHandshakeTimeout());
 			self::assertSame(30.0, $server->getIdleTimeout());
 			self::assertSame(1.0, $server->getCloseTimeout());
+			self::assertSame(0.5, $module->getShutdownTimeout());
+			self::assertSame(0.5, $server->getShutdownTimeout());
 			self::assertSame(100, $server->getMaxConnections());
 			self::assertSame($module->getCluster(), $server->getCluster());
 			self::assertSame('edge-1', $server->getCluster()->getNodeId());
@@ -135,6 +140,8 @@ class TWebSocketModuleTest extends TestCase
 			self::assertSame($defaults->getHandshakeTimeout(), $server->getHandshakeTimeout());
 			self::assertSame($defaults->getIdleTimeout(), $server->getIdleTimeout());
 			self::assertSame($defaults->getCloseTimeout(), $server->getCloseTimeout());
+			self::assertSame($defaults->getShutdownTimeout(), $server->getShutdownTimeout());
+			self::assertNull($module->getShutdownTimeout());
 			self::assertSame($defaults->getMaxConnections(), $server->getMaxConnections());
 			self::assertSame([], $server->getExtensions(), 'permessage-deflate is off unless enabled.');
 			self::assertNull($module->getIdleTimeout());
@@ -148,10 +155,15 @@ class TWebSocketModuleTest extends TestCase
 	{
 		$module = new ProbeWebSocketModule();
 		$module->setEndpoint('tcp://127.0.0.1:0');
+		$module->setShutdownTimeout(0.1);   // the in-process client does not answer the shutdown Close
 		$opened = 0;
+		$closed = 0;
 		$messages = [];
 		$module->attachEventHandler('onOpen', function () use (&$opened) {
 			$opened++;
+		});
+		$module->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
 		});
 		$module->attachEventHandler('onMessage', function ($connection, $message) use (&$messages, $module) {
 			self::assertInstanceOf(TWebSocketConnection::class, $connection, 'The module event sender is the connection.');
@@ -184,7 +196,19 @@ class TWebSocketModuleTest extends TestCase
 		self::assertFalse($safetyNet, 'The loop stopped on the message, not on the safety net.');
 		self::assertSame(1, $opened, 'The handler onOpen was re-raised as the module onOpen.');
 		self::assertSame(['hello module'], $messages, 'The handler onMessage was re-raised with the TWebSocketMessage.');
+		self::assertSame(1, $closed, 'Stopping the module closes the live WebSocket through onClose.');
 		self::assertNull($module->getServer(), 'The server is released after serving.');
+		$client->setBlocking(false);
+		$bytes = '';
+		for ($i = 0; $i < 100 && TWebSocketFrameCodec::tryDecode($bytes, false) === null && !$client->eof(); $i++) {
+			$read = [$client->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);   // the server has stopped: wait for the bytes it sent, without blocking
+			$bytes .= $client->read(4096);
+		}
+		$frame = TWebSocketFrameCodec::tryDecode($bytes, false);
+		self::assertNotNull($frame, 'The client is sent a Close as the module stops.');
+		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode());
 		$client?->close();
 	}
 
@@ -233,6 +257,7 @@ class TWebSocketModuleTest extends TestCase
 	{
 		$module = new ProbeWebSocketModule();
 		$module->setEndpoint('tcp://127.0.0.1:0');
+		$module->setShutdownTimeout(0.1);   // the in-process client does not answer the shutdown Close
 		$prior = TAsync::getLoop();
 		$module->attachEventHandler('onMessage', function ($connection) {
 			TAsync::run(function () use ($connection) {

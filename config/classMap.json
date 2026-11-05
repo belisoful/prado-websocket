@@ -2,6 +2,7 @@
 	"IWebSocketHandler": "Prado\\IO\\Socket\\WebSocket\\IWebSocketHandler",
 	"IWebSocketProtocol": "Prado\\IO\\Socket\\WebSocket\\IWebSocketProtocol",
 	"IWebSocketEndpoint": "Prado\\IO\\Socket\\WebSocket\\IWebSocketEndpoint",
+	"IWebSocketEndpointLimits": "Prado\\IO\\Socket\\WebSocket\\IWebSocketEndpointLimits",
 	"IWebSocketExtension": "Prado\\IO\\Socket\\WebSocket\\IWebSocketExtension",
 	"IWebSocketExtensionNegotiator": "Prado\\IO\\Socket\\WebSocket\\IWebSocketExtensionNegotiator",
 	"TWebSocketModule": "Prado\\IO\\Socket\\WebSocket\\TWebSocketModule",

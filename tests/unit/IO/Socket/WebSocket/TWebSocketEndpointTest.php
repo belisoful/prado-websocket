@@ -8,6 +8,7 @@ use Prado\IO\Socket\WebSocket\Cluster\TMeshBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
+use Prado\IO\Socket\WebSocket\IWebSocketEndpointLimits;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
@@ -43,6 +44,25 @@ class RecordingEndpoint implements IWebSocketEndpoint
 		$this->accepted = $connection;
 		$this->transport = $transport;
 		$this->request = $request;
+	}
+}
+
+/** An endpoint that declares its own connection limits, as a mesh peer link does. */
+class LimitedEndpoint extends RecordingEndpoint implements IWebSocketEndpointLimits
+{
+	public function __construct(string $path, private ?int $maxMessageSize, private ?int $maxSendBufferBytes)
+	{
+		parent::__construct($path);
+	}
+
+	public function getEndpointMaxMessageSize(): ?int
+	{
+		return $this->maxMessageSize;
+	}
+
+	public function getEndpointMaxSendBufferBytes(): ?int
+	{
+		return $this->maxSendBufferBytes;
 	}
 }
 
@@ -86,6 +106,59 @@ class TWebSocketEndpointTest extends TestCase
 		self::assertFalse($endpoint->transport->getBlocking(), 'The endpoint transport is non-blocking.');
 		self::assertStringContainsString('101 Switching Protocols', $client->read(4096), 'The server wrote the 101 before handing over.');
 
+		$client->close();
+		$server->close();
+	}
+
+	public function testAnEndpointDeclaresItsOwnConnectionLimits()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxMessageSize(1000);   // a small client limit
+		$server->setMaxSendBufferBytes(2000);
+		$endpoint = new LimitedEndpoint('/cluster', TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE, 0);
+		$server->addEndpoint($endpoint);
+
+		$client = $this->upgrade($server, '/cluster');
+		for ($tick = 0; $tick < 5 && $endpoint->accepted === null; $tick++) {
+			$server->serveOnce(0, 60000);
+		}
+		self::assertInstanceOf(TWebSocketConnection::class, $endpoint->accepted);
+		self::assertSame(TWebSocketConnection::DEFAULT_MAX_MESSAGE_SIZE, $endpoint->accepted->getMaxMessageSize(), 'The endpoint\'s declared limit replaces the client MaxMessageSize.');
+		self::assertSame(0, $endpoint->accepted->getMaxSendBufferBytes(), 'A declared 0 is unlimited.');
+		$client->read(4096);   // the 101
+		$payload = str_repeat('e', 1500);   // a relayed envelope larger than the client limit
+		(new TWebSocketConnection($client, true))->sendBinary($payload);
+		$received = [];
+		for ($i = 0; $i < 100 && $received === []; $i++) {
+			$read = [$endpoint->transport->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);
+			foreach ($endpoint->accepted->feedMessages($endpoint->transport->read(65536)) as $message) {
+				$received[] = $message->getPayload();
+			}
+		}
+		self::assertSame([$payload], $received, 'The endpoint link carries a message past the client limit.');
+
+		$client->close();
+		$server->close();
+	}
+
+	public function testAnEndpointThatDeclaresNoLimitKeepsTheServers()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setHandler(new TWebSocketHandler());
+		$server->setMaxMessageSize(1000);
+		$server->setMaxSendBufferBytes(2000);
+		$endpoint = new LimitedEndpoint('/admin', null, null);
+		$server->addEndpoint($endpoint);
+
+		$client = $this->upgrade($server, '/admin');
+		for ($tick = 0; $tick < 5 && $endpoint->accepted === null; $tick++) {
+			$server->serveOnce(0, 60000);
+		}
+		self::assertSame(1000, $endpoint->accepted->getMaxMessageSize(), 'A null limit keeps the server MaxMessageSize.');
+		self::assertSame(2000, $endpoint->accepted->getMaxSendBufferBytes(), 'A null limit keeps the server MaxSendBufferBytes.');
 		$client->close();
 		$server->close();
 	}

@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Exceptions\TPhpErrorException;
 use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\IResource;
@@ -57,6 +58,12 @@ use Psr\Http\Message\StreamInterface;
  * A session that is closing (the server or a handler sent a Close, a protocol error failed the
  * connection, or the idle reaper gave up on it) keeps its transport until the Close frame has
  * drained and the peer's Close arrives, and at most for {@see getCloseTimeout() CloseTimeout}.
+ *
+ * One connection's failure fails only that connection.  An exception from the handler raises its
+ * {@see IWebSocketHandler::onError()} and closes the WebSocket with 1011 (Internal Server Error),
+ * as the synchronous {@see IWebSocketHandler::handleConnection()} loop does; on HTTP/2 only that
+ * stream closes.  When {@see serve()} ends, every live WebSocket is closed with 1001 (Going Away)
+ * and given {@see getShutdownTimeout() ShutdownTimeout} to complete its close handshake.
  *
  * The handshake, close, and idle timeouts are measured on the server's
  * {@see getMonotonicClock() MonotonicClock}, so a wall-clock change neither lengthens nor shortens
@@ -120,6 +127,9 @@ class TWebSocketServer extends TSocketServer
 	/** @var float The seconds a closing session waits for the peer's Close before it is ended; 0 disables. */
 	private float $_closeTimeout = 5.0;
 
+	/** @var float The seconds {@see serve()} waits, as it ends, for live sessions to complete their close handshake. */
+	private float $_shutdownTimeout = 2.0;
+
 	/** @var ?TSocketReactor The event loop the server runs on, created on first use. */
 	private ?TSocketReactor $_reactor = null;
 
@@ -132,20 +142,32 @@ class TWebSocketServer extends TSocketServer
 	/** @var array<int, IResource> The cluster sources registered with the reactor, keyed by object id. */
 	private array $_clusterSources = [];
 
-	/** @var bool Whether the cluster has been ticked during the current pump. */
+	/** @var bool Whether the cluster has been ticked during the current reactor tick. */
 	private bool $_clusterTicked = false;
+
+	/** @var ?string The deferred reactor callback that clears {@see $_clusterTicked} on the next tick. */
+	private ?string $_clusterTickReset = null;
 
 	/** @var IWebSocketEndpoint[] The internal endpoints matched before normal client handling. */
 	private array $_endpoints = [];
 
+	/** @var array<int, true> The session transports armed for writability, keyed by transport object id. */
+	private array $_writeArmed = [];
+
+	/** @var array<int, true> The HTTP/2 sessions, keyed by transport object id. */
+	private array $_http2Sessions = [];
+
 	/**
-	 * @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float, handshake?: string, deadline?: float, crypto?: bool, closing?: float, discard?: bool, timer?: string, closeTimer?: string}>
+	 * @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float, handshake?: string, deadline?: float, crypto?: bool, closing?: float, discard?: bool, dispatching?: bool, held?: bool, streamClosing?: array<int, float>, timer?: string, closeTimer?: string}>
 	 *   Live sessions, keyed by transport object id.  `timer` and `closeTimer` are the reactor timer
 	 *   identifiers scheduled for the handshake and close deadlines.  A pending session (its opening
 	 *   handshake still arriving) carries the bytes gathered so far in `handshake`, `crypto` while its TLS handshake
 	 *   is in progress, and, when a {@see getHandshakeTimeout() HandshakeTimeout} is set, the
 	 *   `deadline` it must complete by.  A closing HTTP/1.1 session carries the `closing` deadline it
 	 *   is ended at, and `discard` once the connection has failed and its input is no longer parsed.
+	 *   An HTTP/1.1 session is `dispatching` while the handler runs its messages, and `held` while
+	 *   its input waits for that dispatch.  An HTTP/2 session carries the close deadlines of its
+	 *   closing streams in `streamClosing`.
 	 */
 	private array $_sessions = [];
 
@@ -421,6 +443,29 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Returns the shutdown timeout.
+	 * @return float The seconds {@see serve()} waits, as it ends, for live sessions to close.
+	 * @since 1.2.0
+	 */
+	public function getShutdownTimeout(): float
+	{
+		return $this->_shutdownTimeout;
+	}
+
+	/**
+	 * Sets the seconds {@see serve()} waits, as it ends, for the live sessions to complete the close
+	 * handshake {@see shutdownSessions()} starts with 1001 (Going Away).  Sessions still open after
+	 * it are ended without the peer's Close, so a stuck peer cannot hold the shutdown.  Default 2;
+	 * 0 ends every session at once, after its Close frame is written.
+	 * @param float|int|string $value The shutdown timeout in seconds.
+	 * @since 1.2.0
+	 */
+	public function setShutdownTimeout($value): void
+	{
+		$this->_shutdownTimeout = max(0, (float) $value);
+	}
+
+	/**
 	 * Returns the idle session timeout.
 	 * @return float The timeout in seconds, or 0 when idle reaping is disabled.
 	 */
@@ -621,6 +666,11 @@ class TWebSocketServer extends TSocketServer
 			$reactor->unregister($source);
 		}
 		$this->_clusterSources = [];
+		$this->_writeArmed = [];
+		if ($this->_clusterTickReset !== null) {
+			$reactor->cancel($this->_clusterTickReset);
+			$this->_clusterTickReset = null;
+		}
 		if ($this->_idleTimer !== null) {
 			$reactor->cancel($this->_idleTimer);
 			$this->_idleTimer = null;
@@ -634,7 +684,23 @@ class TWebSocketServer extends TSocketServer
 	 * handler starts with {@see TAsync::run()} resumes on the loop the server ticks; the prior TAsync
 	 * loop is restored on exit.  A handler that waits on the main fiber (an `await()` or a
 	 * {@see TAsync::sleep()} outside a fiber of its own) ticks the reactor from inside its callback, so
-	 * a handler starts its waits in a fiber instead.
+	 * a handler starts its waits in a fiber instead.  During such a wait the server holds the waiting
+	 * session's input (an HTTP/1.1 transport stays unread, an HTTP/2 session keeps the bytes), so its
+	 * messages still arrive in order and never after its `onClose`.  A second main-fiber wait that
+	 * starts while one is in progress, in another session's handler or a timer, fails: PRADO's
+	 * main-fiber suspension serves one wait at a time, so that handler's exception fails its
+	 * connection.
+	 *
+	 * While it serves, a reactor with no {@see TSocketReactor::getErrorHandler() ErrorHandler} gets
+	 * {@see handleLoopError()}, so an exception from an application timer (`TAsync` `delay()` or
+	 * `repeat()`) or from a fiber the loop resumes is logged and the loop carries on.  A host that set
+	 * its own handler keeps it.  The handler is removed on exit.
+	 *
+	 * When the loop ends ({@see close()}, a stop signal through a {@see TWebSocketModule}, or an
+	 * exception), {@see shutdownSessions()} closes the live sessions with 1001 (Going Away) and waits
+	 * up to {@see getShutdownTimeout() ShutdownTimeout} for their close handshakes.  The cluster then
+	 * closes and the server detaches from the reactor; each tear-down step runs even when an earlier
+	 * one throws.
 	 * @param ?int $seconds Per-pump tick timeout in seconds; null waits until activity or the nearest
 	 *   reactor timer (a handshake, close or idle deadline), blocking only when nothing is pending.
 	 * @param ?callable $afterEach Called after each pump, for a host with work to run between ticks
@@ -642,11 +708,16 @@ class TWebSocketServer extends TSocketServer
 	 */
 	public function serve(?int $seconds = null, ?callable $afterEach = null): void
 	{
+		$reactor = $this->getReactor();
 		$this->attachReactor();
 		$priorLoop = TAsync::getLoop();
-		TAsync::setLoop($this->getReactor());
-		$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
+		TAsync::setLoop($reactor);
+		$ownsErrorHandler = $reactor->getErrorHandler() === null;
+		if ($ownsErrorHandler) {
+			$reactor->setErrorHandler(fn (\Throwable $error) => $this->handleLoopError($error));
+		}
 		try {
+			$this->_cluster?->open();   // open the backplane (connect Redis, dial mesh peers, create the presence dir) for the daemon lifetime
 			while ($this->isListening()) {
 				$this->serveOnce($seconds);
 				if ($afterEach !== null) {
@@ -654,16 +725,152 @@ class TWebSocketServer extends TSocketServer
 				}
 			}
 		} finally {
-			TAsync::setLoop($priorLoop);
-			$this->_cluster?->close();
-			$this->detachReactor();
+			try {
+				$this->shutdownSessions();
+			} finally {
+				TAsync::setLoop($priorLoop);
+				if ($ownsErrorHandler) {
+					$reactor->setErrorHandler(null);
+				}
+				try {
+					$this->_cluster?->close();
+				} catch (\Throwable $e) {
+					$this->log('Cluster close failed: ' . $e->getMessage());
+				} finally {
+					$this->detachReactor();
+				}
+			}
 		}
+	}
+
+	/**
+	 * Handles an exception a reactor callback threw while {@see serve()} runs, as the reactor's
+	 * {@see TSocketReactor::setErrorHandler() ErrorHandler}: an application timer, or a fiber the loop
+	 * resumed.  The server's own callbacks contain their failures; this logs the exception at ERROR
+	 * level, and the loop carries on.  Override it to report or rethrow.
+	 * @param \Throwable $error The exception the callback threw.
+	 * @since 1.2.0
+	 */
+	protected function handleLoopError(\Throwable $error): void
+	{
+		$this->log('An event loop callback failed: ' . $error::class . ': ' . $error->getMessage(), TLogger::ERROR);
+	}
+
+	/**
+	 * Closes the live sessions; {@see serve()} calls it as it ends, and a host that drives the loop
+	 * with {@see serveOnce()} calls it when it stops.  A pending handshake is closed at once.  Each
+	 * open WebSocket, HTTP/1.1 or HTTP/2 stream, is sent a Close with 1001 (Going Away), and the loop
+	 * keeps running until every close handshake completes, {@see getShutdownTimeout() ShutdownTimeout}
+	 * passes, or a wait passes with no I/O.  A session that completes its handshake ends normally.
+	 * The rest are ended then, an HTTP/2 transport with a GOAWAY first.  Every WebSocket ends through
+	 * the handler's {@see IWebSocketHandler::onClose()} and leaves the cluster, and every transport
+	 * is closed.  A failure on one session is logged and ends only that session.
+	 * @since 1.2.0
+	 */
+	public function shutdownSessions(): void
+	{
+		if ($this->_sessions === []) {
+			return;
+		}
+		$this->log('Shutting down: ' . count($this->_sessions) . ' sessions are closed with 1001 Going Away.', TLogger::INFO);
+		foreach (array_column($this->_sessions, 'transport') as $transport) {
+			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+			if ($session === null) {
+				continue;
+			}
+			try {
+				if (isset($session['protocol'])) {
+					foreach ($session['protocol']->getConnections() as $connection) {
+						$connection->close(TWebSocketCloseCode::GoingAway);   // a no-op on a stream already closing
+					}
+					$this->queueHttp2Output($transport, $session['protocol']->send());
+				} elseif (isset($session['connection'])) {
+					$session['connection']->close(TWebSocketCloseCode::GoingAway);
+					$this->settleHttp1Session($transport, $session['connection']);
+				} else {
+					$this->forgetSession($transport);   // a pending handshake has no WebSocket to close
+					$transport->close();
+				}
+			} catch (\Throwable $e) {
+				$this->log('Session dropped during shutdown: ' . $e->getMessage());
+				$this->dropSession($transport);
+			}
+		}
+		$this->drainSessions();
+		$remaining = array_column($this->_sessions, 'transport');
+		if ($remaining !== []) {
+			$this->log('Shutdown: ' . count($remaining) . ' sessions are ended without completing the close handshake.', TLogger::NOTICE);
+		}
+		foreach ($remaining as $transport) {
+			$protocol = $this->_sessions[spl_object_id($transport)]['protocol'] ?? null;
+			if ($protocol !== null) {
+				try {
+					$protocol->getSession()->goaway();
+					$this->queueHttp2Output($transport, $protocol->send());   // best effort: whatever the socket takes now
+				} catch (\Throwable $e) {
+					// The transport cannot take the GOAWAY; the session still ends below.
+				}
+			}
+			$this->dropSession($transport);
+		}
+	}
+
+	/**
+	 * Runs the loop while sessions complete the close handshakes {@see shutdownSessions()} started.
+	 * It returns once no session has a WebSocket open or output queued, once
+	 * {@see getShutdownTimeout() ShutdownTimeout} has passed, or once a wait for the time remaining
+	 * ends with no source ready.
+	 */
+	private function drainSessions(): void
+	{
+		if ($this->_shutdownTimeout <= 0) {
+			return;
+		}
+		$clock = $this->getMonotonicClock();
+		$deadline = $clock->seconds() + $this->_shutdownTimeout;
+		while ($this->hasClosingSessions()) {
+			$remaining = $deadline - $clock->seconds();
+			if ($remaining <= 0) {
+				return;
+			}
+			$this->_clusterTicked = false;
+			$ready = $this->getReactor()->tick($remaining);
+			$this->afterTick();
+			if ($ready === 0) {
+				return;   // nothing moved for the rest of the wait (or a timer cut it short): stop waiting on silent peers
+			}
+		}
+	}
+
+	/**
+	 * Indicates whether a session still has a WebSocket open or output queued, so the shutdown drain
+	 * has something to wait for.
+	 * @return bool Whether a session is still closing.
+	 */
+	private function hasClosingSessions(): bool
+	{
+		foreach ($this->_sessions as $session) {
+			if (isset($session['connection']) || ($session['outbound'] ?? '') !== '') {
+				return true;
+			}
+			if (isset($session['protocol']) && $session['protocol']->getConnections() !== []) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/**
 	 * Runs one pump of the event loop: one reactor tick (readiness, due timers, dispatch) followed by
 	 * the per-tick housekeeping (the cluster tick, HTTP/2 output, close-deadline stamping, and write
 	 * arming).  This is the testable unit of {@see serve()}.
+	 *
+	 * A host that drives the loop with serveOnce() owns what {@see serve()} sets up around it.  The
+	 * reactor is not made the {@see TAsync::getLoop() TAsync loop}, so a fiber a handler starts with
+	 * {@see TAsync::run()} resumes only once the host calls `TAsync::setLoop($server->getReactor())`.
+	 * No reactor ErrorHandler is installed, so an exception from an application timer leaves
+	 * serveOnce().  The live sessions stay open when the host stops pumping until it calls
+	 * {@see shutdownSessions()}.
 	 * @param ?int $seconds Tick timeout in seconds; null waits until activity or the nearest reactor
 	 *   timer, bounded by {@see CLUSTER_TICK_INTERVAL} when a cluster is present.
 	 * @param int $microseconds Additional tick timeout microseconds.
@@ -741,7 +948,10 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Ticks the cluster once per pump.  A backplane fault (e.g. a dropped Redis connection) degrades
+	 * Ticks the cluster once per reactor tick, however many of its sources are ready.  A deferred
+	 * reactor callback clears the mark as the next tick starts, so a reactor ticked from inside a
+	 * handler (a wait on the main fiber) keeps draining a readable cluster source instead of
+	 * reporting it ready again at once.  A backplane fault (e.g. a dropped Redis connection) degrades
 	 * cluster messaging but never terminates the serve loop that is handling live connections.
 	 */
 	protected function tickCluster(): void
@@ -750,6 +960,12 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$this->_clusterTicked = true;
+		if ($this->_attached && $this->_clusterTickReset === null) {
+			$this->_clusterTickReset = $this->getReactor()->defer(function (): void {
+				$this->_clusterTickReset = null;
+				$this->_clusterTicked = false;
+			});
+		}
 		try {
 			$this->_cluster->tick();
 		} catch (\Throwable $e) {
@@ -807,17 +1023,25 @@ class TWebSocketServer extends TSocketServer
 	 * Arms each session transport and cluster source with queued output for writability and disarms
 	 * the rest, so the reactor watches writes only where a drain is pending (a writable socket is
 	 * otherwise always ready).  Output queued outside a pump (a cluster broadcast, a handler's
-	 * out-of-band send, a mesh peer message larger than the socket buffer) is picked up here.
+	 * out-of-band send, a mesh peer message larger than the socket buffer) is picked up here.  Only a
+	 * session whose state changed since the last pass is re-armed or disarmed.
 	 */
 	protected function armWrites(): void
 	{
 		$reactor = $this->getReactor();
 		$pending = [];
 		foreach ($this->pendingWriteTransports() as $transport) {
-			$pending[spl_object_id($transport)] = true;
+			$pending[spl_object_id($transport)] = $transport;
 		}
-		foreach ($this->_sessions as $id => $session) {
-			$reactor->wantWrite($session['transport'], isset($pending[$id]));
+		foreach ($this->_writeArmed as $id => $armed) {
+			if (!isset($pending[$id]) && isset($this->_sessions[$id])) {
+				$this->armSessionWrite($this->_sessions[$id]['transport'], false);
+			}
+		}
+		foreach ($pending as $id => $transport) {
+			if (!isset($this->_writeArmed[$id]) && isset($this->_sessions[$id])) {
+				$this->armSessionWrite($transport, true);
+			}
 		}
 		$backplane = $this->_cluster?->getBackplane();
 		$queued = [];
@@ -832,6 +1056,22 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Arms or disarms a session transport's writable callback and records the state, so
+	 * {@see armWrites()} touches the reactor only on a change.
+	 * @param TSocketStream $transport The session transport.
+	 * @param bool $want Whether to watch the transport for writability.
+	 */
+	private function armSessionWrite(TSocketStream $transport, bool $want): void
+	{
+		$this->getReactor()->wantWrite($transport, $want);
+		if ($want) {
+			$this->_writeArmed[spl_object_id($transport)] = true;
+		} else {
+			unset($this->_writeArmed[spl_object_id($transport)]);
+		}
+	}
+
+	/**
 	 * Records a session under its transport and registers the transport with the reactor.  A
 	 * pending session's handshake deadline is scheduled as a reactor timer.
 	 * @param TSocketStream $transport The session transport.
@@ -841,6 +1081,9 @@ class TWebSocketServer extends TSocketServer
 	{
 		$id = spl_object_id($transport);
 		$this->_sessions[$id] = $session;
+		if (isset($session['protocol'])) {
+			$this->_http2Sessions[$id] = true;
+		}
 		if ($this->_attached) {
 			$this->registerSession($transport);
 			$this->armSessionTimers($id);
@@ -853,6 +1096,7 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function registerSession(TSocketStream $transport): void
 	{
+		unset($this->_writeArmed[spl_object_id($transport)]);   // a fresh registration starts disarmed
 		$this->getReactor()->register(
 			$transport,
 			onReadable: fn () => $this->readySession($transport),
@@ -869,7 +1113,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		$id = spl_object_id($transport);
 		$this->cancelSessionTimers($id);
-		unset($this->_sessions[$id]);
+		unset($this->_sessions[$id], $this->_writeArmed[$id], $this->_http2Sessions[$id]);
 		if ($this->_attached) {
 			$this->getReactor()->unregister($transport);
 		}
@@ -1048,6 +1292,9 @@ class TWebSocketServer extends TSocketServer
 			if ($connection->getIsClosing() || $connection->getIsClosed()) {
 				continue;   // a closing session is bounded by the close deadline, not by a ping
 			}
+			if (!empty($session['dispatching'])) {
+				continue;   // a handler is busy with it and its input is held, so a Pong could not be read
+			}
 			$idle = $now - ($session['active'] ?? $now);
 			if ($idle < $this->_idleTimeout) {
 				continue;
@@ -1157,11 +1404,12 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function flushHttp2Output(): void
 	{
-		foreach (array_column($this->_sessions, 'transport') as $transport) {
-			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+		foreach (array_keys($this->_http2Sessions) as $id) {
+			$session = $this->_sessions[$id] ?? null;
 			if ($session === null || !isset($session['protocol'])) {
 				continue;
 			}
+			$transport = $session['transport'];
 			if (strlen($session['outbound'] ?? '') >= self::HTTP2_OUTPUT_HIGH_WATER) {
 				continue;   // the peer is not reading: leave the output in its streams, where MaxSendBufferBytes bounds it
 			}
@@ -1371,7 +1619,9 @@ class TWebSocketServer extends TSocketServer
 	/**
 	 * Runs the HTTP/1.1 upgrade on a parsed request head and registers a single-WebSocket session.
 	 * An invalid upgrade is refused with its HTTP rejection (a 400, or a 426 naming the supported
-	 * version) and the connection closed.
+	 * version) and the connection closed.  An upgrade an {@see IWebSocketEndpoint} claims is handed
+	 * to it with the server's MaxMessageSize and MaxSendBufferBytes, or with the limits an
+	 * {@see IWebSocketEndpointLimits} endpoint declares.
 	 * @param TSocketStream $transport The accepted, non-blocking transport.
 	 * @param array{method: ?string, target: ?string, protocol: string, headers: array<string, string>} $request The parsed request head.
 	 * @param string $initial The bytes that followed the head, fed to the new session as its first frames.
@@ -1401,8 +1651,9 @@ class TWebSocketServer extends TSocketServer
 			}
 			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // an internal endpoint does not negotiate
 			$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
-			$connection->setMaxMessageSize($this->_maxMessageSize);
-			$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
+			$limits = $endpoint instanceof IWebSocketEndpointLimits;
+			$connection->setMaxMessageSize(($limits ? $endpoint->getEndpointMaxMessageSize() : null) ?? $this->_maxMessageSize);
+			$connection->setMaxSendBufferBytes(($limits ? $endpoint->getEndpointMaxSendBufferBytes() : null) ?? $this->_maxSendBufferBytes);
 			$endpoint->accept($connection, $transport, $request);
 			return;
 		}
@@ -1485,7 +1736,7 @@ class TWebSocketServer extends TSocketServer
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->settleHttp2Handshake($transport));
-		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
+		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->unregisterHttp2Connection($connection));
 		$session = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '', 'active' => $this->getMonotonicClock()->seconds()];
 		if ($this->_handshakeTimeout > 0) {
 			$session['deadline'] = $session['active'] + $this->_handshakeTimeout;   // until its first WebSocket stream opens
@@ -1494,6 +1745,20 @@ class TWebSocketServer extends TSocketServer
 		$this->queueHttp2Output($transport, $protocol->send());   // the initial SETTINGS, queued and drained non-blocking
 		if ($initial !== '') {
 			$this->feedHttp2Session($transport, $protocol, $initial);
+		}
+	}
+
+	/**
+	 * Unregisters a closing HTTP/2 stream's connection from the cluster.  A backplane fault is logged,
+	 * so it neither escapes into the HTTP/2 session nor ends the other streams on the transport.
+	 * @param TWebSocketConnection $connection The closing connection.
+	 */
+	private function unregisterHttp2Connection(TWebSocketConnection $connection): void
+	{
+		try {
+			$this->_cluster?->unregister($connection);
+		} catch (\Throwable $e) {
+			$this->log('Cluster unregister failed: ' . $e->getMessage());
 		}
 	}
 
@@ -1588,8 +1853,10 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Reads a chunk from a ready transport, treating a clean end of stream and an abrupt disconnect
-	 * alike.  A peer that resets the connection surfaces as a read failure ({@see \Prado\IO\TStream::read()}
-	 * throws when the underlying read returns false); both that and an end of stream return null, so a
+	 * alike.  A peer that resets the connection surfaces as a read failure: {@see \Prado\IO\TStream::read()}
+	 * throws a `RuntimeException` when the underlying read returns false, and PRADO's PHP error
+	 * handler raises a read's notice or warning (a TLS stream reports a reset that way) as a
+	 * {@see TPhpErrorException} first.  Any such failure and an end of stream return null, so a
 	 * disconnect ends the session instead of crashing the loop.
 	 * @param TSocketStream $transport The ready transport.
 	 * @return ?string The bytes read, or null at end of stream or on a read failure.
@@ -1598,7 +1865,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		try {
 			$bytes = $transport->read(self::READ_CHUNK);
-		} catch (\RuntimeException $e) {
+		} catch (\Exception $e) {
 			return null;
 		}
 		return ($bytes === '' && $transport->eof()) ? null : $bytes;
@@ -1678,7 +1945,9 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Drains an HTTP/2 session's queued output to its non-blocking transport, keeping any tail the
-	 * send buffer could not accept.  A broken pipe ends the session.
+	 * send buffer could not accept.  A broken pipe ends the session, whether the write reports it as
+	 * a `RuntimeException` or PRADO's PHP error handler raises the write's EPIPE notice as a
+	 * {@see TPhpErrorException}.
 	 * @param TSocketStream $transport The session transport.
 	 */
 	protected function drainHttp2Output(TSocketStream $transport): void
@@ -1699,7 +1968,7 @@ class TWebSocketServer extends TSocketServer
 				}
 				$sent += $wrote;
 			}
-		} catch (\RuntimeException $e) {
+		} catch (\RuntimeException | TPhpErrorException $e) {
 			$this->log('HTTP/2 session ended on a write failure: ' . $e->getMessage(), TLogger::NOTICE);
 			$this->endHttp2Session($transport);
 			return;
@@ -1734,6 +2003,10 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function pumpHttp1Session(TSocketStream $transport, TWebSocketConnection $connection): void
 	{
+		if (!empty($this->_sessions[spl_object_id($transport)]['dispatching'])) {
+			$this->holdHttp1Input($transport, $connection);   // a handler of this session waits on the loop: its input waits for it
+			return;
+		}
 		$bytes = $this->readTransport($transport);
 		if ($bytes === null) {
 			$this->endHttp1Session($transport, $connection);
@@ -1747,37 +2020,115 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Feeds bytes into a single-WebSocket session: refreshes its activity, dispatches the complete
-	 * messages, fails the connection on a protocol error, and ends the session once a close
-	 * handshake has completed and drained.
+	 * messages, fails the connection on a protocol error or a throwing handler, and ends the session
+	 * once a close handshake has completed and drained.
+	 *
+	 * The session is dispatching while its messages run through the handler.  A handler that waits
+	 * on the main fiber ticks the loop from inside the dispatch, and the loop may find this
+	 * transport readable again.  Its input then stays unread in the socket ({@see holdHttp1Input()})
+	 * until the dispatch returns, so the handler sees the session's messages in order, one at a time,
+	 * and never after its `onClose`.  A session the loop ended during the wait (its close deadline)
+	 * dispatches nothing more.
 	 * @param TSocketStream $transport The session transport.
 	 * @param TWebSocketConnection $connection The session connection.
 	 * @param string $bytes The bytes received.
 	 */
 	protected function handleHttp1Bytes(TSocketStream $transport, TWebSocketConnection $connection, string $bytes): void
 	{
-		if ($bytes !== '' && isset($this->_sessions[spl_object_id($transport)])) {
-			$this->_sessions[spl_object_id($transport)]['active'] = $this->getMonotonicClock()->seconds();   // any inbound frame (a Pong included) keeps the session alive
-			unset($this->_sessions[spl_object_id($transport)]['pinged']);
-		}
-		try {
-			$messages = $connection->feedMessages($bytes);
-		} catch (TWebSocketException $e) {
-			$this->log('Protocol error; the connection is failed with close code ' . $e->getCloseCode() . ': ' . $e->getMessage(), TLogger::NOTICE);
-			try {
-				$this->getHandler()?->onError($connection, $e);
-			} catch (\Throwable $inner) {
-				$this->log('Handler onError failed: ' . $inner->getMessage());
-			}
-			$this->failHttp1Session($transport, $connection, $e->getCloseCode());
+		$id = spl_object_id($transport);
+		if (!isset($this->_sessions[$id])) {
 			return;
 		}
-		foreach ($messages as $message) {
-			if ($connection->getIsCloseInitiator()) {
-				break;   // the application or server closed the connection: nothing more reaches the handler
+		if ($bytes !== '') {
+			$this->_sessions[$id]['active'] = $this->getMonotonicClock()->seconds();   // any inbound frame (a Pong included) keeps the session alive
+			unset($this->_sessions[$id]['pinged']);
+		}
+		$this->_sessions[$id]['dispatching'] = true;
+		try {
+			try {
+				$messages = $connection->feedMessages($bytes);
+			} catch (TWebSocketException $e) {
+				$this->log('Protocol error; the connection is failed with close code ' . $e->getCloseCode() . ': ' . $e->getMessage(), TLogger::NOTICE);
+				$this->failHttp1Connection($transport, $connection, $e);
+				return;
 			}
-			$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
+			foreach ($messages as $message) {
+				if (!isset($this->_sessions[$id]) || $connection->getIsCloseInitiator()) {
+					break;   // the session ended, or the application or server closed it: nothing more reaches the handler
+				}
+				try {
+					$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
+				} catch (\Throwable $e) {
+					$this->log('Handler onMessage failed; the connection is failed: ' . $e->getMessage());
+					$this->failHttp1Connection($transport, $connection, $e);
+					return;
+				}
+			}
+		} finally {
+			$this->endHttp1Dispatch($transport, $connection);
 		}
 		$this->settleHttp1Session($transport, $connection);
+	}
+
+	/**
+	 * Holds a dispatching session's input: the transport stays registered for writes only, so the
+	 * loop neither reads it nor reports it readable again until {@see endHttp1Dispatch()}.  The bytes
+	 * wait in the socket, where TCP flow control bounds them.
+	 * @param TSocketStream $transport The session transport.
+	 * @param TWebSocketConnection $connection The session connection.
+	 */
+	private function holdHttp1Input(TSocketStream $transport, TWebSocketConnection $connection): void
+	{
+		$id = spl_object_id($transport);
+		if (!empty($this->_sessions[$id]['held']) || !$this->_attached) {
+			return;
+		}
+		$this->_sessions[$id]['held'] = true;
+		$this->getReactor()->register($transport, onWritable: fn () => $this->writableSession($transport));
+		$this->armSessionWrite($transport, $connection->hasPendingOutbound());
+	}
+
+	/**
+	 * Ends a session's dispatch: clears the dispatching mark and, when its input was held, registers
+	 * the transport for reads again, so the next tick reads what arrived meanwhile.
+	 * @param TSocketStream $transport The session transport.
+	 * @param TWebSocketConnection $connection The session connection.
+	 */
+	private function endHttp1Dispatch(TSocketStream $transport, TWebSocketConnection $connection): void
+	{
+		$id = spl_object_id($transport);
+		if (!isset($this->_sessions[$id])) {
+			return;   // ended during the dispatch: forgetSession() already removed the transport from the reactor
+		}
+		unset($this->_sessions[$id]['dispatching']);
+		if (empty($this->_sessions[$id]['held'])) {
+			return;
+		}
+		unset($this->_sessions[$id]['held']);
+		if ($this->_attached) {
+			$this->registerSession($transport);
+			$this->armSessionWrite($transport, $connection->hasPendingOutbound());
+		}
+	}
+
+	/**
+	 * Fails a single-WebSocket session on an error, as the synchronous
+	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
+	 * {@see IWebSocketHandler::onError()} and closes with the error's close code, or 1011 (Internal
+	 * Server Error) for an error that is not a {@see TWebSocketException}.  Only this session fails.
+	 * @param TSocketStream $transport The session transport.
+	 * @param TWebSocketConnection $connection The session connection.
+	 * @param \Throwable $error The protocol error, or the exception a handler threw.
+	 */
+	private function failHttp1Connection(TSocketStream $transport, TWebSocketConnection $connection, \Throwable $error): void
+	{
+		try {
+			$this->getHandler()?->onError($connection, $error);
+		} catch (\Throwable $inner) {
+			$this->log('Handler onError failed: ' . $inner->getMessage());
+		}
+		$code = $error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError;
+		$this->failHttp1Session($transport, $connection, $code);
 	}
 
 	/**
@@ -1964,5 +2315,7 @@ class TWebSocketServer extends TSocketServer
 		$exprops[] = "\0" . __CLASS__ . "\0_cluster";
 		$exprops[] = "\0" . __CLASS__ . "\0_reactor";
 		$exprops[] = "\0" . __CLASS__ . "\0_clusterSources";
+		$exprops[] = "\0" . __CLASS__ . "\0_writeArmed";
+		$exprops[] = "\0" . __CLASS__ . "\0_http2Sessions";
 	}
 }

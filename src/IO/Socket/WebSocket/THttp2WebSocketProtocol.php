@@ -43,6 +43,12 @@ use Psr\Http\Message\StreamInterface;
  * and {@see send()} move bytes to and from the transport, so an event-loop server pumps the one
  * socket while many WebSockets run on it.
  *
+ * Each stream fails on its own.  A protocol error or an exception from the handler raises the
+ * handler's {@see IWebSocketHandler::onError()} and closes that stream's connection with the
+ * error's close code (1011 for a handler exception), as the synchronous
+ * {@see IWebSocketHandler::handleConnection()} loop does.  A throwing `onOpen` resets its stream
+ * and raises the closes.  The other streams on the transport carry on.
+ *
  * Events ('on' prefix), raised per multiplexed WebSocket so several observers can react (e.g. an
  * event-loop server and a cluster coordinator):
  *  - onConnection: after a stream's Extended CONNECT is accepted, with its {@see TWebSocketConnection}.
@@ -55,6 +61,14 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 {
 	/** @var int The maximum bytes read from the transport per pump. */
 	public const READ_CHUNK = 65536;
+
+	/**
+	 * The most bytes {@see receive()} holds while the session is busy.  Flow control bounds the DATA
+	 * a peer sends meanwhile to the session's receive window (64 KiB), but not its control frames, so
+	 * a peer that floods PING or SETTINGS frames past this limit ends the session.
+	 * @since 1.2.0
+	 */
+	public const MAX_DEFERRED_BYTES = 1048576;
 
 	/** @var IWebSocketHandler The handler each WebSocket stream is run through. */
 	private IWebSocketHandler $_handler;
@@ -94,6 +108,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/** @var string The bytes received while the session was busy, fed once it is not. */
 	private string $_deferred = '';
+
+	/** @var string The output a {@see send()} produced before a later step of it threw, returned first by the next send(). */
+	private string $_unsent = '';
 
 	/** @var ?callable The capacity check a WebSocket stream must pass to open, or null for none. */
 	private $_admission;
@@ -347,15 +364,29 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	 * re-entry (`http2_session_busy`).  A handler that waits on the event loop outside a fiber of its
 	 * own ticks the loop from inside that call, and the loop may read this transport again.  Bytes
 	 * that arrive while the session is busy are held and fed, in order, once the outer
-	 * {@see receive()} or {@see send()} returns.  HTTP/2 flow control bounds the DATA a peer sends
-	 * meanwhile, since the session acknowledges none of the held bytes.
+	 * {@see receive()} or {@see send()} returns; bytes still held when a call starts are fed before
+	 * its own.  HTTP/2 flow control bounds the DATA a peer sends meanwhile, since the session
+	 * acknowledges none of the held bytes, but not its control frames: past
+	 * {@see MAX_DEFERRED_BYTES} the held input is discarded and the call throws, and the server ends
+	 * the session.
 	 * @param string $bytes The bytes read from the transport.
+	 * @throws TWebSocketException When the bytes held while the session is busy would exceed
+	 *   {@see MAX_DEFERRED_BYTES} (`websocket_http2_input_overflow`).
 	 */
 	public function receive(string $bytes): void
 	{
 		if ($this->_receiving || $this->_sending) {
+			if (strlen($this->_deferred) + strlen($bytes) > self::MAX_DEFERRED_BYTES) {
+				$this->_deferred = '';
+				throw (new TWebSocketException('websocket_http2_input_overflow', self::MAX_DEFERRED_BYTES))
+					->setCloseCode(TWebSocketCloseCode::PolicyViolation);
+			}
 			$this->_deferred .= $bytes;
 			return;
+		}
+		if ($this->_deferred !== '') {
+			$bytes = $this->_deferred . $bytes;   // bytes held across an earlier call that threw come first
+			$this->_deferred = '';
 		}
 		$this->_receiving = true;
 		try {
@@ -367,9 +398,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.  A call made
-	 * while a {@see send()} is in progress (a handler waiting on the event loop from inside it)
-	 * returns `''`; the outer call or the next one carries the output.
+	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.  Input held while
+	 * the session was busy is fed once the drain returns, and the output it produces (a handler's
+	 * reply) is drained too, so it is returned by this call.  A call made while a {@see send()} is in
+	 * progress (a handler waiting on the event loop from inside it) returns `''`; the outer call or
+	 * the next one carries the output.  When a step throws, the output already drained is kept and
+	 * returned first by the next call.
 	 * @return string The bytes to write to the transport.
 	 */
 	public function send(): string
@@ -377,21 +411,30 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		if ($this->_sending) {
 			return '';
 		}
-		$this->_sending = true;
+		$output = $this->_unsent;
+		$this->_unsent = '';
 		try {
-			$output = $this->_session->send();
-		} finally {
-			$this->_sending = false;
-		}
-		if (!$this->_receiving && $this->_deferred !== '') {
-			$this->_receiving = true;
-			try {
-				$this->feedDeferred();
-			} finally {
-				$this->_receiving = false;
+			while (true) {
+				$this->_sending = true;
+				try {
+					$output .= $this->_session->send();
+				} finally {
+					$this->_sending = false;
+				}
+				if ($this->_receiving || $this->_deferred === '') {
+					return $output;
+				}
+				$this->_receiving = true;
+				try {
+					$this->feedDeferred();
+				} finally {
+					$this->_receiving = false;
+				}
 			}
+		} catch (\Throwable $e) {
+			$this->_unsent = $output;
+			throw $e;
 		}
-		return $output;
 	}
 
 	/**
@@ -416,21 +459,24 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	public function serve(TSocketStream $connection, callable $onStream): void
 	{
 		$this->_onStream = $onStream;
-		$connection->write($this->send());                  // initial SETTINGS
-		while ($connection->isOpen()) {
-			$bytes = $connection->read(self::READ_CHUNK);
-			if ($bytes === '' && $connection->eof()) {
-				break;   // the read reached end of stream
+		try {
+			$connection->write($this->send());                  // initial SETTINGS
+			while ($connection->isOpen()) {
+				$bytes = $connection->read(self::READ_CHUNK);
+				if ($bytes === '' && $connection->eof()) {
+					break;   // the read reached end of stream
+				}
+				if ($bytes !== '') {
+					$this->receive($bytes);
+				}
+				$out = $this->send();
+				if ($out !== '') {
+					$connection->write($out);
+				}
 			}
-			if ($bytes !== '') {
-				$this->receive($bytes);
-			}
-			$out = $this->send();
-			if ($out !== '') {
-				$connection->write($out);
-			}
+		} finally {
+			$this->shutdown();   // the transport ended or failed; fire onClose for any streams still open
 		}
-		$this->shutdown();   // the transport ended; fire onClose for any streams still open
 	}
 
 	/**
@@ -484,25 +530,32 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
 		$this->_connections[$stream->getStreamId()] = $connection;
-		if ($this->_onStream !== null) {
-			($this->_onStream)($stream, [
-				'requestLine' => 'CONNECT ' . $headers[':path'] . ' HTTP/2',
-				'method' => 'CONNECT',
-				'target' => $headers[':path'],
-				'protocol' => 'HTTP/2',
-				'statusCode' => null,
-				'headers' => $headers,
-				'body' => '',
-				'subprotocol' => $subprotocol,
-				'extensions' => $negotiated['extensions'],
-			]);
+		try {
+			if ($this->_onStream !== null) {
+				($this->_onStream)($stream, [
+					'requestLine' => 'CONNECT ' . $headers[':path'] . ' HTTP/2',
+					'method' => 'CONNECT',
+					'target' => $headers[':path'],
+					'protocol' => 'HTTP/2',
+					'statusCode' => null,
+					'headers' => $headers,
+					'body' => '',
+					'subprotocol' => $subprotocol,
+					'extensions' => $negotiated['extensions'],
+				]);
+			}
+			$this->onConnection($connection);
+			$this->_handler->onOpen($connection);
+		} catch (\Throwable $e) {
+			Prado::log('WebSocket stream activation failed and is rolled back: ' . $e->getMessage(), TLogger::WARNING, static::class);
+			$this->endConnection($connection);   // reset only this stream; the handler and service closes still run
 		}
-		$this->onConnection($connection);
-		$this->_handler->onOpen($connection);
 	}
 
 	/**
-	 * Feeds a stream's newly received DATA to its WebSocket connection and dispatches messages.
+	 * Feeds a stream's newly received DATA to its WebSocket connection and dispatches messages.  A
+	 * protocol error, or an exception from the handler, fails only this stream's connection
+	 * ({@see failStream()}); the other WebSockets on the transport carry on.
 	 * @param TH2Stream $stream The stream with new buffered data.
 	 */
 	protected function pumpStream(TH2Stream $stream): void
@@ -513,21 +566,47 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		}
 		try {
 			$messages = $connection->feedMessages($stream->getContents());
-		} catch (TWebSocketException $e) {
-			$this->_handler->onError($connection, $e);
-			$connection->close($e->getCloseCode());
-			$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
-			return;
-		}
-		foreach ($messages as $message) {
-			if ($connection->getIsCloseInitiator()) {
-				break;   // the application or server closed the stream: nothing more reaches the handler
+			foreach ($messages as $message) {
+				if ($connection->getIsCloseInitiator()) {
+					break;   // the application or server closed the stream: nothing more reaches the handler
+				}
+				$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
 			}
-			$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
+		} catch (\Throwable $e) {
+			$this->failStream($stream, $connection, $e);
+			return;
 		}
 		if ($connection->getIsClosed()) {
 			$this->closeStream($stream);
 		}
+	}
+
+	/**
+	 * Fails one stream's connection on an error, as the synchronous
+	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
+	 * {@see IWebSocketHandler::onError()}, sends a Close with the error's close code (1011, Internal
+	 * Server Error, for an error that is not a {@see TWebSocketException}), and ends the stream with
+	 * the handler and service closes.  A failing onError or Close write is logged.
+	 * @param TH2Stream $stream The stream.
+	 * @param TWebSocketConnection $connection The stream's connection.
+	 * @param \Throwable $error The protocol error, or the exception a handler threw.
+	 */
+	private function failStream(TH2Stream $stream, TWebSocketConnection $connection, \Throwable $error): void
+	{
+		if (!$error instanceof TWebSocketException) {
+			Prado::log('Handler failed on an HTTP/2 stream; the stream is failed: ' . $error->getMessage(), TLogger::WARNING, static::class);
+		}
+		try {
+			$this->_handler->onError($connection, $error);
+		} catch (\Throwable $e) {
+			Prado::log('Handler onError failed on an HTTP/2 stream: ' . $e->getMessage(), TLogger::WARNING, static::class);
+		}
+		try {
+			$connection->close($error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError);
+		} catch (\Throwable $e) {
+			// The stream can no longer carry the Close; it still ends below.
+		}
+		$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
 	}
 
 	/**
@@ -593,6 +672,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			}
 		} finally {
 			$this->_deferred = '';
+			$this->_unsent = '';
 			$this->_session->close();
 		}
 	}
