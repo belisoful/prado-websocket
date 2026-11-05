@@ -11,7 +11,9 @@
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\IResource;
+use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -21,6 +23,7 @@ use Prado\TComponent;
 use Prado\TPropertyValue;
 use Prado\Util\Log\TLogger;
 use Prado\Util\Clock\TApplicationClockAwareTrait;
+use Prado\Util\Clock\TMonotonicClockAwareTrait;
 
 /**
  * TMeshBackplane class.
@@ -46,8 +49,16 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  * The mesh self-assembles: it is seeded from the {@see setPeers() Peers} dialed on {@see open()},
  * then each node announces its {@see setAdvertise() Advertise} URI, which floods so other nodes dial
  * it (a lexical tie-break makes exactly one side of any pair initiate, and an established peer is
- * never dialed twice).  Dials are asynchronous and advance in {@see tick()}, so the serve loop never
- * blocks on a connecting or handshaking peer.
+ * never dialed twice).  A {@see setPeerPattern() PeerPattern} limits which announced URIs a node
+ * dials; seeds are always dialed.
+ *
+ * Dials do not block the serve loop.  The TCP connect is asynchronous; a `tls://` or `ssl://` peer is
+ * connected over TCP first and its TLS handshake is then driven without blocking, with the
+ * {@see setSslContext() SslContext} options and the URI's host as the peer name; the WebSocket
+ * handshake follows.  A connecting dial is one of the {@see getWriteSources() write sources}, so the
+ * server's writability check advances it, and a handshaking one advances when it is readable.  Every
+ * step runs under the {@see setTimeout() Timeout}.  A hostname resolves synchronously, since PHP has
+ * no non-blocking resolver: use IP addresses in Peers and Advertise to keep every dial off the loop.
  *
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
  * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
@@ -71,11 +82,28 @@ use Prado\Util\Clock\TApplicationClockAwareTrait;
  * to it is dropped, which frees its URI so it is dialed again when it returns.  Seed peers that are
  * not linked are re-dialed once per TTL.
  *
+ * Presence converges when a node is heard again.  A node that receives traffic from a node it holds no
+ * liveness for (one it never heard, or one it declared down) floods a {@see TWebSocketEnvelope::NODE_SYNC}
+ * naming it, once per tick for all such nodes.  The named node floods its announce and its local
+ * clients' presence again, at most once per {@see ANNOUNCE_INTERVAL}.  So a node behind an
+ * intermediary is re-learned after a transient silence, as a direct peer is from its join state.  A
+ * 1.1.0 node relays the request and does not answer it.
+ *
+ * An accepted peer that has not proven the secret may send messages of at most
+ * {@see UNVERIFIED_MESSAGE_SIZE} bytes, enough for the challenge exchange, so a link held open with a
+ * replayed handshake cannot buffer a full
+ * {@see \Prado\IO\Socket\WebSocket\TWebSocketConnection::getMaxMessageSize() MaxMessageSize}.
+ *
+ * Durations within the process (the heartbeat, scan and re-dial intervals, the dial and challenge
+ * deadlines, and the liveness of each node, from local receipt times) are measured on the
+ * {@see getMonotonicClock() MonotonicClock}, so a wall-clock step neither expires nor extends them.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  */
 class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, IWebSocketEndpoint
 {
 	use TApplicationClockAwareTrait;
+	use TMonotonicClockAwareTrait;
 
 	/** The maximum bytes read from a peer per drain. */
 	public const READ_CHUNK = 65536;
@@ -83,13 +111,27 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	/** The number of envelope ids remembered for duplicate suppression; a busy mesh cycles through many ids within one TTL. */
 	public const SEEN_CAP = 65536;
 
+	/**
+	 * The largest message, in bytes, an accepted peer may send before it proves the secret: room for
+	 * the challenge and its answer.
+	 * @since 1.2.0
+	 */
+	public const UNVERIFIED_MESSAGE_SIZE = 4096;
+
+	/**
+	 * The fewest seconds between two re-announces of this node's presence that {@see TWebSocketEnvelope::NODE_SYNC}
+	 * requests trigger; requests in between are answered by one re-announce.
+	 * @since 1.2.0
+	 */
+	public const ANNOUNCE_INTERVAL = 1.0;
+
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
-	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, heldNonce: string, authDeadline: float, nodeId: string}> The peer links, keyed by link object id; `nodeId` is the peer's node id once it has proven the secret, '' before; `heldNonce` is an accepted peer's challenge, answered once it is verified. */
+	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, heldNonce: string, authDeadline: float, nodeId: string, limit: int}> The peer links, keyed by link object id; `nodeId` is the peer's node id once it has proven the secret, '' before; `heldNonce` is an accepted peer's challenge, answered once it is verified; `limit` is the link's message size limit to restore once it is verified. */
 	private array $_peers = [];
 
-	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id. */
+	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, secure: bool, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id; `state` is 'connecting', 'securing' (the TLS handshake), or 'handshaking' (the WebSocket upgrade). */
 	private array $_pending = [];
 
 	/** @var array<string, array<string, mixed>> The local clients' presence, for snapshotting to new peers. */
@@ -137,20 +179,35 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	/** @var int The maximum peers accepted but not yet verified, or 0 for unlimited; bounds a connection flood from a replayed handshake proof. */
 	private int $_maxPendingPeers = 64;
 
-	/** @var array<string, float> The last {@see \Prado\Util\Clock\IClock::microtime()} an envelope was seen from each node, for liveness. */
+	/** @var array<string, float> The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} an envelope was last received from each node, for liveness. */
 	private array $_nodeSeen = [];
 
 	/** @var int The seconds a node may go unheard before it is declared down and its presence reaped. */
 	private int $_nodeTtl = 30;
 
-	/** @var float The last {@see \Prado\Util\Clock\IClock::microtime()} a heartbeat was flooded. */
-	private float $_lastHeartbeat = 0.0;
+	/** @var ?float The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} a heartbeat was last flooded, or null before the first. */
+	private ?float $_lastHeartbeat = null;
 
-	/** @var float The last {@see \Prado\Util\Clock\IClock::microtime()} the failure detector scanned. */
-	private float $_lastNodeScan = 0.0;
+	/** @var ?float The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} the failure detector last scanned, or null before the first. */
+	private ?float $_lastNodeScan = null;
 
-	/** @var float The last {@see \Prado\Util\Clock\IClock::microtime()} unlinked seed peers were re-dialed. */
-	private float $_lastRedial = 0.0;
+	/** @var ?float The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} unlinked seed peers were last re-dialed, or null before the first. */
+	private ?float $_lastRedial = null;
+
+	/** @var array<string, true> The nodes heard this tick whose presence this node does not hold, to request in one {@see TWebSocketEnvelope::NODE_SYNC}. */
+	private array $_syncRequests = [];
+
+	/** @var bool Whether a peer requested this node's presence since its last re-announce. */
+	private bool $_announcePending = false;
+
+	/** @var ?float The {@see \Prado\Util\Clock\TMonotonicClock::seconds()} of the last requested re-announce, or null before the first. */
+	private ?float $_lastAnnounce = null;
+
+	/** @var array<string, mixed> The `ssl` stream context options for a `tls://` or `ssl://` dial. */
+	private array $_sslContext = [];
+
+	/** @var string The PCRE an announced peer URI must match to be dialed; '' dials any. */
+	private string $_peerPattern = '';
 
 	/** @var string This backplane's incarnation, announced in each node announce; '' until first used. */
 	private string $_incarnation = '';
@@ -205,8 +262,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	private function redialSeeds(): void
 	{
-		$now = $this->getClock()->microtime();
-		if (($now - $this->_lastRedial) < $this->_nodeTtl) {
+		$now = $this->getMonotonicClock()->seconds();
+		if ($this->_lastRedial !== null && ($now - $this->_lastRedial) < $this->_nodeTtl) {
 			return;
 		}
 		$this->_lastRedial = $now;
@@ -235,11 +292,15 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$this->_connectedUris = [];
 		$this->_nodeSeen = [];
 		$this->_incarnations = [];
+		$this->_syncRequests = [];
+		$this->_announcePending = false;
 	}
 
 	/**
 	 * Flushes each peer link's queued output, drains each link, delivering received envelopes and
-	 * re-flooding them, and drops a peer whose link has closed.
+	 * re-flooding them, and drops a peer whose link has closed.  Then it requests the presence of the
+	 * nodes newly heard, answers a request for this node's presence, and runs the heartbeat, failure
+	 * detector, and seed re-dial.
 	 */
 	public function tick(): void
 	{
@@ -248,7 +309,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		}
 		$this->advancePending();
 		foreach ($this->_peers as $id => $peer) {
-			if (!$peer['verified'] && $peer['authDeadline'] > 0.0 && $this->getClock()->microtime() > $peer['authDeadline']) {
+			if (!$peer['verified'] && $this->getMonotonicClock()->seconds() > $peer['authDeadline']) {
 				$this->dropPeer($id, 'the challenge went unanswered');
 				continue;
 			}
@@ -264,9 +325,49 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 				$this->ingest($id, $bytes);
 			}
 		}
+		$this->requestPresence();
+		$this->reannounce();
 		$this->heartbeat();
 		$this->detectFailures();
 		$this->redialSeeds();
+	}
+
+	/**
+	 * Floods one {@see TWebSocketEnvelope::NODE_SYNC} naming the nodes heard this tick whose presence
+	 * this node does not hold.
+	 */
+	private function requestPresence(): void
+	{
+		if ($this->_syncRequests === []) {
+			return;
+		}
+		$nodes = array_map('strval', array_keys($this->_syncRequests));
+		$this->_syncRequests = [];
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::NODE_SYNC, $this->nodeId(), '', null, null, ['nodes' => $nodes]);
+		$this->markSeen($envelope->getId());
+		$this->flood($envelope, null);
+	}
+
+	/**
+	 * Floods this node's announce and its local clients' presence when a peer requested them, at most
+	 * once per {@see ANNOUNCE_INTERVAL}; a request in between waits for the interval to pass.
+	 */
+	private function reannounce(): void
+	{
+		$now = $this->getMonotonicClock()->seconds();
+		if (!$this->_announcePending || ($this->_lastAnnounce !== null && ($now - $this->_lastAnnounce) < self::ANNOUNCE_INTERVAL)) {
+			return;
+		}
+		$this->_announcePending = false;
+		$this->_lastAnnounce = $now;
+		$announce = $this->nodeAnnounce();
+		$this->markSeen($announce->getId());
+		$this->flood($announce, null);
+		foreach ($this->_localPresence as $clientId => $meta) {
+			$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, (string) $clientId, $meta);
+			$this->markSeen($envelope->getId());
+			$this->flood($envelope, null);
+		}
 	}
 
 	/**
@@ -276,8 +377,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	private function heartbeat(): void
 	{
-		$now = $this->getClock()->microtime();
-		if (($now - $this->_lastHeartbeat) < ($this->_nodeTtl / 3)) {
+		$now = $this->getMonotonicClock()->seconds();
+		if ($this->_lastHeartbeat !== null && ($now - $this->_lastHeartbeat) < ($this->_nodeTtl / 3)) {
 			return;
 		}
 		$this->_lastHeartbeat = $now;
@@ -291,12 +392,13 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 * heartbeating is declared down: its clients are dropped from the coordinator's mirror, so a
 	 * crashed peer's clients do not linger as phantom presence, and any direct link to it is dropped,
 	 * so a half-open socket does not hold its URI as "connected" and the node is re-dialed when it
-	 * returns (a re-established link re-sends the join state, so its presence is re-learned).
+	 * returns.  When the node is heard again, directly or through another node, this node requests its
+	 * presence ({@see requestPresence()}), so its clients are re-learned.
 	 */
 	private function detectFailures(): void
 	{
-		$now = $this->getClock()->microtime();
-		if (($now - $this->_lastNodeScan) < $this->_nodeTtl) {
+		$now = $this->getMonotonicClock()->seconds();
+		if ($this->_lastNodeScan !== null && ($now - $this->_lastNodeScan) < $this->_nodeTtl) {
 			return;
 		}
 		$this->_lastNodeScan = $now;
@@ -324,7 +426,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Returns the transports of the peer links with output queued.  Implements
+	 * Returns the transports of the peer links with output queued and of the dials still connecting,
+	 * whose connect completes when the socket becomes writable.  Implements
 	 * {@see IWebSocketBufferedBackplane}.
 	 * @return IResource[] The transports to watch for writability.
 	 * @since 1.2.0
@@ -337,13 +440,18 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 				$sources[] = $peer['transport'];
 			}
 		}
+		foreach ($this->_pending as $pending) {
+			if ($pending['state'] === 'connecting') {
+				$sources[] = $pending['transport'];
+			}
+		}
 		return $sources;
 	}
 
 	/**
-	 * Writes a writable peer link's queued output, dropping the peer when the write fails.
-	 * Implements {@see IWebSocketBufferedBackplane}.
-	 * @param IResource $source The writable peer transport.
+	 * Writes a writable peer link's queued output, dropping the peer when the write fails, or advances a
+	 * writable dial past its connect.  Implements {@see IWebSocketBufferedBackplane}.
+	 * @param IResource $source The writable peer or dial transport.
 	 * @since 1.2.0
 	 */
 	public function flushSource(IResource $source): void
@@ -353,6 +461,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 				$this->flushPeer($id);
 				return;
 			}
+		}
+		$id = spl_object_id($source);
+		if (isset($this->_pending[$id]) && $this->_pending[$id]['transport'] === $source) {
+			$this->advanceDial($id);
 		}
 	}
 
@@ -433,7 +545,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	public function addPeer(TWebSocketConnection $link, TSocketStream $transport, string $uri = ''): void
 	{
 		$peerId = spl_object_id($link);
-		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'heldNonce' => '', 'authDeadline' => 0.0, 'nodeId' => ''];
+		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'heldNonce' => '', 'authDeadline' => 0.0, 'nodeId' => '', 'limit' => $link->getMaxMessageSize()];
 		if ($uri !== '') {
 			$this->_connectedUris[$uri] = true;
 			$this->_knownUris[$uri] = true;
@@ -459,7 +571,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$nonce = bin2hex(random_bytes(16));
 		$this->_peers[$peerId]['verified'] = false;
 		$this->_peers[$peerId]['nonce'] = $nonce;
-		$this->_peers[$peerId]['authDeadline'] = $this->getClock()->microtime() + $this->_timeout;
+		$this->_peers[$peerId]['authDeadline'] = $this->getMonotonicClock()->seconds() + $this->_timeout;
+		$limit = $link->getMaxMessageSize();
+		if (!$link->getIsClient() && ($limit === 0 || $limit > self::UNVERIFIED_MESSAGE_SIZE)) {
+			$link->setMaxMessageSize(self::UNVERIFIED_MESSAGE_SIZE);   // an unproven accepted peer sends only the challenge exchange; its limit is restored on verification
+		}
 		$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::AUTH_CHALLENGE, $this->nodeId(), $nonce));
 	}
 
@@ -573,7 +689,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			$this->_peers[$peerId]['nonce'] = '';
 			$this->_peers[$peerId]['authDeadline'] = 0.0;
 			$this->_peers[$peerId]['nodeId'] = $answerer;
-			$this->_nodeSeen[$answerer] = $this->getClock()->microtime();   // answering the challenge is proof of life, before its first heartbeat
+			$this->_peers[$peerId]['link']->setMaxMessageSize($this->_peers[$peerId]['limit']);
+			$this->_nodeSeen[$answerer] = $this->getMonotonicClock()->seconds();   // answering the challenge is proof of life, before its first heartbeat; its join state follows
 			$held = $this->_peers[$peerId]['heldNonce'];
 			if ($held !== '') {
 				$this->_peers[$peerId]['heldNonce'] = '';
@@ -609,10 +726,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Begins dialing a peer without blocking: it opens an asynchronous connection and registers the
-	 * attempt, which {@see tick()} advances through the connect and WebSocket handshake before adding
-	 * the link.  A blocking dial would stall the serve loop, so discovery and reconnection stay async.
-	 * @param string $uri The peer endpoint, e.g. 'tcp://10.0.0.2:8080'.
+	 * Begins dialing a peer without blocking: it opens an asynchronous TCP connection and registers the
+	 * attempt, which advances through the connect, the TLS handshake for a `tls://` or `ssl://` URI,
+	 * and the WebSocket handshake before adding the link.  A blocking dial would stall the serve loop,
+	 * so discovery and reconnection stay async.  A hostname in the URI resolves synchronously.
+	 * @param string $uri The peer endpoint, e.g. 'tcp://10.0.0.2:8080' or 'tls://10.0.0.2:8443'.
+	 * @throws \Prado\Exceptions\TSocketException When the connection cannot be started.
 	 */
 	public function connectPeer(string $uri): void
 	{
@@ -628,15 +747,26 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			}
 		}
 		$this->_knownUris[$uri] = true;
-		$transport = TSocketStream::connect($uri, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT);
+		$secure = !preg_match('#^tcp://#i', $uri);
+		$context = null;
+		$target = $uri;
+		if ($secure) {
+			// stream_socket_client() would run the TLS handshake inside the connect and block; connect over
+			// TCP and drive the handshake from advanceDial() instead.
+			$target = 'tcp://' . substr($uri, (int) strpos($uri, '://') + 3);
+			$host = trim((string) TSocketAddress::parse($uri)->getHost(), '[]');
+			$context = stream_context_create(['ssl' => $this->_sslContext + ['peer_name' => $host]]);
+		}
+		$transport = TSocketStream::connect($target, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT, $context);
 		$transport->setBlocking(false);
 		$this->_pending[spl_object_id($transport)] = [
 			'transport' => $transport,
 			'uri' => $uri,
 			'state' => 'connecting',
+			'secure' => $secure,
 			'key' => '',
 			'buffer' => '',
-			'deadline' => $this->getClock()->microtime() + $this->_timeout,
+			'deadline' => $this->getMonotonicClock()->seconds() + $this->_timeout,
 		];
 	}
 
@@ -751,7 +881,10 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		}
 		$origin = $envelope->getOriginNode();
 		if ($origin !== '' && $origin !== $this->nodeId()) {
-			$this->_nodeSeen[$origin] = $this->getClock()->microtime();   // any traffic (data or heartbeat) proves the origin node is alive, even a duplicate copy
+			if (!isset($this->_nodeSeen[$origin])) {
+				$this->_syncRequests[$origin] = true;   // a node never heard, or declared down, is heard: ask for its presence
+			}
+			$this->_nodeSeen[$origin] = $this->getMonotonicClock()->seconds();   // any traffic (data or heartbeat) proves the origin node is alive, even a duplicate copy
 		}
 		if (isset($this->_seen[$envelope->getId()])) {
 			return;
@@ -764,6 +897,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			return;
 		}
 		$this->markSeen($envelope->getId());
+		if ($type === TWebSocketEnvelope::NODE_SYNC) {
+			$nodes = $envelope->getMeta()['nodes'] ?? [];
+			if (is_array($nodes) && in_array($this->nodeId(), $nodes, true)) {
+				$this->_announcePending = true;   // answered by reannounce(), coalesced with other requests
+			}
+			$this->flood($envelope, $fromPeerId);   // a mesh request: relayed, never routed to the coordinator
+			return;
+		}
 		if ($type === TWebSocketEnvelope::NODE_UP) {
 			$incarnation = $envelope->getMeta()['incarnation'] ?? '';
 			$this->trackIncarnation($origin, is_string($incarnation) ? $incarnation : '');   // before any presence the new incarnation sends
@@ -806,12 +947,18 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	/**
 	 * Learns a peer URI from a gossiped announce and dials it once.  A node dials only the URIs that
 	 * sort after its own {@see getAdvertise() Advertise} (or all, when it advertises nothing), so of
-	 * any two nodes exactly one initiates the link.
+	 * any two nodes exactly one initiates the link.  A URI that does not match the
+	 * {@see getPeerPattern() PeerPattern} is never dialed.
 	 * @param string $uri The advertised peer URI.
 	 */
 	private function learnPeer(string $uri): void
 	{
 		if ($uri === '' || $uri === $this->_advertise || isset($this->_knownUris[$uri]) || isset($this->_connectedUris[$uri])) {
+			return;
+		}
+		if ($this->_peerPattern !== '' && preg_match($this->_peerPattern, $uri) !== 1) {
+			$this->_knownUris[$uri] = true;
+			Prado::log("Mesh does not dial the announced peer {$uri}: it does not match the PeerPattern", TLogger::NOTICE, static::class);
 			return;
 		}
 		$this->_knownUris[$uri] = true;
@@ -941,24 +1088,70 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Advances each in-flight dial: a connected socket sends the handshake, a handshaking one reads
-	 * the response, and a timed-out or failed attempt is dropped.
+	 * Advances each in-flight dial, dropping a timed-out or failed attempt.
 	 */
 	private function advancePending(): void
 	{
-		foreach ($this->_pending as $id => $pending) {
-			$resource = $pending['transport']->getResource();
-			if (!is_resource($resource) || $this->getClock()->microtime() > $pending['deadline']) {
-				$this->failPending($id);
-				continue;
+		foreach (array_keys($this->_pending) as $id) {
+			$this->advanceDial($id);
+		}
+	}
+
+	/**
+	 * Advances one in-flight dial without blocking: a socket that has connected starts its TLS
+	 * handshake (a `tls://` or `ssl://` peer) or sends the WebSocket upgrade, a TLS handshake takes its
+	 * next step, and a handshaking dial reads the response.  An attempt past its deadline, or whose
+	 * socket closed, is dropped.
+	 * @param int $id The pending dial id.
+	 */
+	private function advanceDial(int $id): void
+	{
+		$pending = $this->_pending[$id] ?? null;
+		if ($pending === null) {
+			return;
+		}
+		$resource = $pending['transport']->getResource();
+		if (!is_resource($resource) || $this->getMonotonicClock()->seconds() > $pending['deadline']) {
+			$this->failPending($id);
+			return;
+		}
+		if ($pending['state'] === 'connecting') {
+			if (!$this->ready($resource, true)) {
+				return;
 			}
-			if ($pending['state'] === 'connecting') {
-				if ($this->ready($resource, true)) {
-					$this->sendPeerHandshake($id);
-				}
-			} elseif ($this->ready($resource, false)) {
-				$this->readPeerHandshake($id);
+			if (@stream_socket_get_name($resource, true) === false) {
+				$this->failPending($id);   // the connection attempt did not succeed
+				return;
 			}
+			if (!$pending['secure']) {
+				$this->sendPeerHandshake($id);
+				return;
+			}
+			$this->_pending[$id]['state'] = 'securing';
+		}
+		if ($this->_pending[$id]['state'] === 'securing') {
+			$this->secureDial($id);
+		} elseif ($this->ready($resource, false)) {
+			$this->readPeerHandshake($id);
+		}
+	}
+
+	/**
+	 * Takes the next non-blocking step of a dial's TLS handshake, sending the WebSocket upgrade once it
+	 * completes.  A failed handshake (an untrusted certificate, a peer that is not TLS) drops the dial.
+	 * @param int $id The pending dial id.
+	 */
+	private function secureDial(int $id): void
+	{
+		try {
+			$result = $this->_pending[$id]['transport']->enableCrypto(true, STREAM_CRYPTO_METHOD_TLS_CLIENT);
+		} catch (\Throwable $e) {
+			$result = false;   // PRADO's error handler raises the TLS warning
+		}
+		if ($result === true) {
+			$this->sendPeerHandshake($id);
+		} elseif ($result === false) {
+			$this->failPending($id);
 		}
 	}
 
@@ -977,17 +1170,13 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Sends the WebSocket upgrade request once a dialed socket has connected.
+	 * Sends the WebSocket upgrade request once a dialed socket has connected (and, for a `tls://` or
+	 * `ssl://` peer, completed its TLS handshake).
 	 * @param int $id The pending dial id.
 	 */
 	private function sendPeerHandshake(int $id): void
 	{
 		$transport = $this->_pending[$id]['transport'];
-		$resource = $transport->getResource();
-		if (!is_resource($resource) || @stream_socket_get_name($resource, true) === false) {
-			$this->failPending($id);   // the connection attempt did not succeed
-			return;
-		}
 		$key = TWebSocketHandshake::generateKey();
 		$headers = $this->_secret === '' ? [] : [self::AUTH_HEADER => $this->authToken(self::AUTH_CONTEXT_HANDSHAKE, $key)];
 		try {
@@ -1204,7 +1393,61 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
+	 * Returns the `ssl` stream context options used to dial a `tls://` or `ssl://` peer.
+	 * @return array<string, mixed> The options.
+	 * @since 1.2.0
+	 */
+	public function getSslContext(): array
+	{
+		return $this->_sslContext;
+	}
+
+	/**
+	 * Sets the `ssl` stream context options used to dial a `tls://` or `ssl://` peer, such as `cafile`
+	 * for a private certificate authority.  The peer name defaults to the host in the peer's URI.  PHP's
+	 * defaults verify the peer's certificate against the system store.
+	 * @param array<string, mixed>|string $value The options.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setSslContext($value): static
+	{
+		$this->_sslContext = TPropertyValue::ensureArray($value);
+		return $this;
+	}
+
+	/**
+	 * Returns the pattern an announced peer URI must match to be dialed.
+	 * @return string The PCRE, or '' when any announced URI is dialed.
+	 * @since 1.2.0
+	 */
+	public function getPeerPattern(): string
+	{
+		return $this->_peerPattern;
+	}
+
+	/**
+	 * Sets the PCRE an announced peer URI must match to be dialed, such as `#^tls://10\.0\.#`.  Every
+	 * verified peer can announce a URI that every node then dials, so a pattern keeps a node from dialing
+	 * an address outside the cluster.  The seed {@see setPeers() Peers} are always dialed.
+	 * @param string $value The PCRE, or '' to dial any announced URI.
+	 * @throws TInvalidDataValueException When the pattern is not a valid PCRE.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setPeerPattern($value): static
+	{
+		$value = TPropertyValue::ensureString($value);
+		if ($value !== '' && @preg_match($value, '') === false) {
+			throw new TInvalidDataValueException('websocket_backplane_mesh_peer_pattern_invalid', $value);
+		}
+		$this->_peerPattern = $value;
+		return $this;
+	}
+
+	/**
 	 * Returns the maximum number of peers accepted but not yet verified.
+	 *
 	 * @return int The cap, or 0 for unlimited.
 	 */
 	public function getMaxPendingPeers(): int
