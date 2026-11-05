@@ -1069,9 +1069,8 @@ class TWebSocketServerTest extends TestCase
 	public function testServerInitiatedCloseEndsAtTheCloseDeadlineWithoutPinging()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
-		$server->setClock($clock);
+		$clock = new TTestMonotonicClock(1000);
+		$server->getReactor()->setMonotonicClock($clock);
 		$server->setIdleTimeout(2);
 		$server->setCloseTimeout(5);
 		self::assertSame(5.0, $server->getCloseTimeout());
@@ -1097,13 +1096,13 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(1, $server->getConnectionCount(), 'The session waits for the peer to answer the Close.');
 		self::assertSame(0, $closed);
 
-		$clock->setMicrotime(1003.5);   // idle past the idle timeout: a live session would be pinged now
+		$clock->setSeconds(1003.5);   // idle past the idle timeout: a live session would be pinged now
 		$server->serveOnce(0, 50000);
 		$client->setBlocking(false);
 		self::assertSame('', $client->read(16), 'A closing session is not pinged by the idle reaper.');
 		self::assertSame(1, $server->getConnectionCount());
 
-		$clock->setMicrotime(1005.5);   // past the close deadline: the peer never answered
+		$clock->setSeconds(1005.5);   // past the close deadline: the peer never answered
 		$server->serveOnce(0, 50000);
 		self::assertSame(1, $closed, 'The session ends at the close deadline.');
 		self::assertSame(0, $server->getConnectionCount());
@@ -1486,9 +1485,8 @@ class TWebSocketServerTest extends TestCase
 	public function testSilentConnectionNeitherStallsTheLoopNorBlocksOtherClients()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
-		$server->setClock($clock);
+		$clock = new TTestMonotonicClock(1000);
+		$server->getReactor()->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
 		$opened = 0;
 		$handler = new TWebSocketHandler();
@@ -1511,7 +1509,7 @@ class TWebSocketServerTest extends TestCase
 		}
 		self::assertSame(1, $opened, 'A well-behaved client is served while the silent peer is still pending.');
 
-		$clock->setMicrotime(1006.0);   // past the 5 s handshake deadline
+		$clock->setSeconds(1006.0);   // past the 5 s handshake deadline
 		$server->serveOnce(0, 50000);
 		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is dropped at its deadline; the live session remains.');
 		self::assertSame('', $silent->read(16), 'The dropped peer sees end of stream.');
@@ -1658,31 +1656,28 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
-	public function testADeadlineTimerThatFiresBeforeTheServerClockIsRearmed()
+	public function testAWallClockChangeDoesNotMoveADeadline()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
-		$server->setClock($clock);
+		$wall = new TMockClock();
+		$wall->setMicrotime(1000.0);
+		$server->setClock($wall);
+		$clock = new TTestMonotonicClock();
+		$server->getReactor()->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
-		$reactorClock = new TMockClock();   // the reactor counts delays on its own time base
-		$reactorClock->setMicrotime(0.0);
-		$reactor = new TSocketReactor();
-		$reactor->setClock($reactorClock);
-		$server->setReactor($reactor);
 
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$server->serveOnce(0, 100000);
 		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is pending.');
 
-		$reactorClock->setMicrotime(6.0);   // the timer fires, but the server's clock has not reached the deadline
+		$wall->setMicrotime(1000.0 + 3600);   // the wall clock steps an hour forward
 		$server->serveOnce(0, 10000);
-		self::assertSame(1, $server->getConnectionCount(), 'A deadline the server clock has not reached keeps the session.');
+		self::assertSame(1, $server->getConnectionCount(), 'A forward wall-clock step does not expire the handshake deadline.');
 
-		$clock->setMicrotime(1006.0);
-		$reactorClock->setMicrotime(12.0);   // the re-armed timer fires
+		$wall->setMicrotime(1000.0 - 3600);   // then an hour back, before the session was accepted
+		$clock->advance(6);
 		$server->serveOnce(0, 10000);
-		self::assertSame(0, $server->getConnectionCount(), 'The re-armed deadline drops the silent peer.');
+		self::assertSame(0, $server->getConnectionCount(), 'A backward step does not postpone it: the deadline passes on the reactor\'s monotonic clock.');
 		$silent->close();
 		$server->close();
 	}
@@ -1709,9 +1704,8 @@ class TWebSocketServerTest extends TestCase
 	public function testSwappingReactorsCarriesAPendingHandshakeDeadline()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
-		$server->setClock($clock);
+		$clock = new TTestMonotonicClock(1000);
+		$server->getReactor()->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
 
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
@@ -1719,10 +1713,10 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is pending.');
 
 		$other = new TSocketReactor();
-		$other->setClock($clock);
+		$other->setMonotonicClock($clock);
 		$server->setReactor($other);
 		$server->serveOnce(0, 10000);
-		$clock->setMicrotime(1006.0);
+		$clock->setSeconds(1006.0);
 		$server->serveOnce(0, 10000);
 		self::assertSame(0, $server->getConnectionCount(), 'The deadline is re-armed on the new reactor and drops the silent peer.');
 		$silent->close();
@@ -1896,9 +1890,8 @@ class TWebSocketServerTest extends TestCase
 	public function testIdleSessionIsPingedThenReapedOnAQuietServer()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
-		$server->setClock($clock);
+		$clock = new TTestMonotonicClock(1000);
+		$server->getReactor()->setMonotonicClock($clock);
 		$server->setIdleTimeout(10);
 		$closed = 0;
 		$handler = new TWebSocketHandler();
@@ -1920,13 +1913,13 @@ class TWebSocketServerTest extends TestCase
 			$clients[] = $client;
 		}
 
-		$clock->setMicrotime(1010.5);   // idle past the timeout: the reaper pings
+		$clock->setSeconds(1010.5);   // idle past the timeout: the reaper pings
 		foreach ($clients as $client) {
 			self::assertSame("\x89\x00", $this->pumpUntil($server, $client, fn (string $bytes) => strlen($bytes) >= 2), 'An idle session is pinged.');
 		}
 		self::assertSame(0, $closed);
 
-		$clock->setMicrotime(1021.0);   // the ping went unanswered for another timeout: the sessions are reaped
+		$clock->setSeconds(1021.0);   // the ping went unanswered for another timeout: the sessions are reaped
 		for ($i = 0; $i < 100 && $closed < 2; $i++) {
 			$server->serveOnce(0, 20000);
 		}
