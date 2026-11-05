@@ -1582,7 +1582,9 @@ class TWebSocketServer extends TSocketServer
 	/**
 	 * Runs the HTTP/1.1 upgrade on a parsed request head and registers a single-WebSocket session.
 	 * An invalid upgrade is refused with its HTTP rejection (a 400, or a 426 naming the supported
-	 * version) and the connection closed.
+	 * version) and the connection closed.  An upgrade an {@see IWebSocketEndpoint} claims is handed
+	 * to it with the server's MaxMessageSize and MaxSendBufferBytes, or with the limits an
+	 * {@see IWebSocketEndpointLimits} endpoint declares.
 	 * @param TSocketStream $transport The accepted, non-blocking transport.
 	 * @param array{method: ?string, target: ?string, protocol: string, headers: array<string, string>} $request The parsed request head.
 	 * @param string $initial The bytes that followed the head, fed to the new session as its first frames.
@@ -1612,8 +1614,9 @@ class TWebSocketServer extends TSocketServer
 			}
 			$transport->write(TWebSocketHandshake::buildServerResponse($key));   // an internal endpoint does not negotiate
 			$connection = Prado::createComponent(TWebSocketConnection::class, $transport, false);
-			$connection->setMaxMessageSize($this->_maxMessageSize);
-			$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
+			$limits = $endpoint instanceof IWebSocketEndpointLimits;
+			$connection->setMaxMessageSize(($limits ? $endpoint->getEndpointMaxMessageSize() : null) ?? $this->_maxMessageSize);
+			$connection->setMaxSendBufferBytes(($limits ? $endpoint->getEndpointMaxSendBufferBytes() : null) ?? $this->_maxSendBufferBytes);
 			$endpoint->accept($connection, $transport, $request);
 			return;
 		}
