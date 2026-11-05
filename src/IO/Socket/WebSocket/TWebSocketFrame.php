@@ -96,12 +96,17 @@ class TWebSocketFrame extends TComponent
 		return new self(TWebSocketOpcode::Pong, $data);
 	}
 
+	/** @var int The longest Close reason, in bytes: the 125-byte control payload less the 2-byte code. */
+	public const MAX_CLOSE_REASON_LENGTH = 123;
+
 	/**
 	 * Builds a Close control frame.  A reason requires a code, since the code occupies the first two
-	 * payload bytes; the code must be one {@see TWebSocketCloseCode::isSendable()} permits.
+	 * payload bytes; the code must be one {@see TWebSocketCloseCode::isSendable()} permits.  The reason
+	 * is valid UTF-8 of at most {@see MAX_CLOSE_REASON_LENGTH} bytes (RFC 6455 §5.5.1).
 	 * @param ?int $code A {@see TWebSocketCloseCode} value, or null for an empty Close.
 	 * @param string $reason A UTF-8 reason phrase. Default ''.
-	 * @throws TInvalidDataValueException When a reason is given without a code, or the code is not sendable.
+	 * @throws TInvalidDataValueException When a reason is given without a code, the code is not
+	 *   sendable, or the reason is too long or not valid UTF-8.
 	 * @return self The frame.
 	 */
 	public static function close(?int $code = null, string $reason = ''): self
@@ -114,6 +119,12 @@ class TWebSocketFrame extends TComponent
 		}
 		if (!TWebSocketCloseCode::isSendable($code)) {
 			throw new TInvalidDataValueException('websocket_close_code_not_sendable', $code);
+		}
+		if (strlen($reason) > self::MAX_CLOSE_REASON_LENGTH) {
+			throw new TInvalidDataValueException('websocket_close_reason_too_long', strlen($reason), self::MAX_CLOSE_REASON_LENGTH);
+		}
+		if ($reason !== '' && preg_match('//u', $reason) !== 1) {
+			throw new TInvalidDataValueException('websocket_close_reason_not_utf8');
 		}
 		return new self(TWebSocketOpcode::Close, pack('n', $code) . $reason);
 	}

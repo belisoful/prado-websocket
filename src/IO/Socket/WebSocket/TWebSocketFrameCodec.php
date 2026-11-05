@@ -28,6 +28,12 @@ use Psr\Http\Message\StreamInterface;
  * length is 126 or more, a 64-bit length is 65536 or more).  It returns null on a clean end of
  * stream before a frame begins, and throws on a truncated frame.
  *
+ * {@see decode()} is for a blocking stream that delivers each frame whole: an empty read inside a
+ * frame (a non-blocking stream with no more bytes yet, or a read timeout) counts as truncation, and
+ * the bytes already read are lost.  {@see tryDecode()} decodes from a caller's buffer instead;
+ * {@see TWebSocketConnection} buffers its reads and decodes with it, so a frame that arrives in
+ * pieces is kept until it is complete.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-5.2
  */

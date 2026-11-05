@@ -3,6 +3,8 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
+use Prado\Exceptions\TInvalidDataValueException;
+use Prado\Exceptions\TPhpErrorException;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -13,6 +15,44 @@ use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\TStream;
+use Prado\Prado;
+
+/** A stream whose reads fail the way PRADO's error handler reports an fread() on a reset peer. */
+class ResetOnReadStream extends TStream
+{
+	public function read(int $length): string
+	{
+		throw new TPhpErrorException(E_NOTICE, 'fread(): Read of ' . $length . ' bytes failed with errno=54 Connection reset by peer', __FILE__, __LINE__);
+	}
+}
+
+/**
+ * A server-side socket whose peer answers each Ping written to it: with a Pong for the first
+ * {@see $answers}, then with a Close.
+ */
+class PingAnsweringStream extends TSocketStream
+{
+	/** @var ?TSocketStream The peer end that answers. */
+	public ?TSocketStream $peer = null;
+
+	/** @var int The Pings written. */
+	public int $pings = 0;
+
+	/** @var int The Pings answered with a Pong before the peer closes. */
+	public int $answers = 2;
+
+	public function write(string $string): int
+	{
+		$written = parent::write($string);
+		$frame = TWebSocketFrameCodec::tryDecode($string, false)['frame'] ?? null;
+		if ($frame !== null && $frame->getOpcode() === TWebSocketOpcode::Ping) {
+			$this->pings++;
+			$reply = $this->pings <= $this->answers ? TWebSocketFrame::pong($frame->getPayload()) : TWebSocketFrame::close(TWebSocketCloseCode::Normal);
+			$this->peer->write(TWebSocketFrameCodec::encode($reply, random_bytes(4)));
+		}
+		return $written;
+	}
+}
 
 class TWebSocketConnectionTest extends TestCase
 {
@@ -501,5 +541,267 @@ class TWebSocketConnectionTest extends TestCase
 		$s->seek(strlen($req));
 		self::assertStringContainsString('101 Switching Protocols', $s->getContents());
 		$s->close();
+	}
+
+	/**
+	 * Reads every frame the server end wrote to its peer, without blocking.
+	 * @param TSocketStream $peer The client end.
+	 * @return TWebSocketFrame[] The frames, in order.
+	 */
+	private static function serverFrames(TSocketStream $peer): array
+	{
+		$peer->setBlocking(false);
+		$wire = '';
+		while (($chunk = $peer->read(65536)) !== '') {
+			$wire .= $chunk;
+		}
+		$frames = [];
+		while (($decoded = TWebSocketFrameCodec::tryDecode($wire, false)) !== null) {
+			$frames[] = $decoded['frame'];
+			$wire = substr($wire, $decoded['length']);
+		}
+		return $frames;
+	}
+
+	public function testSendToAResetPeerFailsTheWriteUnderPradosErrorHandler()
+	{
+		[$client, $server, $a, $b] = $this->pair();
+		$a->close();                                       // the peer is gone: a write raises EPIPE
+		set_error_handler([Prado::class, 'phpErrorHandler']);   // PRADO turns the fwrite() notice into a TPhpErrorException
+		try {
+			for ($i = 0; $i < 2; $i++) {
+				try {
+					$server->send(str_repeat('x', 100));
+					self::fail('A write to a reset peer fails.');
+				} catch (TWebSocketException $e) {
+					self::assertSame('websocket_write_failed', $e->getErrorCode(), 'The documented write failure is thrown, not the PHP notice.');
+				}
+				self::assertTrue($server->getIsClosed(), 'The failed write marks the connection closed.');
+				self::assertSame(0, $server->getPendingOutboundLength(), 'The queue does not grow across failed sends.');
+			}
+		} finally {
+			restore_error_handler();
+		}
+		$b->close();
+	}
+
+	public function testReceiveFromAResetPeerFailsTheReadUnderPradosErrorHandler()
+	{
+		$server = new TWebSocketConnection(new ResetOnReadStream(fopen('php://memory', 'r+')), false);
+		try {
+			$server->receive();
+			self::fail('A read from a reset peer fails.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_read_failed', $e->getErrorCode());
+		}
+		self::assertTrue($server->getIsClosed(), 'The failed read marks the connection closed.');
+		self::assertFalse($server->getReadTimedOut(), 'A failed read is not a timeout.');
+	}
+
+	public function testAPartialFrameOnANonBlockingStreamIsBufferedUntilItCompletes()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->setBlocking(false);
+		$server = new TWebSocketConnection($b, false);
+		$wire = TWebSocketFrameCodec::encode(TWebSocketFrame::text('hello world'), "\x01\x02\x03\x04");   // 17 bytes
+		$a->write(substr($wire, 0, 3));
+		self::assertNull($server->receive(), 'A partial frame is not a message yet.');
+		self::assertFalse($server->getIsClosed(), 'A partial frame does not close the connection.');
+		self::assertFalse($server->getReadTimedOut(), 'An empty non-blocking read is not a timeout.');
+		$a->write(substr($wire, 3, 7));
+		self::assertNull($server->receive(), 'Still partial.');
+		$a->write(substr($wire, 10) . TWebSocketFrameCodec::encode(TWebSocketFrame::text('next'), "\x05\x06\x07\x08"));
+		self::assertSame('hello world', $server->receive(), 'The buffered bytes complete the frame.');
+		self::assertSame('next', $server->receive(), 'The frame behind it is read intact.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testABlockingReadTimeoutKeepsTheConnectionAndItsPartialFrame()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->setTimeout(0, 20000);
+		$server = new TWebSocketConnection($b, false);
+		self::assertNull($server->receive(), 'A read timeout yields no message.');
+		self::assertTrue($server->getReadTimedOut(), 'The null reports a read timeout.');
+		self::assertFalse($server->getIsClosed(), 'A read timeout does not close the connection.');
+
+		$wire = TWebSocketFrameCodec::encode(TWebSocketFrame::text('later'), "\x01\x02\x03\x04");
+		$a->write(substr($wire, 0, 4));
+		self::assertNull($server->receive(), 'A frame cut by the timeout stays buffered.');
+		self::assertTrue($server->getReadTimedOut());
+		$a->write(substr($wire, 4));
+		self::assertSame('later', $server->receive(), 'The connection keeps serving once the rest arrives.');
+		self::assertFalse($server->getReadTimedOut());
+		$a->close();
+		$b->close();
+	}
+
+	public function testTheStreamEndingInsideAFrameFailsAndCloses()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$a->write(substr(TWebSocketFrameCodec::encode(TWebSocketFrame::text('hello'), "\x01\x02\x03\x04"), 0, 5));
+		$a->close();
+		try {
+			$server->receive();
+			self::fail('A frame cut short by the end of the stream fails.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_frame_incomplete', $e->getErrorCode());
+		}
+		self::assertTrue($server->getIsClosed());
+		$b->close();
+	}
+
+	public function testReceiveRefusesAnOversizedFrameFromItsHeader()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->setBlocking(false);
+		$server = new TWebSocketConnection($b, false);
+		$server->setMaxMessageSize(100);
+		$a->write("\x82\xfe\x01\x00\x01\x02\x03\x04");   // a masked Binary frame declaring 256 bytes; no payload sent
+		try {
+			$server->receive();
+			self::fail('A frame over the limit is refused before its payload is read.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_message_too_big', $e->getErrorCode());
+		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testReceiveAfterFeedContinuesFromTheSameBuffer()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->setBlocking(false);
+		$server = new TWebSocketConnection($b, false);
+		$wire = TWebSocketFrameCodec::encode(TWebSocketFrame::text(str_repeat('a', 200)), "\x01\x02\x03\x04");
+		self::assertSame([], $server->feedMessages(substr($wire, 0, 10)));
+		self::assertSame([], $server->feedMessages(substr($wire, 10, 10)), 'The frame of known length is collected in pieces.');
+		$a->write(substr($wire, 20));
+		self::assertSame(str_repeat('a', 200), $server->receive(), 'receive() joins the collected pieces with the bytes it reads.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testFeedMessagesHandsTheDecodedMessagesToTheFailure()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$key = "\x01\x02\x03\x04";
+		$wire = TWebSocketFrameCodec::encode(TWebSocketFrame::text('one'), $key)
+			. TWebSocketFrameCodec::encode(TWebSocketFrame::binary('two'), $key)
+			. TWebSocketFrameCodec::encode(TWebSocketFrame::continuation('orphan'), $key);   // a continuation with no message
+		try {
+			$server->feedMessages($wire);
+			self::fail('The malformed frame fails the read.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_continuation_unexpected', $e->getErrorCode());
+			$messages = $e->getDecodedMessages();
+			self::assertCount(2, $messages, 'The messages before the malformed frame travel with the failure.');
+			self::assertSame('one', $messages[0]->getPayload());
+			self::assertTrue($messages[1]->getIsBinary());
+			self::assertSame('two', $messages[1]->getPayload());
+		}
+
+		$fresh = new TWebSocketConnection($b, false);
+		try {
+			$fresh->feedMessages(TWebSocketFrameCodec::encode(TWebSocketFrame::continuation('orphan'), $key));
+			self::fail('A malformed first frame fails.');
+		} catch (TWebSocketException $e) {
+			self::assertSame([], $e->getDecodedMessages(), 'With nothing decoded first the failure carries no messages.');
+		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testCloseRefusesABadCodeOrReasonWithoutClosing()
+	{
+		[$client, $server, $a, $b] = $this->pair();
+		foreach ([[TWebSocketCloseCode::Normal, str_repeat('r', 124)], [TWebSocketCloseCode::NoStatusReceived, ''], [TWebSocketCloseCode::Normal, "\xff"]] as [$code, $reason]) {
+			try {
+				$server->close($code, $reason);
+				self::fail('A Close that cannot be built is refused.');
+			} catch (TInvalidDataValueException $e) {
+				self::assertFalse($server->getIsClosing(), 'A refused Close leaves the connection open.');
+				self::assertFalse($server->getIsCloseInitiator());
+			}
+		}
+		self::assertSame(0, $server->getPendingOutboundLength(), 'Nothing was queued.');
+		$server->close(TWebSocketCloseCode::Normal, str_repeat('r', 123));
+		self::assertTrue($server->getIsClosing(), 'A valid Close still closes.');
+		self::assertSame(TWebSocketCloseCode::Normal, $client->receiveFrame()->getCloseCode());
+		$a->close();
+		$b->close();
+	}
+
+	public function testDrainCloseMeasuresItsTimeoutOnTheMonotonicClock()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$a->setBlocking(false);
+		$client = new TWebSocketConnection($a, true);
+		$clock = new class () extends TTestMonotonicClock {
+			public int $readings = 0;
+
+			protected function hrtime(): int
+			{
+				$this->readings++;
+				$this->advance(0.1);   // every reading moves 100 ms
+				return parent::hrtime();
+			}
+		};
+		$client->setMonotonicClock($clock);
+		self::assertFalse($client->drainClose(1000, '', 0.25), 'A silent peer does not complete the close handshake.');
+		self::assertGreaterThan(0, $clock->readings, 'The drain deadline is read from the monotonic clock.');
+		self::assertLessThanOrEqual(4, $clock->readings, 'The deadline passes once the monotonic readings cover the timeout.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testHandleConnectionPingsAnIdlePeerAndClosesAnUnresponsiveOne()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->setTimeout(0, 20000);                         // the idle interval: each blocking read waits 20 ms
+		$server = new TWebSocketConnection($b, false);
+		$handler = new TWebSocketHandler();
+		$errors = [];
+		$handler->attachEventHandler('onError', function ($sender, $error) use (&$errors) {
+			$errors[] = $error;
+		});
+		$handler->handleConnection($server);
+		self::assertSame([], $errors, 'An idle peer is not an error.');
+
+		$frames = self::serverFrames($a);
+		self::assertCount(2, $frames);
+		self::assertSame(TWebSocketOpcode::Ping, $frames[0]->getOpcode(), 'The first idle interval pings the peer.');
+		self::assertSame(TWebSocketOpcode::Close, $frames[1]->getOpcode());
+		self::assertSame(TWebSocketCloseCode::GoingAway, $frames[1]->getCloseCode(), 'A second idle interval with no answer closes with 1001.');
+		$a->close();
+		$b->close();
+	}
+
+	public function testHandleConnectionKeepsAPeerThatAnswersEachPing()
+	{
+		[$serverEnd, $clientEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
+		$transport = new PingAnsweringStream();
+		$transport->attachResource($serverEnd, true);
+		$transport->setTimeout(0, 20000);
+		$peer = new TSocketStream();
+		$peer->attachResource($clientEnd, true);
+		$transport->peer = $peer;
+		$server = new TWebSocketConnection($transport, false);
+		$handler = new TWebSocketHandler();
+		$errors = [];
+		$handler->attachEventHandler('onError', function ($sender, $error) use (&$errors) {
+			$errors[] = $error;
+		});
+		$handler->handleConnection($server);
+		self::assertSame([], $errors);
+		self::assertSame(3, $transport->pings, 'Each answered Ping keeps the connection for another idle interval.');
+		self::assertTrue($server->getIsClosed(), 'The peer\'s Close ends the loop.');
+		$frames = self::serverFrames($peer);
+		self::assertSame(TWebSocketCloseCode::Normal, end($frames)->getCloseCode(), 'The server echoes the peer\'s Close rather than dropping it as unresponsive.');
+		$transport->close();
+		$peer->close();
 	}
 }
