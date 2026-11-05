@@ -26,7 +26,10 @@ use Prado\TComponent;
  * the trailer before inflating (§7.2.2).  An empty message compresses to a single empty block
  * (`0x00`).  A message whose DEFLATE data stops short of a block boundary is refused as invalid
  * payload (close code 1007), never delivered in part; a message that ends its DEFLATE stream with a
- * `BFINAL` block (§7.2.3.4) is accepted and the next message begins a new stream.
+ * `BFINAL` block (§7.2.3.4) is accepted and the next message begins a new stream.  A `BFINAL` block
+ * must still be followed by the empty block header (`0x00`) that remains once the sender strips the
+ * sync-flush trailer, as §7.2.1 produces and the §7.2.3.4 example shows; a message that ends at the
+ * `BFINAL` block itself is refused with 1007, although zlib-based peers accept it.
  *
  * The context is reused across messages by default, so a message's DEFLATE dictionary carries the
  * history of the ones before it (context takeover).  {@see getDeflateNoContextTakeover()} and

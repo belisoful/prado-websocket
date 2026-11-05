@@ -336,6 +336,21 @@ class TPermessageDeflateTest extends TestCase
 		self::assertSame(10, $extension->getDeflateWindowBits());
 	}
 
+	public function testServerEchoesAnOfferedServerMaxWindowBitsOf15()
+	{
+		// RFC 7692 §7.1.2.1: a server accepts an offered server_max_window_bits by including it, the maximum included.
+		[$extension, $response] = (new TPermessageDeflateNegotiator())->accept([['server_max_window_bits' => '15']]);
+		self::assertSame('15', $response['server_max_window_bits'], 'The offered parameter is echoed even at the maximum window.');
+		self::assertSame(15, $extension->getDeflateWindowBits());
+
+		[, $response] = (new TPermessageDeflateNegotiator(serverMaxWindowBits: 15))->accept([[]]);
+		self::assertArrayNotHasKey('server_max_window_bits', $response, 'Unoffered, the maximum window needs no parameter.');
+
+		$header = TWebSocketHandshake::negotiateExtensions(['sec-websocket-extensions' => 'permessage-deflate; server_max_window_bits=15'], [new TPermessageDeflateNegotiator()])['header'];
+		self::assertSame('permessage-deflate; server_max_window_bits=15', $header);
+		self::assertNotNull((new TPermessageDeflateNegotiator(serverMaxWindowBits: 15))->fromResponse(['server_max_window_bits' => '15']), 'A strict client accepts the echoed response.');
+	}
+
 	public function testServerSkipsAnOfferDemandingAnUnsupportedWindowAndTakesTheFallback()
 	{
 		$offers = [['server_max_window_bits' => '8'], []];   // 8 is below the raw-DEFLATE minimum
@@ -497,6 +512,8 @@ class TPermessageDeflateTest extends TestCase
 			'unknown parameter' => [new TPermessageDeflateNegotiator(), ['x_unknown' => '1']],
 			'flag with a value' => [new TPermessageDeflateNegotiator(), ['server_no_context_takeover' => '1']],
 			'offered server_no_context_takeover not echoed' => [new TPermessageDeflateNegotiator(serverNoContextTakeover: true), []],
+			'offered server_max_window_bits not echoed' => [new TPermessageDeflateNegotiator(serverMaxWindowBits: 10), []],
+			'offered server_max_window_bits=15 not echoed' => [new TPermessageDeflateNegotiator(serverMaxWindowBits: 15), []],
 		];
 	}
 
