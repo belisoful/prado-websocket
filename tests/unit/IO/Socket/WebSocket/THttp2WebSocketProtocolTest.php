@@ -475,4 +475,99 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$protocol->getSession()->close();
 		$client->close();
 	}
+
+	public function testOutputFromInputHeldDuringASendIsReturnedByThatSend()
+	{
+		$handler = new TWebSocketHandler();
+		$handler->attachEventHandler('onMessage', function ($connection, $message) {
+			$connection->send("echo:$message");
+		});
+		[$protocol, $client, $stream] = $this->establish($handler);
+		$clientWs = new TWebSocketConnection($stream, true);
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		$held = false;
+		$protocol->getSession()->attachEventHandler('onFrameSent', function () use (&$held, $protocol, $client, $stream) {
+			if ($held) {
+				return;
+			}
+			$held = true;
+			$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('held'), random_bytes(4)));
+			$protocol->receive($client->send());   // held: the session is sending
+		});
+		$protocol->getSession()->ping();
+		$client->receive($protocol->send());   // one send: the PING, then the reply to the held message
+
+		self::assertSame(['echo:held'], $clientWs->feed($stream->getContents()), 'The reply to the held input leaves with the send that fed it.');
+		$protocol->getSession()->close();
+		$client->close();
+	}
+
+	public function testInputHeldAcrossAFailedReceiveIsFedBeforeTheNextInput()
+	{
+		$handler = new TWebSocketHandler();
+		$received = [];
+		$handler->attachEventHandler('onMessage', function ($connection, $message) use (&$received) {
+			$received[] = (string) $message;
+		});
+		[$protocol, $client, $stream] = $this->establish($handler);
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		$second = null;
+		$fail = true;
+		$protocol->getSession()->attachEventHandler('onData', function () use (&$fail, &$second, $protocol) {
+			if ($fail) {
+				$fail = false;
+				$protocol->receive($second);   // held: the session is receiving
+				throw new \RuntimeException('session observer failed');
+			}
+		});
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('first'), random_bytes(4)));
+		$first = $client->send();
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('second'), random_bytes(4)));
+		$second = $client->send();
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('third'), random_bytes(4)));
+		$third = $client->send();
+		try {
+			$protocol->receive($first);
+			self::fail('The observer exception leaves receive().');
+		} catch (\RuntimeException $e) {
+			self::assertSame('session observer failed', $e->getMessage());
+		}
+		$protocol->receive($third);
+
+		self::assertSame(['first', 'second', 'third'], $received, 'Bytes held when a receive failed are fed before the next call\'s own.');
+		$protocol->getSession()->close();
+		$client->close();
+	}
+
+	public function testHeldInputPastTheLimitThrows()
+	{
+		$handler = new TWebSocketHandler();
+		[$protocol, $client] = $this->establish($handler);
+		$protocol->receive($client->send());
+		$protocol->send();
+
+		$error = null;
+		$protocol->getSession()->attachEventHandler('onFrameSent', function () use (&$error, $protocol) {
+			if ($error !== null) {
+				return;
+			}
+			$protocol->receive(str_repeat("\0", THttp2WebSocketProtocol::MAX_DEFERRED_BYTES));   // held, at the limit
+			try {
+				$protocol->receive("\0");
+			} catch (TWebSocketException $e) {
+				$error = $e;
+			}
+		});
+		$protocol->getSession()->ping();
+		$protocol->send();
+
+		self::assertInstanceOf(TWebSocketException::class, $error, 'A peer flooding a busy session past the limit is refused.');
+		self::assertSame('websocket_http2_input_overflow', $error->getErrorCode());
+		$protocol->getSession()->close();
+		$client->close();
+	}
 }

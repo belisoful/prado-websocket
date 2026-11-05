@@ -4,6 +4,7 @@ websocket_control_frame_fragmented		= WebSocket control frame (opcode {0}) must 
 websocket_frame_length_invalid			= WebSocket frame length exceeds the supported range.
 websocket_frame_incomplete				= WebSocket frame truncated: expected {0, plural, one{# byte} other{# bytes}}, read {1}.
 websocket_send_buffer_overflow			= WebSocket send buffer overflowed {0} bytes: the peer is not reading fast enough.
+websocket_http2_input_overflow			= WebSocket HTTP/2 session received more than {0, number, integer} bytes while a handler was busy.
 websocket_write_failed					= WebSocket write failed: the connection is broken.
 websocket_frame_not_masked				= WebSocket server received an unmasked frame from the client.
 websocket_frame_masked					= WebSocket client received a masked frame from the server.

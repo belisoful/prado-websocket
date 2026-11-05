@@ -62,6 +62,14 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var int The maximum bytes read from the transport per pump. */
 	public const READ_CHUNK = 65536;
 
+	/**
+	 * The most bytes {@see receive()} holds while the session is busy.  Flow control bounds the DATA
+	 * a peer sends meanwhile to the session's receive window (64 KiB), but not its control frames, so
+	 * a peer that floods PING or SETTINGS frames past this limit ends the session.
+	 * @since 1.2.0
+	 */
+	public const MAX_DEFERRED_BYTES = 1048576;
+
 	/** @var IWebSocketHandler The handler each WebSocket stream is run through. */
 	private IWebSocketHandler $_handler;
 
@@ -100,6 +108,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 
 	/** @var string The bytes received while the session was busy, fed once it is not. */
 	private string $_deferred = '';
+
+	/** @var string The output a {@see send()} produced before a later step of it threw, returned first by the next send(). */
+	private string $_unsent = '';
 
 	/** @var ?callable The capacity check a WebSocket stream must pass to open, or null for none. */
 	private $_admission;
@@ -353,15 +364,29 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	 * re-entry (`http2_session_busy`).  A handler that waits on the event loop outside a fiber of its
 	 * own ticks the loop from inside that call, and the loop may read this transport again.  Bytes
 	 * that arrive while the session is busy are held and fed, in order, once the outer
-	 * {@see receive()} or {@see send()} returns.  HTTP/2 flow control bounds the DATA a peer sends
-	 * meanwhile, since the session acknowledges none of the held bytes.
+	 * {@see receive()} or {@see send()} returns; bytes still held when a call starts are fed before
+	 * its own.  HTTP/2 flow control bounds the DATA a peer sends meanwhile, since the session
+	 * acknowledges none of the held bytes, but not its control frames: past
+	 * {@see MAX_DEFERRED_BYTES} the held input is discarded and the call throws, and the server ends
+	 * the session.
 	 * @param string $bytes The bytes read from the transport.
+	 * @throws TWebSocketException When the bytes held while the session is busy would exceed
+	 *   {@see MAX_DEFERRED_BYTES} (`websocket_http2_input_overflow`).
 	 */
 	public function receive(string $bytes): void
 	{
 		if ($this->_receiving || $this->_sending) {
+			if (strlen($this->_deferred) + strlen($bytes) > self::MAX_DEFERRED_BYTES) {
+				$this->_deferred = '';
+				throw (new TWebSocketException('websocket_http2_input_overflow', self::MAX_DEFERRED_BYTES))
+					->setCloseCode(TWebSocketCloseCode::PolicyViolation);
+			}
 			$this->_deferred .= $bytes;
 			return;
+		}
+		if ($this->_deferred !== '') {
+			$bytes = $this->_deferred . $bytes;   // bytes held across an earlier call that threw come first
+			$this->_deferred = '';
 		}
 		$this->_receiving = true;
 		try {
@@ -373,9 +398,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.  A call made
-	 * while a {@see send()} is in progress (a handler waiting on the event loop from inside it)
-	 * returns `''`; the outer call or the next one carries the output.
+	 * Drains and returns the bytes the HTTP/2 session has to send to the transport.  Input held while
+	 * the session was busy is fed once the drain returns, and the output it produces (a handler's
+	 * reply) is drained too, so it is returned by this call.  A call made while a {@see send()} is in
+	 * progress (a handler waiting on the event loop from inside it) returns `''`; the outer call or
+	 * the next one carries the output.  When a step throws, the output already drained is kept and
+	 * returned first by the next call.
 	 * @return string The bytes to write to the transport.
 	 */
 	public function send(): string
@@ -383,21 +411,30 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		if ($this->_sending) {
 			return '';
 		}
-		$this->_sending = true;
+		$output = $this->_unsent;
+		$this->_unsent = '';
 		try {
-			$output = $this->_session->send();
-		} finally {
-			$this->_sending = false;
-		}
-		if (!$this->_receiving && $this->_deferred !== '') {
-			$this->_receiving = true;
-			try {
-				$this->feedDeferred();
-			} finally {
-				$this->_receiving = false;
+			while (true) {
+				$this->_sending = true;
+				try {
+					$output .= $this->_session->send();
+				} finally {
+					$this->_sending = false;
+				}
+				if ($this->_receiving || $this->_deferred === '') {
+					return $output;
+				}
+				$this->_receiving = true;
+				try {
+					$this->feedDeferred();
+				} finally {
+					$this->_receiving = false;
+				}
 			}
+		} catch (\Throwable $e) {
+			$this->_unsent = $output;
+			throw $e;
 		}
-		return $output;
 	}
 
 	/**
@@ -635,6 +672,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			}
 		} finally {
 			$this->_deferred = '';
+			$this->_unsent = '';
 			$this->_session->close();
 		}
 	}
