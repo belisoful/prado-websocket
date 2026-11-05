@@ -26,12 +26,17 @@
  *
  * The client reconnects with exponential backoff and full jitter, re-subscribes its channels,
  * holds requests made while offline (up to maxQueue), and pings at the server's heartbeat
- * interval, dropping a connection silent for twice that.  It stops reconnecting after close()
- * or a close code in fatalCloseCodes.  A refused handshake (a rejected origin) is reported by the
- * browser as 1006 and retried with backoff.  A server that does not select prado.pubsub.v1 is
- * refused for good with the `subprotocol` code where the browser opens the socket (Firefox,
- * WebKit); Chromium fails that handshake itself, as 1006.  A publish, send or call in flight
- * when the connection drops rejects with `disconnected` and is not resent.
+ * interval, dropping a connection silent for twice that.  The client is open once the server's
+ * welcome arrives: the open listeners run first, then the channels are re-subscribed and the held
+ * requests sent, so a request an open listener makes (an authentication or join call) precedes
+ * them.  It stops reconnecting after close() or a close code in fatalCloseCodes.  A refused
+ * handshake (a rejected origin) is reported by the browser as 1006 and retried with backoff.  A
+ * server that does not select prado.pubsub.v1 is refused for good with the `subprotocol` code
+ * where the browser opens the socket (Firefox, WebKit); Chromium fails that handshake itself, as
+ * 1006.  A publish, send or call in flight when the connection drops rejects with `disconnected`
+ * and is not resent, so a server closing for one message (1007 invalid data, 1009 too big) costs
+ * that request and a reconnect.  A subscribe that times out is unsubscribed, in case the server
+ * applied it late, and one for a channel left meanwhile is not resent.
  */
 (function (root, factory) {
 	if (typeof module === 'object' && module.exports) {
@@ -79,7 +84,7 @@
 				maxDelay: 30000,
 				requestTimeout: 10000,
 				maxQueue: 256,
-				fatalCloseCodes: [1002, 1003, 1007, 1008, 1009, 1010, 4401, 4403],
+				fatalCloseCodes: [1002, 1003, 1008, 1010, 4401, 4403],
 				WebSocket: typeof WebSocket === 'function' ? WebSocket : null,
 			}, options);
 			/** @type {?string} The cluster client id from the latest welcome. */
@@ -125,7 +130,7 @@
 			if (!entry) {
 				entry = { handlers: new Set(), acked: false, ready: null };
 				this._channels.set(channel, entry);
-				entry.ready = this._request({ type: 'subscribe', channel }, true).then(() => {
+				entry.ready = this._request({ type: 'subscribe', channel }, true, entry).then(() => {
 					entry.acked = true;
 				});
 				entry.ready.catch(() => {
@@ -211,19 +216,7 @@
 					ws.close(1000);
 					return;
 				}
-				this.state = 'open';
-				this._lastSeen = Date.now();
-				for (const [channel, entry] of this._channels) {
-					if (entry.acked) {
-						this._request({ type: 'subscribe', channel }, true).catch((e) => {
-							this._channels.delete(channel);
-							this._emit('error', e);
-						});
-					}
-				}
-				const queued = this._queue;
-				this._queue = [];
-				queued.forEach((frame) => this._transmit(frame));
+				this._lastSeen = Date.now();   // the client opens when the welcome arrives
 			};
 			ws.onmessage = (ev) => {
 				if (typeof ev.data === 'string') {
@@ -252,7 +245,7 @@
 				}
 				clearTimeout(p.timer);
 				p.sent = false;
-				if (p.retry && willReconnect) {
+				if (p.retry && willReconnect && this._wanted(p)) {
 					requeue.push(p.frame);
 				} else {
 					this._pending.delete(id);
@@ -311,7 +304,14 @@
 
 		// ---- Frames ---------------------------------------------------------
 
-		_request(frame, retry = false) {
+		/**
+		 * Sends a request, or holds it while offline, and settles with its reply.
+		 * @param {object} frame The request frame, without an id.
+		 * @param {boolean} [retry=false] Whether to resend it after a reconnect (a subscribe).
+		 * @param {?object} [entry=null] The channel entry a subscribe is for.
+		 * @returns {Promise<any>}
+		 */
+		_request(frame, retry = false, entry = null) {
 			return new Promise((resolve, reject) => {
 				if (this.state === 'closed') {
 					reject(new PubSubError('closed', 'the client is closed'));
@@ -321,8 +321,9 @@
 					reject(new PubSubError('queue_full', 'the offline queue is full'));
 					return;
 				}
-				frame.id = String(this._nextId++);
-				this._pending.set(frame.id, { frame, resolve, reject, retry, sent: false, timer: null });
+				// The id leads the frame, so a server that cannot decode the frame can still find it.
+				frame = Object.assign({ id: String(this._nextId++) }, frame);
+				this._pending.set(frame.id, { frame, resolve, reject, retry, entry, sent: false, timer: null });
 				if (this.state === 'open') {
 					this._transmit(frame);
 				} else {
@@ -353,6 +354,9 @@
 				p.sent = true;
 				p.timer = setTimeout(() => {
 					this._pending.delete(frame.id);
+					if (p.entry) {
+						this._abandon(frame.channel, p.entry);
+					}
 					p.reject(new PubSubError('timeout', 'no reply within ' + this.options.requestTimeout + ' ms'));
 				}, this.options.requestTimeout);
 			}
@@ -364,6 +368,37 @@
 				p.reject(error);
 			} else {
 				this._emit('error', error);
+			}
+		}
+
+		/** Whether a subscribe request is still for its channel's current entry. */
+		_wanted(p) {
+			return !p.entry || this._channels.get(p.frame.channel) === p.entry;
+		}
+
+		/**
+		 * Unsubscribes a channel whose subscribe timed out, since the server may apply the subscribe
+		 * after the timeout; the rejection then forgets the channel.  A channel subscribed again
+		 * meanwhile, under a new entry, is kept.
+		 */
+		_abandon(channel, entry) {
+			const current = this._channels.get(channel);
+			if ((!current || current === entry) && this.state === 'open') {
+				this._transmit({ type: 'unsubscribe', channel });
+			}
+		}
+
+		/** Re-subscribes the acked channels after a reconnect. */
+		_resubscribe() {
+			for (const [channel, entry] of this._channels) {
+				if (entry.acked) {
+					this._request({ type: 'subscribe', channel }, true, entry).catch((e) => {
+						if (this._channels.get(channel) === entry) {
+							this._channels.delete(channel);
+							this._emit('error', e);
+						}
+					});
+				}
 			}
 		}
 
@@ -390,13 +425,22 @@
 				return;
 			}
 			switch (msg.type) {
-				case 'welcome':
+				case 'welcome': {
+					this.state = 'open';
 					this.clientId = msg.clientId;
 					this._maxFrame = Number(msg.maxFrame) || 0;
 					this._attempt = 0;
 					this._startHeartbeat(msg.heartbeat);
 					this._emit('open', { clientId: msg.clientId });
+					if (this.state !== 'open') {
+						break;   // a listener closed the client
+					}
+					this._resubscribe();
+					const queued = this._queue;
+					this._queue = [];
+					queued.forEach((frame) => this._transmit(frame));
 					break;
+				}
 				case 'ack':
 				case 'error': {
 					const p = msg.id !== undefined ? this._pending.get(String(msg.id)) : null;

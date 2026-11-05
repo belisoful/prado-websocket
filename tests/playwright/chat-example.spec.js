@@ -114,6 +114,82 @@ test('a bad nickname returns to the form with the server message', async ({ page
 	await expect(page.locator('#join')).toBeVisible();
 });
 
+/** Records each WebSocket the page opens in window.__sockets. */
+async function recordSockets(page) {
+	await page.addInitScript(() => {
+		const Native = window.WebSocket;
+		window.__sockets = [];
+		window.WebSocket = class extends Native {
+			constructor(...args) {
+				super(...args);
+				window.__sockets.push(this);
+			}
+		};
+	});
+}
+
+test('a nickname in use is refused', async ({ browser }) => {
+	const room = 'nick' + Date.now();
+	const ada = await newPage(browser);
+	const impostor = await newPage(browser);
+	await joinAs(ada, 'ada', room);
+	await impostor.goto(PAGE);
+	await impostor.fill('#nick', 'ADA');
+	await impostor.fill('#room', 'elsewhere' + Date.now());
+	await impostor.click('#join button[type=submit]');
+	await expect(impostor.locator('#join-error')).toContainText('The nickname ADA is taken.');
+	await expect(impostor.locator('#join')).toBeVisible();
+});
+
+test('a room cannot be read without joining it', async ({ browser }) => {
+	const room = 'lurk' + Date.now();
+	const ada = await newPage(browser);
+	await joinAs(ada, 'ada', room);
+	const lurker = await newPage(browser);
+	await lurker.goto(PAGE);
+	const code = await lurker.evaluate(async ({ url, channel }) => {
+		const ps = new window.Prado.WebSocket.PubSub(url);
+		const result = await ps.subscribe(channel, () => {}).then(() => 'subscribed', (e) => e.code);
+		ps.close();
+		return result;
+	}, { url: `ws://127.0.0.1:${WS_PORT}/`, channel: 'room:' + room });
+	expect(code).toBe('forbidden');
+});
+
+test('rejoins the room after the connection drops', async ({ browser }) => {
+	const room = 'drop' + Date.now();
+	const ada = await newPage(browser);
+	const bob = await newPage(browser);
+	await recordSockets(ada);
+	await joinAs(ada, 'ada', room);
+	await joinAs(bob, 'bob', room);
+	await expect(ada.locator('#members')).toContainText('bob');
+
+	await ada.evaluate(() => window.__sockets[window.__sockets.length - 1].close());
+	await expect(ada.locator('#log')).toContainText('Reconnected.');
+	await expect(ada.locator('#status')).toHaveText('online');
+	await expect(ada.locator('#members')).toContainText('ada (you)');
+	await expect(ada.locator('#members')).toContainText('bob');
+
+	await bob.fill('#text', 'still there?');
+	await bob.press('#text', 'Enter');
+	await expect(ada.locator('#log .msg').last()).toContainText('still there?');
+	await ada.fill('#text', 'yes');
+	await ada.press('#text', 'Enter');
+	await expect(bob.locator('#log .msg').last()).toContainText('yes');
+	await expect(bob.locator('#members li')).toHaveCount(2);
+});
+
+test('?ws= is honored only for this page\'s host', async ({ page }) => {
+	await recordSockets(page);
+	await page.goto(`http://127.0.0.1:${PAGE_PORT}/?ws=${encodeURIComponent(`ws://localhost:${WS_PORT}/`)}`);
+	await page.fill('#nick', 'ada');
+	await page.fill('#room', 'elsewhere');
+	await page.click('#join button[type=submit]');
+	await page.waitForFunction(() => window.__sockets.length > 0);
+	expect(await page.evaluate(() => window.__sockets[0].url)).toBe('ws://127.0.0.1:8090/');
+});
+
 test('the PRADO application serves the same chat', async ({ browser }) => {
 	const room = 'app' + Date.now();
 	const ada = await newPage(browser);

@@ -2,15 +2,22 @@
  * The chat example's browser side, built on prado-pubsub.js (Prado.WebSocket.PubSub).
  *
  * Flow:
- *  1. new PubSub(url) connects; subscribe('room:<name>') registers the room handler.
+ *  1. new PubSub(url) connects.
  *  2. On every 'open' (the first connect and each reconnect, each with a new client id) the page
- *     calls chat.join, which returns the members and recent history; messages with a sequence
- *     number already shown are skipped, so a reconnect fills the gap without duplicates.
- *  3. publish() posts to the room; send() whispers to one member; 'message' events carry whispers.
+ *     calls chat.join, which joins the room on the server and returns the members, recent
+ *     history and a token; messages with a sequence number already shown are skipped, so a
+ *     reconnect fills the gap without duplicates.  The token, sent with each later join, keeps
+ *     the nickname, which the server holds for one page at a time.
+ *  3. After the first join, subscribe('room:<name>') registers the room handler; the server
+ *     allows it for members only.  The client re-subscribes after each reconnect, after the
+ *     'open' listeners have sent the join.
+ *  4. publish() posts to the room; send() whispers to one member by client id; 'message' events
+ *     carry whispers.
  *
- * The WebSocket URL comes from the ?ws= query parameter, else <body data-ws-url>, else
- * ws://<this host>:8090/.  The script waits for the DOM, so it loads from <head> with or
- * without defer.
+ * The WebSocket URL comes from <body data-ws-url>, else ws://<this host>:8090/.  The ?ws= query
+ * parameter overrides it with a ws:// or wss:// URL on this page's host only, so a crafted link
+ * cannot send a visitor's nickname and messages to another server.  The script waits for the
+ * DOM, so it loads from <head> with or without defer.
  */
 (function () {
 	'use strict';
@@ -24,16 +31,32 @@
 	function start() {
 		const PubSub = window.Prado.WebSocket.PubSub;
 		const el = (id) => document.getElementById(id);
-		const wsUrl = new URLSearchParams(location.search).get('ws')
-			|| document.body.dataset.wsUrl
-			|| `ws://${location.hostname || '127.0.0.1'}:8090/`;
+		const wsUrl = socketUrl();
 
 		/** @type {?InstanceType<typeof PubSub>} */
 		let ps = null;
-		/** @type {?{nick: string, room: string, channel: string, lastSeq: number, entered: boolean, ownIds: Set<string>}} */
+		/** @type {?{nick: string, room: string, channel: string, lastSeq: number, entered: boolean, token: ?string, ownIds: Set<string>}} */
 		let session = null;
 		/** @type {Map<string, string>} client id → nickname */
 		const members = new Map();
+
+		/** Returns the WebSocket URL; a ?ws= override must be a ws:// or wss:// URL on this page's host. */
+		function socketUrl() {
+			const fallback = document.body.dataset.wsUrl || `ws://${location.hostname || '127.0.0.1'}:8090/`;
+			const override = new URLSearchParams(location.search).get('ws');
+			if (override) {
+				try {
+					const url = new URL(override);
+					if ((url.protocol === 'ws:' || url.protocol === 'wss:') && url.hostname === location.hostname) {
+						return url.href;
+					}
+				} catch (e) {
+					// not a URL
+				}
+				console.warn('Ignoring ?ws=: only a ws:// or wss:// URL on ' + location.hostname + ' is allowed.');
+			}
+			return fallback;
+		}
 
 		// ---- Rendering ------------------------------------------------------------
 
@@ -135,7 +158,12 @@
 
 		/** Joins the room on the server; runs after every (re)connect, since the client id is new each time. */
 		async function enterRoom() {
-			const res = await ps.call('chat.join', { room: session.room, nick: session.nick });
+			const res = await ps.call('chat.join', { room: session.room, nick: session.nick, token: session.token || undefined });
+			session.token = res.token;
+			if (!session.entered) {
+				// A member may subscribe; registering the handler now catches every later message.
+				ps.subscribe(session.channel, onRoomEvent).catch((e) => session && system('Error: ' + e.message));
+			}
 			members.clear();
 			for (const m of res.members) {
 				members.set(m.id, m.nick);
@@ -157,7 +185,7 @@
 
 		function join(nick, room) {
 			el('join-error').textContent = '';
-			session = { nick, room, channel: 'room:' + room, lastSeq: 0, entered: false, ownIds: new Set() };
+			session = { nick, room, channel: 'room:' + room, lastSeq: 0, entered: false, token: null, ownIds: new Set() };
 			ps = new PubSub(wsUrl);
 			setStatus('connecting');
 
@@ -190,8 +218,6 @@
 				}
 			});
 			ps.on('error', (e) => system('Error: ' + e.message));
-
-			ps.subscribe(session.channel, onRoomEvent).catch((e) => leave(e.message));
 			showChat(true);
 		}
 
@@ -214,7 +240,8 @@
 				return;
 			}
 			const [, nick, body] = whisper;
-			const target = [...members].find(([id, name]) => name === nick && id !== ps.clientId);
+			// Nicknames are unique on the server, so the name finds one member, addressed by client id.
+			const target = [...members].find(([id, name]) => name === nick && id !== ps.clientId && !session.ownIds.has(id));
 			if (!target) {
 				system(`No one called ${nick} is here.`);
 				return;
