@@ -70,7 +70,7 @@ This README documents the development branch. Features marked **1.2.0 (unrelease
 | `IWebSocketBackplane` | The transport seam a cluster relays through; `TWebSocketEnvelope` is its unit of exchange |
 | `TNullBackplane` | Single-node no-op backplane (the default) |
 | `TFileBackplane` | Shared-directory backplane for one host or a shared filesystem (dev/small clusters); owner-only spool |
-| `TRedisBackplane` | Redis pub/sub + presence backplane for multi-host scaling (needs `ext-redis`) |
+| `TRedisBackplane` | Redis backplane (per-node inbox lists + a presence hash) for multi-host scaling (needs `ext-redis`) |
 | `TMeshBackplane` | Peer-to-peer gossip backplane over server-to-server WebSocket links; shared-secret authenticated |
 | `IWebSocketClusterAware` | A handler the module hands its cluster to. **1.2.0 (unreleased)** |
 | `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster. **1.2.0 (unreleased)** |
@@ -133,6 +133,10 @@ $server->serve();                                 // TSocketReactor-driven loop;
 The loop is PRADO's `TSocketReactor`: the listener, every connection and the cluster backplane's sockets are multiplexed through one `select()`, transports are watched for writes only while output is queued, and the handshake, close and idle deadlines run as reactor timers. Pass your own reactor with `setReactor()` to run other sources in the same loop; `serveOnce()` runs one tick for tests.
 
 While `serve()` runs, the reactor is also PRADO's `TAsync` loop (the prior loop is restored on exit), and `TWebSocketModule` serves the same way. A fiber that a handler starts with `TAsync::run()` therefore resumes on the loop the server ticks, so a handler can wait on `TAsync::sleep()`, a `TFuture`, or `TCurlMultiHttpClient` without stalling other clients. Start such waits in a fiber: an `await()` on the main fiber ticks the reactor from inside the handler's callback. Over HTTP/2 the handler runs inside the session's nghttp2 call, which `prado-http2` 1.3 refuses to re-enter; `THttp2WebSocketProtocol` holds the bytes the loop reads for that session meanwhile and feeds them once the call returns.
+
+During such a wait the server leaves that HTTP/1.1 session's input unread until the handler returns, so its messages stay in order and never follow its `onClose`. A second main-fiber wait that starts while one is in progress fails, because PRADO's main-fiber suspension serves one wait at a time. While `serve()` runs, a reactor without an `ErrorHandler` gets one that logs a throwing timer or resumed fiber and carries on. When `serve()` ends, every live WebSocket is sent a Close with 1001 Going Away and has `ShutdownTimeout` (default 2 s) to answer before it is ended through `onClose`. A host that drives `serveOnce()` calls `shutdownSessions()` itself.
+
+The synchronous `handleConnection()` loop uses the stream's read timeout (`default_socket_timeout` for an accepted socket) as its keepalive interval: an idle peer is pinged, and one that answers neither the Ping nor anything else by the next interval is closed with 1001.
 
 ### As a daemon from prado-cli
 
@@ -230,12 +234,15 @@ Negotiation runs on every accept path: the `serveOnce()` loop, the synchronous `
 | `setHandshakeTimeout($seconds)` | 10.0 | Deadline for the opening handshake; a silent or dribbling client is dropped without ever blocking the loop |
 | `setIdleTimeout($seconds)` | 0 (off) | Pings, then reaps, a connection idle this long; runs on a quiet server too |
 | `setCloseTimeout($seconds)` | 5.0 | After the server sends Close, how long it waits for the peer's Close before ending the session; the queued Close is drained first |
+| `setShutdownTimeout($seconds)` | 2.0 | When `serve()` ends, how long live WebSockets get to complete the 1001 Going Away close handshake before they are ended |
 | `setMaxConnections($n)` | 0 (unlimited) | Bounds the load: every transport the server holds (sessions, pending handshakes, endpoint links, app-held connections) plus HTTP/2 streams; a further connection is accepted and shed with 503, and a further HTTP/2 stream is refused with 503 |
 | `setReactor($reactor)` | own | The `TSocketReactor` the loop runs on; supply one to multiplex other sources or timers with the server |
 | `setOrigins([...])` | `[]` (any) | Allowed `Origin` values; a disallowed origin is refused with 403 before upgrading |
 | `setAllowedHosts([...])` | `[]` (any) | Allowed `Host` values; a disallowed host is refused with 400 |
 
 These apply on both the HTTP/1.1 and HTTP/2 paths: an HTTP/2 transport is a pending handshake until its first WebSocket stream opens, an idle one is sent an HTTP/2 PING (and one carrying no stream is ended), a stream that never completes its close is reset at `CloseTimeout`, and `MaxSendBufferBytes` counts what a stream holds while its peer withholds flow-control window. Binding `tls://host:port` (with `ssl` context options for the certificate) runs each accepted socket's TLS handshake without blocking, under the handshake deadline; an ALPN `h2` selects HTTP/2 without a preface. Every refused upgrade, shed connection, deadline, idle reap and swallowed handler error is logged through `Prado::log()` under the server's class.
+
+The handshake, close, idle and shutdown timeouts run on the server's monotonic clock (`getMonotonicClock()`), so a wall-clock step neither expires nor postpones them. A handler exception fails only its own connection: `onError` runs and the WebSocket closes with 1011, and on HTTP/2 the other streams carry on. Messages a read completed before a malformed frame are delivered before the connection fails. An upgrade request with a repeated `Host`, an obs-fold line, whitespace before a colon, `Transfer-Encoding` or a non-zero `Content-Length` is refused with 400. An internal endpoint that implements `IWebSocketEndpointLimits` declares its own `MaxMessageSize`/`MaxSendBufferBytes` for the connections it accepts.
 
 ## Clustering (multi-node)
 
@@ -255,9 +262,9 @@ Several server processes (each a `websocket/serve` daemon, or a `TWebSocketServe
 Backplane choices:
 
 - **`TNullBackplane`** — single node, no relay (the default).
-- **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it, any other user can access it, or it is a symlink. A crashed node's presence files go stale after `PresenceTtl` and its clients are dropped on every node; a node that stalled past it writes its files again on resuming, and a node that restarts under the same `NodeId` replaces its previous incarnation's presence.
-- **`TRedisBackplane`** — per-node inbox lists plus a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`/`InboxLimit`); the driver for multi-host scaling. Needs `ext-redis`. Redis pub/sub is not used (phpredis subscribe blocks); a node polls its inbox each tick. A node whose heartbeat expires is reaped, and every node drops its clients. Opening, a reconnect (retried every 5 s), and a node finding itself reaped after a stall all replace the node's presence on every node and re-declare its channel interest from local state, so a client that left during an outage, or a previous incarnation under the same `NodeId`, leaves no phantom.
-- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. The dialer answers first and the accepting node answers only a verified peer, so a replayed handshake cannot turn one node into a signing oracle for another. Only an address this node dials (a seed, or one a verified peer announced) obtains its answer, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL. Each node announces a per-process incarnation, so a node that restarts under the same `NodeId` has its previous clients dropped everywhere. A message larger than a link's socket buffer drains as the peer reads it: the server watches a link with output queued for writability.
+- **`TFileBackplane`** — a shared directory (`Directory`); for one host or a shared filesystem (dev, tests, small clusters). The spool is created owner-only and refused if another user owns it, any other user can access it, or it is a symlink. A crashed node's presence files go stale after `PresenceTtl` and its clients are dropped on every node; a node that stalled past it writes its files again on resuming, and a node that restarts under the same `NodeId` replaces its previous incarnation's presence. A tick reads up to `DrainLimit` lines (default 10000) and the server ticks again at once while more remain. `open()` warns when a parent directory of the spool is unsafe (owned by another user, or writable by others without the sticky bit).
+- **`TRedisBackplane`** — per-node inbox lists plus a presence registry (`Host`/`Port`/`Password`/`Database`/`Prefix`/`InboxLimit`); the driver for multi-host scaling. Needs `ext-redis`. Redis pub/sub is not used (phpredis subscribe blocks); a node polls its inbox each tick. A node whose heartbeat expires is reaped, and every node drops its clients. Opening, a reconnect (retried every 5 s), and a node finding itself reaped after a stall all replace the node's presence on every node and re-declare its channel interest from local state, so a client that left during an outage, or a previous incarnation under the same `NodeId`, leaves no phantom. A tick drains up to `DrainLimit` envelopes (default 10000) and the server ticks again at once while more remain; the reap of a dead node is one Redis transaction, and an inbox expires three `NodeTtl` after its last push. Every Redis command is a blocking round trip on the serve loop, so keep Redis close to the nodes.
+- **`TMeshBackplane`** — peer-to-peer gossip over server-to-server WebSocket links (`Peers`/`Advertise`), with no shared service. A peer joins only by proving the shared `Secret` (required; `open()` refuses without one) — a handshake HMAC plus a *mutual* post-upgrade nonce challenge bound to the answering node's id, so each side proves the secret to the other and shows no state until it has, and a challenge cannot be reflected. The dialer answers first and the accepting node answers only a verified peer, so a replayed handshake cannot turn one node into a signing oracle for another. Only an address this node dials (a seed, or one a verified peer announced) obtains its answer, so prefer a `tls://` transport on any untrusted network. A node unheard for `NodeTtl` is declared down: its clients leave the presence mirror and its link is dropped so it is re-dialed when it returns; unlinked seed peers are re-dialed once per TTL. Each node announces a per-process incarnation, so a node that restarts under the same `NodeId` has its previous clients dropped everywhere. A message larger than a link's socket buffer drains as the peer reads it: the server watches a link with output queued for writability. `tls://` peers are dialed without blocking the loop (`SslContext` sets the `ssl` options, such as `cafile`); hostnames resolve synchronously, so prefer IP addresses. `PeerPattern` limits which announced URIs a node dials. A node heard again after being declared down, directly or through another node, is asked to re-announce its presence, so a partial mesh converges after a transient silence. Links apply `LinkMaxMessageSize` and `LinkMaxSendBufferBytes` at both ends, not the server's client limits; set them alike on every node. An accepted peer may send at most 4096-byte messages until it is verified.
 
 ## Pub/sub for browsers (`prado.pubsub.v1`)
 
@@ -265,7 +272,7 @@ Backplane choices:
 
 A browser needs no library to open a WebSocket, but the cluster's `subscribe()`/`publish()` are server-side calls. `TWebSocketPubSubHandler` defines a small JSON subprotocol over them, and `prado-pubsub.js` is its browser client.
 
-Each message is one JSON object with a `type`. A request with an `id` gets exactly one `ack` (with `data` for a call) or `error` (`code`, `message`); a request without one is answered only when it fails.
+Each message is one JSON object with a `type`. A request with an `id` (an integer, or a string of 1 to 64 bytes) gets exactly one `ack` (with `data` for a call) or `error` (`code`, `message`); a request without one is answered only when it fails. A frame the server cannot decode, or refuses as too large, is answered with the `id` that a bounded scan of its top-level members finds.
 
 | Client → server | Fields | Server → client | Fields |
 |---|---|---|---|
@@ -273,9 +280,9 @@ Each message is one JSON object with a `type`. A request with an `id` gets exact
 | `publish` | `channel`, `data` | `message` | `data`, `channel`?, `from`? |
 | `send` | `to`, `data` | `ack` | `id`, `data`? |
 | `call` | `method`, `params` | `error` | `id`?, `code`, `message` |
-| `ping` | | `pong` | |
+| `ping` | | `pong` | (to a `ping` without an `id`; a `ping` with one is acked) |
 
-Channels match `[A-Za-z0-9_.:/-]{1,128}`. Error codes are `bad_request`, `unknown_type`, `forbidden`, `limit`, `not_found` and `internal`. Delivery is at-most-once: a client that is reconnecting misses what is published meanwhile.
+Channels match `[A-Za-z0-9_.:/-]{1,128}`. Error codes are `bad_request`, `unknown_type`, `forbidden`, `limit`, `not_found` and `internal`. Delivery is at-most-once: a client that is reconnecting misses what is published meanwhile. A publish or send relays `data` as the JSON text the client sent, so `{}`, an object with numeric keys, and an integer past 64 bits arrive unchanged. Event handlers see `data` decoded to PHP arrays, with such an integer as its decimal string, and `setData()` replaces what is relayed. A number outside the float range (`1e400`) is `bad_request`.
 
 ```xml
 <module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule" Port="8080"
@@ -288,7 +295,7 @@ Authorization runs through events, each with a `TWebSocketPubSubEventParameter`:
 
 - `onSubscribe` → allowed unless a handler calls `setAllowed(false)`.
 - `onPublish` / `onSend` → denied unless `AllowClientPublish` / `AllowClientSend` is set or a handler allows it; a handler may also `setData()`.
-- `onCall` → a handler answers with `setResult()`, or throws a `TWebSocketPubSubException`; an unanswered call is `not_found`.
+- `onCall` → a handler answers with `setResult()`, denies with `setAllowed(false)`, or throws a `TWebSocketPubSubException`; an unanswered call is `not_found`. Any other exception from a handler is logged and answered `internal`, including a `TWebSocketException` from writing to another connection; the requester keeps its connection.
 - `onOpen` is raised before the `welcome`, so it can authenticate the client (close with 4401 or 4403 to stop the browser from reconnecting) or `subscribe()` it to its own channels. Once a connection is closed this way, nothing the client sends reaches the handler, including requests pipelined behind the handshake.
 
 `MaxSubscriptions` (default 64) bounds each client. `MaxFrameSize` (default 65536 bytes) bounds each request: a larger frame is answered `limit` without being decoded, since decoding JSON takes many times a frame's size in memory, and the browser client refuses such a request itself. `Heartbeat` (default 25 s; keep it below `IdleTimeout`) sets the client ping interval. Application code reaches clients with `publish()`, `sendTo()` and `broadcast()` on the handler, or with `$module->publish($channel, TWebSocketPubSubHandler::encodeMessage($data, $channel))`. The module gives the handler its cluster; a bare `TWebSocketServer` and the handler share one with `setCluster()`.
@@ -309,7 +316,7 @@ leave();
 
 [`examples/chat`](examples/chat) is a runnable multi-room chat on this layer: rooms, history, whispers, and reconnection, run both standalone and as a PRADO application.
 
-The client reconnects with exponential backoff and jitter (`minDelay`, `maxDelay`), re-subscribes, holds requests made while offline (`maxQueue`), times requests out (`requestTimeout`), and drops a connection silent for twice the heartbeat. Close codes 1002, 1003, 1007 to 1010, 4401 and 4403 end reconnection. A publish, send or call in flight when the connection drops rejects with `disconnected` and is not resent. Pub/sub runs on the standalone server; `TWebSocketService` does not serve it.
+The client reconnects with exponential backoff and jitter (`minDelay`, `maxDelay`), re-subscribes, holds requests made while offline (`maxQueue`), times requests out (`requestTimeout`), and drops a connection silent for twice the heartbeat. It is open once the `welcome` arrives: `open` listeners run first, then the channels are re-subscribed and the held requests sent, so a join or authentication call made in an `open` listener goes first. A subscribe that times out is unsubscribed. Close codes 1002, 1003, 1008, 1010, 4401 and 4403 end reconnection. A publish, send or call in flight when the connection drops rejects with `disconnected` and is not resent, so a close for one message (1007, 1009) costs that request and a reconnect. In Node, `require()` loads the client as CommonJS; pass `options.WebSocket`. Pub/sub runs on the standalone server; `TWebSocketService` does not serve it.
 
 ## HTTP/2 multiplexing (RFC 8441)
 
@@ -324,7 +331,6 @@ The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazil
 - **Web SAPIs cannot host WebSockets.** Under PHP-FPM/mod_php the web server owns the socket and FastCGI cannot tunnel the upgrade to PHP. Run the standalone `TWebSocketServer` in its own process. (The PRADO `websocket` service is the dispatch target; the socket is supplied by the server.)
 - **HTTP/3 (RFC 9220) is out of scope** — QUIC needs TLS key hooks PHP does not expose.
 - **TLS** (`wss://`, `h2`) is terminated on the socket; HTTP/2 over TLS needs ALPN negotiating `h2` before the bytes reach the server.
-- **`MaxConnections` and HTTP/2**: streams count when their session is accepted; a new stream on an existing session past the cap is not refused.
 
 ## Development
 
@@ -344,7 +350,7 @@ Tests cover the codec (round-trips, masking, fragmentation, control-frame rules)
 
 ### Browser client tests (Playwright)
 
-A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate. The pub/sub specs drive `prado-pubsub.js` against `TWebSocketPubSubHandler`: channel delivery, calls, error codes, a fatal close, reconnection after a server restart, and heartbeat detection of a stalled server. The chat-example specs run both versions of [`examples/chat`](examples/chat) in two browser pages.
+A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate. The pub/sub specs drive `prado-pubsub.js` against `TWebSocketPubSubHandler`: channel delivery, calls, error codes, a fatal close, reconnection after a server restart, and heartbeat detection of a stalled server, faithful relay of `{}`, an undecodable request, and reconnection after a 1009. `pubsub-client.spec.js` tests the client's request ordering and subscription bookkeeping in Node against a scripted socket. The chat-example specs run both versions of [`examples/chat`](examples/chat) in two browser pages.
 
 ```sh
 npm install                                  # or: bun install
