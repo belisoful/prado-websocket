@@ -17,6 +17,7 @@ use Prado\IO\Socket\TSocketAddress;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketEndpoint;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\Prado;
 use Prado\TComponent;
@@ -1075,11 +1076,28 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		try {
 			$messages = $this->_peers[$peerId]['link']->feed($bytes);
 		} catch (\Throwable $e) {
-			// A protocol error, or an I/O failure echoing a Close to a vanished peer, drops it.
+			// A protocol error, or an I/O failure echoing a Close to a vanished peer, drops it, after
+			// the messages the same read completed before a malformed frame.
+			if ($e instanceof TWebSocketException) {
+				$this->route(array_map(fn ($message) => $message->getPayload(), $e->getDecodedMessages()), $peerId);
+			}
 			$this->dropPeer($peerId, 'its link failed: ' . $e->getMessage());
 			return;
 		}
+		$this->route($messages, $peerId);
+	}
+
+	/**
+	 * Decodes and receives the envelopes one read of a peer link delivered.
+	 * @param string[] $messages The message payloads, in order.
+	 * @param int $peerId The peer they came from.
+	 */
+	private function route(array $messages, int $peerId): void
+	{
 		foreach ($messages as $message) {
+			if (!isset($this->_peers[$peerId])) {
+				return;   // an earlier envelope dropped the peer
+			}
 			$envelope = TWebSocketEnvelope::decode($message);
 			if ($envelope !== null) {
 				$this->receive($envelope, $peerId);

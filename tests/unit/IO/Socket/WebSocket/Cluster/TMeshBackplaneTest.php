@@ -815,6 +815,18 @@ class TMeshBackplaneTest extends TestCase
 		return [$b, $spyB, $peer, $raw];
 	}
 
+	public function testEnvelopesBeforeAMalformedFrameInTheSameReadAreReceived()
+	{
+		[$b, $spyB, $peer, $raw] = $this->verifiedPeer('A');
+		$spyB->received = [];
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'A', 'hello', 'news'))->encode());
+		$raw->write("\x83\x80\x00\x00\x00\x00");   // a masked frame with a reserved opcode, in the same read
+		$b->tick();
+		self::assertSame(0, $b->getPeerCount(), 'The malformed frame drops the peer.');
+		self::assertSame([TWebSocketEnvelope::PUBLISH], array_map(fn ($e) => $e->getType(), $spyB->received), 'The envelope decoded before it is still received.');
+		$b->close();
+	}
+
 	public function testOpenRequiresASecret()
 	{
 		[$mesh] = $this->makeNode('A');
