@@ -8,6 +8,7 @@ use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TNgHttp2;
 use Prado\IO\Socket\TSocketReactor;
 use Prado\IO\Socket\TSocketStream;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketPolledBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\IWebSocketProtocol;
@@ -121,6 +122,30 @@ class CountingReactor extends TSocketReactor
 	{
 		$this->wantWrites++;
 		parent::wantWrite($source, $want);
+	}
+}
+
+/** A polled backplane whose backlog a test sets. */
+class BacklogBackplane extends TNullBackplane implements IWebSocketPolledBackplane
+{
+	public bool $backlog = false;
+
+	public function getHasBacklog(): bool
+	{
+		return $this->backlog;
+	}
+}
+
+/** A reactor that records the timeout of each tick. */
+class TimeoutRecordingReactor extends TSocketReactor
+{
+	/** @var array<?float> */
+	public array $timeouts = [];
+
+	public function tick(?float $timeout = null): int
+	{
+		$this->timeouts[] = $timeout;
+		return parent::tick(0.0);
 	}
 }
 
@@ -1039,6 +1064,22 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame(TWebSocketCloseCode::ProtocolError, $code);
 		self::assertSame(['message:first', 'error:' . TWebSocketCloseCode::ProtocolError], $events, 'The message before the malformed frame reaches the handler, then the connection fails.');
 		$client->close();
+		$server->close();
+	}
+
+	public function testAClusterBacklogIsTickedAgainWithoutWaiting()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$backplane = new BacklogBackplane();
+		$server->setCluster(new TWebSocketCluster('s1', $backplane));
+		$reactor = new TimeoutRecordingReactor();
+		$server->setReactor($reactor);
+
+		$server->serveOnce();
+		$backplane->backlog = true;
+		$server->serveOnce();
+		$server->serveOnce(0, 5000);
+		self::assertSame([(float) TWebSocketServer::CLUSTER_TICK_INTERVAL, 0.0, 0.005], $reactor->timeouts, 'An idle cluster waits for the tick interval; a backlog is ticked again at once; a caller\'s timeout is kept.');
 		$server->close();
 	}
 

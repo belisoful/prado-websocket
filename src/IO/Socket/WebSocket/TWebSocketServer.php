@@ -872,7 +872,8 @@ class TWebSocketServer extends TSocketServer
 	 * serveOnce().  The live sessions stay open when the host stops pumping until it calls
 	 * {@see shutdownSessions()}.
 	 * @param ?int $seconds Tick timeout in seconds; null waits until activity or the nearest reactor
-	 *   timer, bounded by {@see CLUSTER_TICK_INTERVAL} when a cluster is present.
+	 *   timer, bounded by {@see CLUSTER_TICK_INTERVAL} when a cluster is present, and 0 while the
+	 *   cluster reports a {@see TWebSocketCluster::getHasBacklog() backlog}.
 	 * @param int $microseconds Additional tick timeout microseconds.
 	 */
 	public function serveOnce(?int $seconds = null, int $microseconds = 0): void
@@ -880,7 +881,9 @@ class TWebSocketServer extends TSocketServer
 		$this->attachReactor();
 		$timeout = $seconds === null ? null : $seconds + $microseconds / 1000000;
 		if ($timeout === null && $this->_cluster !== null) {
-			$timeout = (float) self::CLUSTER_TICK_INTERVAL;   // async dials complete on writability and mesh deadlines must fire, both advanced by the cluster tick
+			// The cluster tick advances mesh deadlines and drains polled backplanes; one that stopped
+			// with inbound traffic left is ticked again at once.
+			$timeout = $this->_cluster->getHasBacklog() ? 0.0 : (float) self::CLUSTER_TICK_INTERVAL;
 		}
 		$this->_clusterTicked = false;
 		$this->getReactor()->tick($timeout);
