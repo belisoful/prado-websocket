@@ -212,6 +212,30 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$client->close();
 	}
 
+	public function testMessagesBeforeAProtocolErrorInTheSameReadAreDispatchedFirst()
+	{
+		$handler = new TWebSocketHandler();
+		$events = [];
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$events) {
+			$events[] = 'message:' . $msg->getPayload();
+		});
+		$handler->attachEventHandler('onError', function () use (&$events) {
+			$events[] = 'error';
+		});
+		[$protocol, $client, $stream] = $this->establish($handler);
+
+		$mask = "\x01\x02\x03\x04";
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('first'), $mask) . TWebSocketFrameCodec::encode(new TWebSocketFrame(0x3, 'x'), $mask));
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+
+		self::assertSame(['message:first', 'error'], $events, 'The message before the malformed frame reaches the handler, then the stream fails.');
+		self::assertCount(0, $protocol->getConnections());
+
+		$protocol->getSession()->close();
+		$client->close();
+	}
+
 	/**
 	 * Submits an Extended CONNECT with the given request headers against a configured protocol and
 	 * returns [opened-count, response headers, protocol].

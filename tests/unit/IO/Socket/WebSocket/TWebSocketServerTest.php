@@ -1016,6 +1016,32 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testMessagesBeforeAProtocolErrorInTheSameReadAreDispatchedFirst()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$events = [];
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$events) {
+			$events[] = 'message:' . $msg->getPayload();
+		});
+		$handler->attachEventHandler('onError', function ($conn, $e) use (&$events) {
+			$events[] = 'error:' . $e->getCloseCode();
+		});
+		$server->setHandler($handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/', TWebSocketHandshake::generateKey()));
+		self::assertStringContainsString('101', $this->readResponseHead($server, $client));
+
+		// A masked message and an unmasked (protocol error) frame in one write.
+		$client->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('first'), "\x01\x02\x03\x04") . TWebSocketFrameCodec::encode(TWebSocketFrame::text('unmasked')));
+		[, $code] = $this->readFramesUntilClose($server, $client);
+		self::assertSame(TWebSocketCloseCode::ProtocolError, $code);
+		self::assertSame(['message:first', 'error:' . TWebSocketCloseCode::ProtocolError], $events, 'The message before the malformed frame reaches the handler, then the connection fails.');
+		$client->close();
+		$server->close();
+	}
+
 	public function testMaxSendBufferBytesIsAppliedToAcceptedConnections()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');

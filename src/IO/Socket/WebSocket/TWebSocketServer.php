@@ -2044,13 +2044,13 @@ class TWebSocketServer extends TSocketServer
 			unset($this->_sessions[$id]['pinged']);
 		}
 		$this->_sessions[$id]['dispatching'] = true;
+		$failure = null;
 		try {
 			try {
 				$messages = $connection->feedMessages($bytes);
 			} catch (TWebSocketException $e) {
-				$this->log('Protocol error; the connection is failed with close code ' . $e->getCloseCode() . ': ' . $e->getMessage(), TLogger::NOTICE);
-				$this->failHttp1Connection($transport, $connection, $e);
-				return;
+				$messages = $e->getDecodedMessages();   // the messages the read completed before the malformed frame are delivered first
+				$failure = $e;
 			}
 			foreach ($messages as $message) {
 				if (!isset($this->_sessions[$id]) || $connection->getIsCloseInitiator()) {
@@ -2063,6 +2063,11 @@ class TWebSocketServer extends TSocketServer
 					$this->failHttp1Connection($transport, $connection, $e);
 					return;
 				}
+			}
+			if ($failure !== null && isset($this->_sessions[$id]) && !$connection->getIsCloseInitiator()) {
+				$this->log('Protocol error; the connection is failed with close code ' . $failure->getCloseCode() . ': ' . $failure->getMessage(), TLogger::NOTICE);
+				$this->failHttp1Connection($transport, $connection, $failure);
+				return;
 			}
 		} finally {
 			$this->endHttp1Dispatch($transport, $connection);

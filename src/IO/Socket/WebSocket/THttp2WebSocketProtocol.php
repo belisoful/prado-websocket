@@ -565,12 +565,21 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			return;
 		}
 		try {
-			$messages = $connection->feedMessages($stream->getContents());
+			$failure = null;
+			try {
+				$messages = $connection->feedMessages($stream->getContents());
+			} catch (TWebSocketException $e) {
+				$messages = $e->getDecodedMessages();   // the messages the read completed before the malformed frame are delivered first
+				$failure = $e;
+			}
 			foreach ($messages as $message) {
 				if ($connection->getIsCloseInitiator()) {
 					break;   // the application or server closed the stream: nothing more reaches the handler
 				}
 				$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
+			}
+			if ($failure !== null && !$connection->getIsCloseInitiator()) {
+				throw $failure;
 			}
 		} catch (\Throwable $e) {
 			$this->failStream($stream, $connection, $e);
