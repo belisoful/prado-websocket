@@ -199,7 +199,14 @@ class TWebSocketModuleTest extends TestCase
 		self::assertSame(1, $closed, 'Stopping the module closes the live WebSocket through onClose.');
 		self::assertNull($module->getServer(), 'The server is released after serving.');
 		$client->setBlocking(false);
-		$frame = TWebSocketFrameCodec::tryDecode($client->read(4096), false);
+		$bytes = '';
+		for ($i = 0; $i < 100 && TWebSocketFrameCodec::tryDecode($bytes, false) === null && !$client->eof(); $i++) {
+			$read = [$client->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);   // the server has stopped: wait for the bytes it sent, without blocking
+			$bytes .= $client->read(4096);
+		}
+		$frame = TWebSocketFrameCodec::tryDecode($bytes, false);
 		self::assertNotNull($frame, 'The client is sent a Close as the module stops.');
 		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode());
 		$client?->close();

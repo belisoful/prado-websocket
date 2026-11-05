@@ -2229,6 +2229,25 @@ class TWebSocketServerTest extends TestCase
 	}
 
 	/**
+	 * Reads a client without blocking until a whole frame has arrived or the stream ends, waiting up
+	 * to about two seconds, for bytes a server sent before it stopped pumping.
+	 * @param TSocketStream $client The client transport.
+	 * @return string The bytes read.
+	 */
+	private function readFrameWithoutServer(TSocketStream $client): string
+	{
+		$client->setBlocking(false);
+		$bytes = '';
+		for ($i = 0; $i < 100 && TWebSocketFrameCodec::tryDecode($bytes, false) === null && !$client->eof(); $i++) {
+			$read = [$client->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);
+			$bytes .= $client->read(4096);
+		}
+		return $bytes;
+	}
+
+	/**
 	 * Connects a raw client and completes its upgrade by pumping the server.
 	 * @param TWebSocketServer $server The server.
 	 * @return TSocketStream The upgraded client transport, non-blocking.
@@ -2301,11 +2320,10 @@ class TWebSocketServerTest extends TestCase
 
 		self::assertSame(1, $closed, 'A peer that never answers is ended at the shutdown timeout, through onClose.');
 		self::assertSame(0, $server->getConnectionCount(), 'Every transport is closed, the pending handshake too.');
-		$frame = TWebSocketFrameCodec::tryDecode($silent->read(4096), false);
+		$frame = TWebSocketFrameCodec::tryDecode($this->readFrameWithoutServer($silent), false);
 		self::assertNotNull($frame, 'The silent peer was still sent the Close.');
 		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode());
-		$pending->setBlocking(false);
-		self::assertSame('', $pending->read(16));
+		self::assertSame('', $this->readFrameWithoutServer($pending));
 		self::assertTrue($pending->eof(), 'The pending handshake is closed.');
 		$logs = Prado::getLogger()->getLogs(TLogger::NOTICE, TWebSocketServer::class);
 		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'without completing')), 'The forced end is logged.');
@@ -2353,7 +2371,10 @@ class TWebSocketServerTest extends TestCase
 		}
 		$socket->setBlocking(false);
 		for ($i = 0; $i < 100 && !$socket->eof(); $i++) {
-			$bytes = $socket->read(65536);   // the server has closed: what it sent is buffered, then end of stream
+			$read = [$socket->getResource()];
+			$write = $except = null;
+			stream_select($read, $write, $except, 0, 20000);
+			$bytes = $socket->read(65536);   // the server has closed: what it sent arrives, then end of stream
 			if ($bytes !== '') {
 				$client->receive($bytes);
 			}
@@ -2548,7 +2569,7 @@ class TWebSocketServerTest extends TestCase
 
 		self::assertSame(1, $closed, 'The session ends through onClose.');
 		self::assertSame(0, $server->getConnectionCount());
-		$frame = TWebSocketFrameCodec::tryDecode($client->read(4096), false);
+		$frame = TWebSocketFrameCodec::tryDecode($this->readFrameWithoutServer($client), false);
 		self::assertSame(TWebSocketCloseCode::GoingAway, $frame['frame']->getCloseCode(), 'The peer is sent 1001 Going Away.');
 		$client->close();
 		$server->close();
