@@ -151,6 +151,12 @@ class TWebSocketServer extends TSocketServer
 	/** @var IWebSocketEndpoint[] The internal endpoints matched before normal client handling. */
 	private array $_endpoints = [];
 
+	/** @var array<int, true> The session transports armed for writability, keyed by transport object id. */
+	private array $_writeArmed = [];
+
+	/** @var array<int, true> The HTTP/2 sessions, keyed by transport object id. */
+	private array $_http2Sessions = [];
+
 	/**
 	 * @var array<int, array{transport: TSocketStream, connection?: TWebSocketConnection, protocol?: THttp2WebSocketProtocol, outbound?: string, active?: float, pinged?: float, handshake?: string, deadline?: float, crypto?: bool, closing?: float, discard?: bool, dispatching?: bool, held?: bool, streamClosing?: array<int, float>, timer?: string, closeTimer?: string}>
 	 *   Live sessions, keyed by transport object id.  `timer` and `closeTimer` are the reactor timer
@@ -660,6 +666,7 @@ class TWebSocketServer extends TSocketServer
 			$reactor->unregister($source);
 		}
 		$this->_clusterSources = [];
+		$this->_writeArmed = [];
 		if ($this->_clusterTickReset !== null) {
 			$reactor->cancel($this->_clusterTickReset);
 			$this->_clusterTickReset = null;
@@ -1015,17 +1022,25 @@ class TWebSocketServer extends TSocketServer
 	 * Arms each session transport and cluster source with queued output for writability and disarms
 	 * the rest, so the reactor watches writes only where a drain is pending (a writable socket is
 	 * otherwise always ready).  Output queued outside a pump (a cluster broadcast, a handler's
-	 * out-of-band send, a mesh peer message larger than the socket buffer) is picked up here.
+	 * out-of-band send, a mesh peer message larger than the socket buffer) is picked up here.  Only a
+	 * session whose state changed since the last pass is re-armed or disarmed.
 	 */
 	protected function armWrites(): void
 	{
 		$reactor = $this->getReactor();
 		$pending = [];
 		foreach ($this->pendingWriteTransports() as $transport) {
-			$pending[spl_object_id($transport)] = true;
+			$pending[spl_object_id($transport)] = $transport;
 		}
-		foreach ($this->_sessions as $id => $session) {
-			$reactor->wantWrite($session['transport'], isset($pending[$id]));
+		foreach ($this->_writeArmed as $id => $armed) {
+			if (!isset($pending[$id]) && isset($this->_sessions[$id])) {
+				$this->armSessionWrite($this->_sessions[$id]['transport'], false);
+			}
+		}
+		foreach ($pending as $id => $transport) {
+			if (!isset($this->_writeArmed[$id]) && isset($this->_sessions[$id])) {
+				$this->armSessionWrite($transport, true);
+			}
 		}
 		$backplane = $this->_cluster?->getBackplane();
 		$queued = [];
@@ -1040,6 +1055,22 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
+	 * Arms or disarms a session transport's writable callback and records the state, so
+	 * {@see armWrites()} touches the reactor only on a change.
+	 * @param TSocketStream $transport The session transport.
+	 * @param bool $want Whether to watch the transport for writability.
+	 */
+	private function armSessionWrite(TSocketStream $transport, bool $want): void
+	{
+		$this->getReactor()->wantWrite($transport, $want);
+		if ($want) {
+			$this->_writeArmed[spl_object_id($transport)] = true;
+		} else {
+			unset($this->_writeArmed[spl_object_id($transport)]);
+		}
+	}
+
+	/**
 	 * Records a session under its transport and registers the transport with the reactor.  A
 	 * pending session's handshake deadline is scheduled as a reactor timer.
 	 * @param TSocketStream $transport The session transport.
@@ -1049,6 +1080,9 @@ class TWebSocketServer extends TSocketServer
 	{
 		$id = spl_object_id($transport);
 		$this->_sessions[$id] = $session;
+		if (isset($session['protocol'])) {
+			$this->_http2Sessions[$id] = true;
+		}
 		if ($this->_attached) {
 			$this->registerSession($transport);
 			$this->armSessionTimers($id);
@@ -1061,6 +1095,7 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function registerSession(TSocketStream $transport): void
 	{
+		unset($this->_writeArmed[spl_object_id($transport)]);   // a fresh registration starts disarmed
 		$this->getReactor()->register(
 			$transport,
 			onReadable: fn () => $this->readySession($transport),
@@ -1077,7 +1112,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		$id = spl_object_id($transport);
 		$this->cancelSessionTimers($id);
-		unset($this->_sessions[$id]);
+		unset($this->_sessions[$id], $this->_writeArmed[$id], $this->_http2Sessions[$id]);
 		if ($this->_attached) {
 			$this->getReactor()->unregister($transport);
 		}
@@ -1368,11 +1403,12 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function flushHttp2Output(): void
 	{
-		foreach (array_column($this->_sessions, 'transport') as $transport) {
-			$session = $this->_sessions[spl_object_id($transport)] ?? null;
+		foreach (array_keys($this->_http2Sessions) as $id) {
+			$session = $this->_sessions[$id] ?? null;
 			if ($session === null || !isset($session['protocol'])) {
 				continue;
 			}
+			$transport = $session['transport'];
 			if (strlen($session['outbound'] ?? '') >= self::HTTP2_OUTPUT_HIGH_WATER) {
 				continue;   // the peer is not reading: leave the output in its streams, where MaxSendBufferBytes bounds it
 			}
@@ -2047,9 +2083,8 @@ class TWebSocketServer extends TSocketServer
 			return;
 		}
 		$this->_sessions[$id]['held'] = true;
-		$reactor = $this->getReactor();
-		$reactor->register($transport, onWritable: fn () => $this->writableSession($transport));
-		$reactor->wantWrite($transport, $connection->hasPendingOutbound());
+		$this->getReactor()->register($transport, onWritable: fn () => $this->writableSession($transport));
+		$this->armSessionWrite($transport, $connection->hasPendingOutbound());
 	}
 
 	/**
@@ -2071,7 +2106,7 @@ class TWebSocketServer extends TSocketServer
 		unset($this->_sessions[$id]['held']);
 		if ($this->_attached) {
 			$this->registerSession($transport);
-			$this->getReactor()->wantWrite($transport, $connection->hasPendingOutbound());
+			$this->armSessionWrite($transport, $connection->hasPendingOutbound());
 		}
 	}
 
@@ -2279,5 +2314,7 @@ class TWebSocketServer extends TSocketServer
 		$exprops[] = "\0" . __CLASS__ . "\0_cluster";
 		$exprops[] = "\0" . __CLASS__ . "\0_reactor";
 		$exprops[] = "\0" . __CLASS__ . "\0_clusterSources";
+		$exprops[] = "\0" . __CLASS__ . "\0_writeArmed";
+		$exprops[] = "\0" . __CLASS__ . "\0_http2Sessions";
 	}
 }

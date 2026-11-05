@@ -112,6 +112,18 @@ class SourceBackplane extends TNullBackplane
 	}
 }
 
+/** Counts the write arming calls the server makes, so a test can bound its per-tick reactor work. */
+class CountingReactor extends TSocketReactor
+{
+	public int $wantWrites = 0;
+
+	public function wantWrite(\Prado\IO\IResource $source, bool $want = true): void
+	{
+		$this->wantWrites++;
+		parent::wantWrite($source, $want);
+	}
+}
+
 class TWebSocketServerTest extends TestCase
 {
 	/** @var string[] Temporary certificate files to remove. */
@@ -2486,6 +2498,37 @@ class TWebSocketServerTest extends TestCase
 
 		self::assertSame('onetwo', $seenDuringWait, 'The cluster ticks on every reactor tick of the wait, so its source is read rather than spun on.');
 		$client->close();
+		$server->close();
+	}
+
+	public function testIdleSessionsCostTheReactorNoWriteArmingPerTick()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$reactor = new CountingReactor();
+		$server->setReactor($reactor);
+		$handler = new TWebSocketHandler();
+		$connections = [];
+		$handler->attachEventHandler('onOpen', function ($connection) use (&$connections) {
+			$connections[] = $connection;
+		});
+		$server->setHandler($handler);
+		$clients = [];
+		for ($n = 0; $n < 3; $n++) {
+			$clients[] = $this->upgradedClient($server);
+		}
+		$reactor->wantWrites = 0;
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 1000);
+		}
+		self::assertSame(0, $reactor->wantWrites, 'A session whose write state did not change is not re-armed or disarmed each tick.');
+
+		$connections[0]->send('out of band');   // queued output, if the socket does not take it at once
+		$server->serveOnce(0, 1000);
+		$message = TWebSocketFrameCodec::tryDecode($this->pumpUntil($server, $clients[0], fn (string $bytes) => TWebSocketFrameCodec::tryDecode($bytes, false) !== null), false);
+		self::assertSame('out of band', $message['frame']->getPayload(), 'Output still reaches the peer.');
+		foreach ($clients as $client) {
+			$client->close();
+		}
 		$server->close();
 	}
 }
