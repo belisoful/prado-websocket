@@ -12,6 +12,7 @@ namespace Prado\IO\Socket\WebSocket;
 
 use Prado\IO\Socket\TSocketStream;
 use Prado\Util\Clock\TApplicationClockAwareTrait;
+use Prado\Util\Clock\TMonotonicClockAwareTrait;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -25,7 +26,8 @@ use Psr\Http\Message\StreamInterface;
  *
  * The handshake policy is configured through {@see setSubprotocols()}, {@see setExtensions()},
  * {@see setOrigins()}, {@see setAllowedHosts()}, {@see setResponseHeaders()}, and
- * {@see setHandshakeTimeout()}.
+ * {@see setHandshakeTimeout()}.  The handshake deadline is measured on the
+ * {@see getMonotonicClock() MonotonicClock}, so a wall-clock change does not move it.
  *
  * This is the default stack of {@see TWebSocketServer}.
  *
@@ -35,6 +37,7 @@ use Psr\Http\Message\StreamInterface;
 class THttp1WebSocketProtocol implements IWebSocketProtocol
 {
 	use TApplicationClockAwareTrait;
+	use TMonotonicClockAwareTrait;
 
 	/** @var array<string, string> Extra headers added to the 101 response. */
 	private array $_responseHeaders = [];
@@ -188,7 +191,7 @@ class THttp1WebSocketProtocol implements IWebSocketProtocol
 			'allowedHosts' => $this->_allowedHosts,
 			'headers' => $this->_responseHeaders,
 			'timeout' => $this->_handshakeTimeout > 0 ? $this->_handshakeTimeout : null,
-			'clock' => $this->getClock(),
+			'clock' => $this->getMonotonicClock(),
 		]);
 		$onStream($connection, $handshake);
 	}

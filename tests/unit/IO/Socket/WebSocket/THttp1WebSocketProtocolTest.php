@@ -9,6 +9,7 @@ use Prado\IO\Socket\WebSocket\TPermessageDeflateExtension;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
+use Prado\Util\Clock\TMockClock;
 use Psr\Http\Message\StreamInterface;
 
 /**
@@ -144,6 +145,34 @@ class THttp1WebSocketProtocolTest extends TestCase
 		}
 		self::assertSame(0, $yielded);
 		self::assertStringStartsWith('HTTP/1.1 403', $b->read(65536));
+		$a->close();
+		$b->close();
+	}
+
+	public function testTheHandshakeDeadlineIsMeasuredOnTheMonotonicClock()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->write($this->request());
+		$protocol = new THttp1WebSocketProtocol();
+		$protocol->setHandshakeTimeout(5);
+		$wall = new TMockClock();
+		$wall->setMicrotime(1000.0);
+		$protocol->setClock($wall);
+		$clock = new class () extends TTestMonotonicClock {
+			protected function hrtime(): int
+			{
+				$this->nanoseconds += 10_000_000_000;   // each reading is 10 s after the last: the deadline has passed by the first read
+				return $this->nanoseconds;
+			}
+		};
+		$protocol->setMonotonicClock($clock);
+		try {
+			$protocol->serve($a, function () {
+			});
+			self::fail('The deadline passes on the monotonic clock although the wall clock stands still.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode());
+		}
 		$a->close();
 		$b->close();
 	}
