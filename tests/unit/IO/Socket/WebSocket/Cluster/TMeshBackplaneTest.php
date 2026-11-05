@@ -151,7 +151,9 @@ class TMeshBackplaneTest extends TestCase
 			$a->tick();   // no further traffic: only the tick flushes the link
 			$b->tick();
 		}
-		$b->tick();
+		for ($i = 0; $i < 100 && $spyB->traffic() === []; $i++) {
+			$b->tick();   // the peer reads what the socket buffer still holds (Linux buffers far more than macOS)
+		}
 
 		self::assertSame([], $a->getWriteSources(), 'The queued output drains.');
 		self::assertCount(1, $spyB->traffic(), 'The whole message reaches the peer.');
@@ -173,7 +175,9 @@ class TMeshBackplaneTest extends TestCase
 			$a->flushSource($rawA);   // the server reports the link writable
 			$b->tick();
 		}
-		$b->tick();
+		for ($i = 0; $i < 100 && $spyB->traffic() === []; $i++) {
+			$b->tick();   // the peer reads what the socket buffer still holds
+		}
 
 		self::assertSame([], $a->getWriteSources(), 'Flushing the writable link drains it.');
 		self::assertCount(1, $spyB->traffic(), 'The whole message reaches the peer.');
@@ -1073,7 +1077,7 @@ class TMeshBackplaneTest extends TestCase
 	public function testPresenceRequestsAreAnsweredAtMostOncePerInterval()
 	{
 		[$b, , $peer, $raw] = $this->verifiedPeer('A');
-		$clock = new TTestMonotonicClock(1000.0);
+		$clock = new TTestMonotonicClock($b->getMonotonicClock()->seconds());   // continue from B's reading: a jump would pass the TTL on a host booted minutes ago
 		$b->setMonotonicClock($clock);
 		$b->putPresence('B-1', ['node' => 'B']);
 		$read = function () use ($peer, $raw): array {
