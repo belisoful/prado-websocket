@@ -34,13 +34,39 @@ trait TWebSocketHandlerTrait
 	/**
 	 * Drives the message loop for a connection: opens, dispatches each message, and closes.
 	 * A protocol error raises {@see onError} and closes with the error's close code.
+	 *
+	 * The loop reads a blocking stream.  A read that reaches the stream's read timeout (for an
+	 * accepted socket, `default_socket_timeout`) with no message keeps the connection alive:
+	 *  - an open connection is pinged; a second timeout with no Pong and no message since closes it
+	 *    with {@see TWebSocketCloseCode::GoingAway}, since the peer is gone.
+	 *  - a connection that is closing stops waiting for the peer's Close.
+	 * On a non-blocking stream the loop ends when no frame is available.
 	 * @param TWebSocketConnection $connection The handshaken connection.
 	 */
 	public function handleConnection(TWebSocketConnection $connection): void
 	{
 		$this->onOpen($connection);
+		$pinged = false;
+		$answered = function () use (&$pinged): void {
+			$pinged = false;
+		};
+		$connection->attachEventHandler('onPong', $answered);
 		try {
-			while (($message = $connection->receiveMessage()) !== null) {
+			while (!$connection->getIsClosed()) {
+				$message = $connection->receiveMessage();
+				if ($message === null) {
+					if (!$connection->getReadTimedOut() || $connection->getIsClosing()) {
+						break;   // the stream ended, the peer closed, no frame is available, or the peer's Close is overdue
+					}
+					if ($pinged) {
+						$connection->close(TWebSocketCloseCode::GoingAway);   // the peer answered neither the Ping nor anything else
+						break;
+					}
+					$connection->ping();
+					$pinged = true;
+					continue;
+				}
+				$pinged = false;
 				if ($connection->getIsCloseInitiator()) {
 					continue;   // this side closed the connection: read on for the peer's Close, dispatching nothing
 				}
@@ -57,6 +83,8 @@ trait TWebSocketHandlerTrait
 					Prado::log('WebSocket Close could not be written after an error: ' . $inner->getMessage(), TLogger::NOTICE, static::class);
 				}
 			}
+		} finally {
+			$connection->detachEventHandler('onPong', $answered);
 		}
 		$this->onClose($connection);
 	}

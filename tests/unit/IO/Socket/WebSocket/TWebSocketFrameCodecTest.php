@@ -312,4 +312,24 @@ class TWebSocketFrameCodecTest extends TestCase
 		self::assertSame(4999, TWebSocketFrame::close(4999)->getCloseCode());
 		self::assertSame('', TWebSocketFrame::close(1000)->getCloseReason());
 	}
+
+	public function testCloseFactoryBoundsTheReasonAndRequiresUtf8()
+	{
+		$longest = str_repeat('é', 61) . 'x';                  // 123 bytes of valid UTF-8
+		$frame = TWebSocketFrame::close(TWebSocketCloseCode::Normal, $longest);
+		self::assertSame($longest, $frame->getCloseReason(), 'A 123-byte reason fits the 125-byte control payload with its code.');
+		self::assertSame(125, strlen(TWebSocketFrameCodec::encode($frame)) - 2);
+		try {
+			TWebSocketFrame::close(TWebSocketCloseCode::Normal, $longest . 'y');
+			self::fail('A 124-byte reason does not fit a control frame.');
+		} catch (TInvalidDataValueException $e) {
+			self::assertSame('websocket_close_reason_too_long', $e->getErrorCode());
+		}
+		try {
+			TWebSocketFrame::close(TWebSocketCloseCode::Normal, "bad \xc3\x28");
+			self::fail('A reason that is not UTF-8 is refused.');
+		} catch (TInvalidDataValueException $e) {
+			self::assertSame('websocket_close_reason_not_utf8', $e->getErrorCode());
+		}
+	}
 }

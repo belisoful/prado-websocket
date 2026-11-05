@@ -30,7 +30,8 @@ use Prado\TComponent;
  * | `client_max_window_bits` | bounds the client's DEFLATE window |
  *
  * As a server, {@see accept()} honors a client's requested limits, narrowing them no further than its
- * own configured policy, and echoes the agreed parameters.  An offer is declined (RFC 7692 §7.1) when
+ * own configured policy, and echoes the agreed parameters.  An offered `server_max_window_bits` is
+ * always echoed, even at 15, since that is how a server accepts it (§7.1.2.1).  An offer is declined (RFC 7692 §7.1) when
  * it carries an unknown parameter, a flag with a value, a `server_max_window_bits` without a value,
  * a window value that is not an integer 8-15, or a server window below what raw DEFLATE supports;
  * the next offer for the token is tried.  {@see TWebSocketHandshake::negotiateExtensions()} declines
@@ -42,7 +43,8 @@ use Prado\TComponent;
  * (§7.1.1.2, §7.1.2.2).  A response fails the handshake when it carries an unknown parameter, a
  * flag with a value, `client_max_window_bits` the client never offered or without a value, a
  * `server_max_window_bits` without a value or larger than the client requested, a client window
- * raw DEFLATE cannot produce, or omits a `server_no_context_takeover` the client offered.
+ * raw DEFLATE cannot produce, or omits a `server_no_context_takeover` or `server_max_window_bits`
+ * the client offered.
  *
  * The receive side always inflates with the maximum window, so a peer's `*_max_window_bits`
  * constrains only the matching send side.
@@ -172,15 +174,16 @@ class TPermessageDeflateNegotiator extends TComponent implements IWebSocketExten
 		}
 
 		$serverBits = $this->_serverMaxWindowBits;
-		if (array_key_exists(self::PARAM_SERVER_MAX_WINDOW_BITS, $offer)) {
+		$offeredServerBits = array_key_exists(self::PARAM_SERVER_MAX_WINDOW_BITS, $offer);
+		if ($offeredServerBits) {
 			$requested = self::parseWindowBits($offer[self::PARAM_SERVER_MAX_WINDOW_BITS]);   // null for a bare or invalid value
 			if ($requested === null || $requested < TPermessageDeflateExtension::MIN_WINDOW_BITS) {
 				return null;   // malformed, or a window we cannot deflate within; try the next offer
 			}
 			$serverBits = min($serverBits ?? TPermessageDeflateExtension::MAX_WINDOW_BITS, $requested);
 		}
-		if ($serverBits !== null && $serverBits < TPermessageDeflateExtension::MAX_WINDOW_BITS) {
-			$response[self::PARAM_SERVER_MAX_WINDOW_BITS] = (string) $serverBits;
+		if ($serverBits !== null && ($offeredServerBits || $serverBits < TPermessageDeflateExtension::MAX_WINDOW_BITS)) {
+			$response[self::PARAM_SERVER_MAX_WINDOW_BITS] = (string) $serverBits;   // §7.1.2.1: an offered parameter is accepted by echoing it, 15 included
 		}
 
 		if (array_key_exists(self::PARAM_CLIENT_MAX_WINDOW_BITS, $offer)) {
@@ -223,7 +226,8 @@ class TPermessageDeflateNegotiator extends TComponent implements IWebSocketExten
 	/**
 	 * Client side: builds the configured extension from the server's accepted parameters.  The
 	 * client's own offered `client_no_context_takeover` and `client_max_window_bits` apply whether or
-	 * not the server echoes them.
+	 * not the server echoes them.  An offered `server_no_context_takeover` or `server_max_window_bits`
+	 * must be echoed, since the server accepts each only by including it (RFC 7692 §7.1.1.1, §7.1.2.1).
 	 * @param array<string, bool|string> $params The parameters the server accepted.
 	 * @return ?IWebSocketExtension The extension, or null when the response must fail the handshake.
 	 */
@@ -254,6 +258,8 @@ class TPermessageDeflateNegotiator extends TComponent implements IWebSocketExten
 			if ($bits === null || ($this->_serverMaxWindowBits !== null && $bits > $this->_serverMaxWindowBits)) {
 				return null;   // §7.1.2.1: the server may not widen the window the client requested
 			}
+		} elseif ($this->_serverMaxWindowBits !== null) {
+			return null;   // §7.1.2.1: the server accepts an offered server_max_window_bits only by echoing it
 		}
 		return new TPermessageDeflateExtension($deflateWindow, $clientNoTakeover, $serverNoTakeover, $this->_level);
 	}

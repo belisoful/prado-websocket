@@ -3,6 +3,7 @@
 namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketExtension;
 use Prado\IO\Socket\WebSocket\IWebSocketExtensionNegotiator;
@@ -99,6 +100,73 @@ class TWebSocketNegotiationTest extends TestCase
 		[, $error, $response] = $this->accept($this->request(['Sec-WebSocket-Key' => 'too-short']));
 		self::assertInstanceOf(TWebSocketException::class, $error);
 		self::assertStringContainsString('400', $response, 'A key that does not decode to 16 bytes is refused.');
+	}
+
+	/** @return array<string, array{0: string}> Request heads that break an RFC 7230 rule a server answers with 400. */
+	public static function malformedHeads(): array
+	{
+		$head = "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+			. 'Sec-WebSocket-Key: ' . self::KEY . "\r\nSec-WebSocket-Version: 13\r\n";
+		return [
+			'two Host fields' => [$head . "Host: other.example.com\r\n\r\n"],
+			'whitespace before the colon' => [$head . "X-Note : 1\r\n\r\n"],
+			'obs-fold' => [$head . "X-Note: one\r\n two\r\n\r\n"],
+			'obs-fold with a tab' => [$head . "X-Note: one\r\n\ttwo\r\n\r\n"],
+			'Transfer-Encoding' => [$head . "Transfer-Encoding: chunked\r\n\r\n"],
+			'Content-Length' => [$head . "Content-Length: 5\r\n\r\n"],
+		];
+	}
+
+	/** @dataProvider malformedHeads */
+	public function testAMalformedHeadIsRejectedWith400(string $request)
+	{
+		[, $error, $response] = $this->accept($request);
+		self::assertInstanceOf(TWebSocketException::class, $error);
+		self::assertSame('websocket_handshake_not_upgrade', $error->getErrorCode());
+		self::assertStringStartsWith('HTTP/1.1 400', $response);
+	}
+
+	public function testParseHttpMessageReportsAMalformedHead()
+	{
+		self::assertFalse(TWebSocketHandshake::parseHttpMessage($this->request())['malformed'], 'A well-formed head is not malformed.');
+		self::assertTrue(TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a\r\nhost: b\r\n\r\n")['malformed'], 'A second Host in any case is malformed.');
+		self::assertTrue(TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost\t: a\r\n\r\n")['malformed'], 'A tab before the colon is malformed.');
+		$repeated = TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nConnection: Upgrade\r\n\r\n");
+		self::assertFalse($repeated['malformed'], 'Another field may repeat.');
+		self::assertSame('keep-alive, Upgrade', $repeated['headers']['connection']);
+	}
+
+	public function testAZeroContentLengthIsAccepted()
+	{
+		[, $error, $response] = $this->accept($this->request(['Content-Length' => '0']));
+		self::assertNull($error, 'An upgrade that declares an empty body is unambiguous.');
+		self::assertStringContainsString('101 Switching Protocols', $response);
+		self::assertNull(TWebSocketHandshake::upgradeError(['method' => 'GET', 'protocol' => 'HTTP/1.1', 'headers' => TWebSocketHandshake::parseHttpMessage($this->request())['headers']]), 'A request without the malformed key is validated as before.');
+	}
+
+	public function testBuildersRefuseCrLfAndNulInCallerValues()
+	{
+		$key = TWebSocketHandshake::generateKey();
+		$cases = [
+			'host' => fn () => TWebSocketHandshake::buildClientRequest("example.com\r\nX-Evil: 1", '/', $key),
+			'path' => fn () => TWebSocketHandshake::buildClientRequest('example.com', "/\r\nX-Evil: 1", $key),
+			'key' => fn () => TWebSocketHandshake::buildClientRequest('example.com', '/', "k\n"),
+			'request header value' => fn () => TWebSocketHandshake::buildClientRequest('example.com', '/', $key, ['X-Token' => "a\nb"]),
+			'request header name' => fn () => TWebSocketHandshake::buildClientRequest('example.com', '/', $key, ["X-A\r\nX-B" => 'v']),
+			'request NUL' => fn () => TWebSocketHandshake::buildClientRequest('example.com', '/', $key, ['X-Token' => "a\0b"]),
+			'response header value' => fn () => TWebSocketHandshake::buildServerResponse(self::KEY, ['X-Token' => "a\r\nSet-Cookie: s=1"]),
+			'response key' => fn () => TWebSocketHandshake::buildServerResponse("k\r\n"),
+			'rejection reason' => fn () => TWebSocketHandshake::buildRejection(400, "Bad\r\nX-Evil: 1"),
+		];
+		foreach ($cases as $label => $build) {
+			try {
+				$build();
+				self::fail("A CR, LF or NUL in the {$label} is refused.");
+			} catch (TInvalidDataValueException $e) {
+				self::assertSame('websocket_http_field_invalid', $e->getErrorCode(), $label);
+			}
+		}
+		self::assertStringContainsString('X-Token: a b', TWebSocketHandshake::buildClientRequest('example.com', '/', $key, ['X-Token' => 'a b']), 'Ordinary values are written unchanged.');
 	}
 
 	public function testHttpVersionPredicate()
@@ -250,6 +318,8 @@ class TWebSocketNegotiationTest extends TestCase
 		self::assertTrue(TWebSocketHandshake::isHostAllowed(['host' => 'a.example.com'], ['a.example.com']));
 		self::assertFalse(TWebSocketHandshake::isHostAllowed(['host' => 'b.example.com'], ['a.example.com']));
 		self::assertFalse(TWebSocketHandshake::isHostAllowed([], ['a.example.com']), 'With an allowlist set, a missing Host is refused.');
+		self::assertTrue(TWebSocketHandshake::isHostAllowed(['host' => 'A.Example.COM'], ['a.example.com']), 'A host name compares without regard to case.');
+		self::assertTrue(TWebSocketHandshake::isHostAllowed(['host' => 'a.example.com:8080'], ['A.EXAMPLE.com:8080']), 'The allowlist entry compares without regard to case too.');
 	}
 
 	// ---- URL parsing ----------------------------------------------------------
