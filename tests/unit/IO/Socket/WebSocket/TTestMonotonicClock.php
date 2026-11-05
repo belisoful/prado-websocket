@@ -6,8 +6,8 @@ use Prado\Util\Clock\TMonotonicClock;
 
 /**
  * A {@see TMonotonicClock} that moves only when a test sets or advances it, as PRADO's own test
- * harness clock does. A test gives it to a reactor through `setMonotonicClock()` to drive the
- * reactor's timers and the server deadlines read on them.
+ * harness clock does. A test gives it to a server (or a reactor) through `setMonotonicClock()` to
+ * drive the server's timeouts and the reactor timers that enforce them.
  */
 class TTestMonotonicClock extends TMonotonicClock
 {

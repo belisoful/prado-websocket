@@ -1070,7 +1070,7 @@ class TWebSocketServerTest extends TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$clock = new TTestMonotonicClock(1000);
-		$server->getReactor()->setMonotonicClock($clock);
+		$server->setMonotonicClock($clock);
 		$server->setIdleTimeout(2);
 		$server->setCloseTimeout(5);
 		self::assertSame(5.0, $server->getCloseTimeout());
@@ -1486,7 +1486,7 @@ class TWebSocketServerTest extends TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$clock = new TTestMonotonicClock(1000);
-		$server->getReactor()->setMonotonicClock($clock);
+		$server->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
 		$opened = 0;
 		$handler = new TWebSocketHandler();
@@ -1663,7 +1663,7 @@ class TWebSocketServerTest extends TestCase
 		$wall->setMicrotime(1000.0);
 		$server->setClock($wall);
 		$clock = new TTestMonotonicClock();
-		$server->getReactor()->setMonotonicClock($clock);
+		$server->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
 
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
@@ -1677,7 +1677,34 @@ class TWebSocketServerTest extends TestCase
 		$wall->setMicrotime(1000.0 - 3600);   // then an hour back, before the session was accepted
 		$clock->advance(6);
 		$server->serveOnce(0, 10000);
-		self::assertSame(0, $server->getConnectionCount(), 'A backward step does not postpone it: the deadline passes on the reactor\'s monotonic clock.');
+		self::assertSame(0, $server->getConnectionCount(), 'A backward step does not postpone it: the deadline passes on the server\'s monotonic clock.');
+		$silent->close();
+		$server->close();
+	}
+
+	public function testADeadlineTimerThatFiresBeforeTheServerClockIsRearmed()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$clock = new TTestMonotonicClock(1000);
+		$server->setMonotonicClock($clock);
+		$server->setHandshakeTimeout(5);
+		$reactorClock = new TTestMonotonicClock();   // the reactor counts delays on its own time base
+		$reactor = new TSocketReactor();
+		$reactor->setMonotonicClock($reactorClock);
+		$server->setReactor($reactor);
+
+		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$server->serveOnce(0, 100000);
+		self::assertSame(1, $server->getConnectionCount(), 'The silent peer is pending.');
+
+		$reactorClock->setSeconds(6.0);   // the timer fires, but the server's clock has not reached the deadline
+		$server->serveOnce(0, 10000);
+		self::assertSame(1, $server->getConnectionCount(), 'A deadline the server clock has not reached keeps the session.');
+
+		$clock->setSeconds(1006.0);
+		$reactorClock->setSeconds(12.0);   // the re-armed timer fires
+		$server->serveOnce(0, 10000);
+		self::assertSame(0, $server->getConnectionCount(), 'The re-armed deadline drops the silent peer.');
 		$silent->close();
 		$server->close();
 	}
@@ -1705,7 +1732,7 @@ class TWebSocketServerTest extends TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$clock = new TTestMonotonicClock(1000);
-		$server->getReactor()->setMonotonicClock($clock);
+		$server->setMonotonicClock($clock);
 		$server->setHandshakeTimeout(5);
 
 		$silent = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
@@ -1891,7 +1918,7 @@ class TWebSocketServerTest extends TestCase
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
 		$clock = new TTestMonotonicClock(1000);
-		$server->getReactor()->setMonotonicClock($clock);
+		$server->setMonotonicClock($clock);
 		$server->setIdleTimeout(10);
 		$closed = 0;
 		$handler = new TWebSocketHandler();

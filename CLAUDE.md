@@ -14,7 +14,7 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 - Classes live under `Prado\IO\Socket\WebSocket\` (PSR-4 `Prado\` → `src/`). This extension does **not** update the framework's `classes.php`; Prado3 short names come from `config/classMap.json`.
 - Error codes (keys) and messages live in `config/errorMessages.txt`. Both it and the class map are registered by **Composer** from `composer.json` `extra.prado` — not by `TWebSocketModule`. Messages are ICU MessageFormat patterns: quote a placeholder as `''{0}''`, never `'{0}'`.
 - Unit tests are namespaced `Prado\Test\Unit\…` mirroring `tests/unit/` (Composer `autoload-dev`).
-- Time is read through PRADO's clock seam (`TApplicationClockAwareTrait`, `$this->getClock()`); tests inject `TMockClock`. Server timeouts run on the reactor's monotonic clock (`TSocketReactor::now()`); tests set `TTestMonotonicClock` with `getReactor()->setMonotonicClock()`.
+- Time is read through PRADO's clock seam (`TApplicationClockAwareTrait`, `$this->getClock()`); tests inject `TMockClock`. Durations and timeouts use `TMonotonicClockAwareTrait` (`$this->getMonotonicClock()->seconds()`); tests set `TTestMonotonicClock` with `setMonotonicClock()`.
 - The public API is published (v1.0.0 onward). Prefer compatible changes. A breaking change needs an entry under "Upgrading" in `CHANGELOG.md`.
 
 ## Checks (all must pass before commit)

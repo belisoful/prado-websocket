@@ -21,6 +21,7 @@ use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBufferedBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\Prado;
 use Prado\Util\Clock\TApplicationClockAwareTrait;
+use Prado\Util\Clock\TMonotonicClockAwareTrait;
 use Prado\Util\Log\TLogger;
 use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
@@ -57,11 +58,12 @@ use Psr\Http\Message\StreamInterface;
  * connection, or the idle reaper gave up on it) keeps its transport until the Close frame has
  * drained and the peer's Close arrives, and at most for {@see getCloseTimeout() CloseTimeout}.
  *
- * The handshake, close, and idle timeouts are measured on the {@see getReactor() reactor}'s
- * monotonic clock ({@see \Prado\IO\Socket\TSocketReactor::getMonotonicClock()}), so a wall-clock
- * change neither lengthens nor shortens them; a test advances them by setting the reactor a
- * {@see \Prado\Util\Clock\TMonotonicClock} subclass.  The server's {@see getClock() Clock} does
- * not move them.
+ * The handshake, close, and idle timeouts are measured on the server's
+ * {@see getMonotonicClock() MonotonicClock}, so a wall-clock change neither lengthens nor shortens
+ * them, and the server's {@see getClock() Clock} does not move them.  The default reactor shares
+ * that clock, so its timers agree with the deadlines they enforce; give a reactor set with
+ * {@see setReactor()} the same clock.  A test advances the timeouts with a
+ * {@see \Prado\Util\Clock\TMonotonicClock} subclass set before the reactor is created.
  *
  * {@see serveConnection()} handles one accepted connection synchronously (blocking) through the
  * configured {@see getProtocol() protocol stack} (HTTP/1.1 by default), useful for a one-shot
@@ -80,6 +82,7 @@ use Psr\Http\Message\StreamInterface;
 class TWebSocketServer extends TSocketServer
 {
 	use TApplicationClockAwareTrait;
+	use TMonotonicClockAwareTrait;
 
 	/** @var ?IWebSocketProtocol The protocol stack that maps connections to logical streams. */
 	private ?IWebSocketProtocol $_protocol = null;
@@ -570,22 +573,14 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Creates the default reactor.
+	 * Creates the default reactor, sharing the server's monotonic clock so timers and deadlines agree.
 	 * @return TSocketReactor The event loop.
 	 */
 	protected function createReactor(): TSocketReactor
 	{
-		return Prado::createComponent(TSocketReactor::class);
-	}
-
-	/**
-	 * Returns the current time on the reactor's monotonic clock, the base of every session deadline
-	 * and activity stamp, so the timers that enforce them agree and a wall-clock change moves none.
-	 * @return float The current time in seconds, from an arbitrary origin.
-	 */
-	private function now(): float
-	{
-		return $this->getReactor()->now();
+		$reactor = Prado::createComponent(TSocketReactor::class);
+		$reactor->setMonotonicClock($this->getMonotonicClock());
+		return $reactor;
 	}
 
 	/**
@@ -916,16 +911,17 @@ class TWebSocketServer extends TSocketServer
 	}
 
 	/**
-	 * Schedules a one-shot reactor timer for a session deadline.  The timer forgets itself as it
-	 * fires, and the scan it runs re-arms each deadline not reached yet.
+	 * Schedules a one-shot reactor timer for a session deadline read on the server's monotonic clock.
+	 * The reactor counts the delay on its own time base, so the timer forgets itself as it fires and
+	 * the scan it runs re-arms a deadline the server's clock has not reached yet.
 	 * @param int $id The session (transport object) id.
 	 * @param string $key The session key that holds the timer, `timer` or `closeTimer`.
-	 * @param float $when The deadline, on the reactor's clock ({@see now()}).
+	 * @param float $when The deadline, in {@see \Prado\Util\Clock\TMonotonicClock::seconds()}.
 	 * @param callable $scan The scan the timer runs.
 	 */
 	private function scheduleSessionTimer(int $id, string $key, float $when, callable $scan): void
 	{
-		$delay = max(0.0, $when - $this->now());
+		$delay = max(0.0, $when - $this->getMonotonicClock()->seconds());
 		$this->_sessions[$id][$key] = $this->getReactor()->delay($delay, function () use ($id, $key, $scan): void {
 			unset($this->_sessions[$id][$key]);
 			$scan();
@@ -969,7 +965,7 @@ class TWebSocketServer extends TSocketServer
 	 */
 	protected function reapStaleHandshakes(): void
 	{
-		$now = $this->now();
+		$now = $this->getMonotonicClock()->seconds();
 		foreach ($this->_sessions as $id => $session) {
 			if (isset($session['deadline']) && $now >= $session['deadline']) {
 				$this->log('Handshake deadline passed; the pending connection is dropped.', TLogger::NOTICE);
@@ -997,7 +993,7 @@ class TWebSocketServer extends TSocketServer
 		if ($this->_closeTimeout <= 0) {
 			return;
 		}
-		$now = $this->now();
+		$now = $this->getMonotonicClock()->seconds();
 		foreach (array_column($this->_sessions, 'transport') as $transport) {
 			$id = spl_object_id($transport);
 			$session = $this->_sessions[$id] ?? null;
@@ -1037,7 +1033,7 @@ class TWebSocketServer extends TSocketServer
 		if ($this->_idleTimeout <= 0) {
 			return;
 		}
-		$now = $this->now();
+		$now = $this->getMonotonicClock()->seconds();
 		foreach (array_column($this->_sessions, 'transport') as $transport) {
 			$id = spl_object_id($transport);
 			$session = $this->_sessions[$id] ?? null;
@@ -1079,7 +1075,7 @@ class TWebSocketServer extends TSocketServer
 	 * session's `closing` deadline is the earliest pending one, so its timer runs this scan again.
 	 * @param TSocketStream $transport The session transport.
 	 * @param array<string, mixed> $session The session record.
-	 * @param float $now The current time on the reactor's clock, {@see now()}.
+	 * @param float $now The current time on the server's monotonic clock.
 	 */
 	private function reapClosingHttp2Streams(TSocketStream $transport, array $session, float $now): void
 	{
@@ -1123,7 +1119,7 @@ class TWebSocketServer extends TSocketServer
 	 * acknowledgement included.
 	 * @param TSocketStream $transport The session transport.
 	 * @param array<string, mixed> $session The session record.
-	 * @param float $now The current time on the reactor's clock, {@see now()}.
+	 * @param float $now The current time on the server's monotonic clock.
 	 */
 	private function reapIdleHttp2Session(TSocketStream $transport, array $session, float $now): void
 	{
@@ -1241,7 +1237,7 @@ class TWebSocketServer extends TSocketServer
 			$session['crypto'] = true;   // the TLS handshake is driven by the pump, under the same deadline
 		}
 		if ($this->_handshakeTimeout > 0) {
-			$session['deadline'] = $this->now() + $this->_handshakeTimeout;
+			$session['deadline'] = $this->getMonotonicClock()->seconds() + $this->_handshakeTimeout;
 		}
 		$this->trackSession($transport, $session);
 		try {
@@ -1439,7 +1435,7 @@ class TWebSocketServer extends TSocketServer
 		$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
-		$this->trackSession($transport, ['transport' => $transport, 'connection' => $connection, 'active' => $this->now()]);
+		$this->trackSession($transport, ['transport' => $transport, 'connection' => $connection, 'active' => $this->getMonotonicClock()->seconds()]);
 		$this->activateConnection($transport, $connection);
 		if ($initial !== '' && isset($this->_sessions[spl_object_id($transport)])) {
 			$this->handleHttp1Bytes($transport, $connection, $initial);   // frames sent on the heels of the request
@@ -1490,7 +1486,7 @@ class TWebSocketServer extends TSocketServer
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->settleHttp2Handshake($transport));
 		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
-		$session = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '', 'active' => $this->now()];
+		$session = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '', 'active' => $this->getMonotonicClock()->seconds()];
 		if ($this->_handshakeTimeout > 0) {
 			$session['deadline'] = $session['active'] + $this->_handshakeTimeout;   // until its first WebSocket stream opens
 		}
@@ -1534,7 +1530,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		$transport->setBlocking(false);
 		$this->addConnection($transport);
-		$this->trackSession($transport, ['transport' => $transport, 'connection' => $connection, 'active' => $this->now()]);
+		$this->trackSession($transport, ['transport' => $transport, 'connection' => $connection, 'active' => $this->getMonotonicClock()->seconds()]);
 		$this->activateConnection($transport, $connection);
 	}
 
@@ -1760,7 +1756,7 @@ class TWebSocketServer extends TSocketServer
 	protected function handleHttp1Bytes(TSocketStream $transport, TWebSocketConnection $connection, string $bytes): void
 	{
 		if ($bytes !== '' && isset($this->_sessions[spl_object_id($transport)])) {
-			$this->_sessions[spl_object_id($transport)]['active'] = $this->now();   // any inbound frame (a Pong included) keeps the session alive
+			$this->_sessions[spl_object_id($transport)]['active'] = $this->getMonotonicClock()->seconds();   // any inbound frame (a Pong included) keeps the session alive
 			unset($this->_sessions[spl_object_id($transport)]['pinged']);
 		}
 		try {
@@ -1825,7 +1821,7 @@ class TWebSocketServer extends TSocketServer
 		}
 		if ($bytes !== '') {
 			$id = spl_object_id($transport);
-			$this->_sessions[$id]['active'] = $this->now();   // any inbound frame (a PING ACK included) keeps the session alive
+			$this->_sessions[$id]['active'] = $this->getMonotonicClock()->seconds();   // any inbound frame (a PING ACK included) keeps the session alive
 			unset($this->_sessions[$id]['pinged']);
 		}
 		$this->feedHttp2Session($transport, $protocol, $bytes);

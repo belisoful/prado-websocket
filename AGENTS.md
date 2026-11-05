@@ -115,7 +115,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - UI Portlets are PHP classes with a ".tpl" TTemplate file with the same base name
 - Data components should support `TActiveRecord` pattern
 - All UI controls should have proper template support and state management
-- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to `TNativeClock`. `TWebSocketServer` measures its handshake, close and idle timeouts on its reactor's monotonic clock (`TSocketReactor::now()`), so the reactor's timers and the deadlines they enforce share one base; tests drive them with a `TMonotonicClock` subclass set through `getReactor()->setMonotonicClock()` (`tests/unit/IO/Socket/WebSocket/TTestMonotonicClock.php`).
+- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to `TNativeClock`. Durations, deadlines and timeouts measured within one process use PRADO's `\Prado\Util\Clock\TMonotonicClockAwareTrait` (`$this->getMonotonicClock()->seconds()`), so a wall-clock change does not move them: `TWebSocketServer` measures its handshake, close and idle timeouts this way and shares the clock with the reactor it creates. Tests set `tests/unit/IO/Socket/WebSocket/TTestMonotonicClock.php` with `setMonotonicClock()`.
 - Logging goes through `Prado::log()` with `\Prado\Util\Log\TLogger` levels (the logger moved to `Prado\Util\Log` in PRADO 4.4).
 - The public API is published (v1.0.0 onward): prefer compatible changes, and document any breaking change under "Upgrading" in `CHANGELOG.md`
 - Record every user-visible change under `## [Unreleased]` in `CHANGELOG.md` (Keep a Changelog format) as it lands
@@ -139,7 +139,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - Unit test functions must comprehensively assert both typical and edge cases
 - Maximal coverage of code execution paths of a class is required
 - Test error conditions and exception handling
-- Use mock objects where appropriate; inject `TMockClock` (or, for server timeouts, `TTestMonotonicClock` on the reactor) instead of sleeping when a test depends on elapsed time
+- Use mock objects where appropriate; inject `TMockClock` (or `TTestMonotonicClock` for a monotonic clock) instead of sleeping when a test depends on elapsed time
 - Functional tests should verify complete user workflows
 - Tests should be isolated from each other (no shared state); bind sockets to `127.0.0.1:0` so the OS picks a free port
 - When unit testing one or cluster of classes, only run the unit tests for that class or cluster/directory.
