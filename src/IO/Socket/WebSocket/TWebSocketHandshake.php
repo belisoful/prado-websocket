@@ -10,8 +10,10 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Exceptions\TInvalidDataValueException;
+use Prado\IO\TResource;
 use Prado\Util\Clock\IClock;
-use Prado\Util\Clock\TNativeClock;
+use Prado\Util\Clock\TMonotonicClock;
 use Prado\Web\THttpHeaderName;
 use Psr\Http\Message\StreamInterface;
 
@@ -27,6 +29,10 @@ use Psr\Http\Message\StreamInterface;
  *
  * The accept key is `base64(sha1(Sec-WebSocket-Key . GUID))`, where the GUID is the fixed
  * RFC 6455 value.
+ *
+ * The builders refuse a caller-supplied host, path, header name or value, or reason phrase that
+ * holds a CR, LF or NUL, so no value can end a line and inject a header.  A transport failure while
+ * the stream functions read or write the head throws a {@see TWebSocketException}.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @see https://www.rfc-editor.org/rfc/rfc6455.html#section-4
@@ -107,8 +113,14 @@ class TWebSocketHandshake
 	 * that repeats is combined into one value joined with `, ` (RFC 7230 §3.2.2), so a
 	 * `Sec-WebSocket-Protocol`, `Sec-WebSocket-Extensions`, or `Connection` split across lines
 	 * reads as its full list.
+	 *
+	 * `malformed` is true when the head breaks an RFC 7230 rule a server answers with 400, and
+	 * {@see upgradeError()} refuses such a request:
+	 *  - whitespace between a field name and its colon (§3.2.4).
+	 *  - an obs-fold continuation line, one that starts with a space or tab (§3.2.4).
+	 *  - a second `Host` field (§5.4).
 	 * @param string $data The HTTP head (and optional body) text.
-	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string}
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, malformed: bool}
 	 *   The parsed message; header keys are lower-cased.
 	 */
 	public static function parseHttpMessage(string $data): array
@@ -129,6 +141,7 @@ class TWebSocketHandshake
 			'statusCode' => null,
 			'headers' => [],
 			'body' => $body,
+			'malformed' => false,
 		];
 		if (str_starts_with($first, 'HTTP/')) {
 			$result['protocol'] = $parts[0] ?? '';
@@ -138,13 +151,24 @@ class TWebSocketHandshake
 			$result['target'] = $parts[1] ?? null;
 			$result['protocol'] = $parts[2] ?? '';
 		}
+		$host = strtolower(THttpHeaderName::Host);
 		foreach ($lines as $line) {
+			if ($line !== '' && ($line[0] === ' ' || $line[0] === "\t")) {
+				$result['malformed'] = true;   // obs-fold
+				continue;
+			}
 			if ($line === '' || !str_contains($line, ':')) {
 				continue;
 			}
 			[$name, $value] = explode(':', $line, 2);
+			if ($name !== rtrim($name)) {
+				$result['malformed'] = true;   // whitespace before the colon
+			}
 			$name = strtolower(trim($name));
 			$value = trim($value);
+			if ($name === $host && isset($result['headers'][$name])) {
+				$result['malformed'] = true;   // a second Host
+			}
 			$result['headers'][$name] = isset($result['headers'][$name]) ? $result['headers'][$name] . ', ' . $value : $value;
 		}
 		return $result;
@@ -180,16 +204,21 @@ class TWebSocketHandshake
 
 	/**
 	 * Validates a parsed request as a WebSocket upgrade, returning the HTTP rejection to send when it
-	 * is not.  A request that is not an HTTP/1.1-or-higher `GET`, omits `Host`, or is not an
-	 * `Upgrade: websocket` with a valid key is a `400`; a request whose `Sec-WebSocket-Version` is not
-	 * exactly the token `13` is a `426` advertising the supported version.
-	 * @param array{method: ?string, protocol?: string, headers: array<string, string>} $request The parsed request.
+	 * is not.  The result:
+	 *  - a {@see parseHttpMessage() malformed} head, or a request that is not an HTTP/1.1-or-higher
+	 *    `GET` → `400`.
+	 *  - a request that omits `Host`, or is not an `Upgrade: websocket` with a valid key → `400`.
+	 *  - a request with a `Transfer-Encoding`, or a `Content-Length` other than `0` → `400`: an upgrade
+	 *    has no body, and the bytes behind its head are WebSocket frames.
+	 *  - a `Sec-WebSocket-Version` that is not exactly the token `13` → `426` advertising the
+	 *    supported version.
+	 * @param array{method: ?string, protocol?: string, headers: array<string, string>, malformed?: bool} $request The parsed request.
 	 * @return ?string The rejection response to write, or null when the request is a valid upgrade.
 	 */
 	public static function upgradeError(array $request): ?string
 	{
 		$headers = $request['headers'];
-		if (strtoupper((string) ($request['method'] ?? '')) !== 'GET') {
+		if (!empty($request['malformed']) || strtoupper((string) ($request['method'] ?? '')) !== 'GET') {
 			return self::buildRejection(400, 'Bad Request');
 		}
 		if (!self::isHttpVersionAtLeast11($request['protocol'] ?? '')) {
@@ -199,6 +228,9 @@ class TWebSocketHandshake
 			return self::buildRejection(400, 'Bad Request');
 		}
 		if (!self::isUpgradeRequest($headers)) {
+			return self::buildRejection(400, 'Bad Request');
+		}
+		if (isset($headers[strtolower(THttpHeaderName::TransferEncoding)]) || trim($headers[strtolower(THttpHeaderName::ContentLength)] ?? '0') !== '0') {
 			return self::buildRejection(400, 'Bad Request');
 		}
 		if (!self::isSupportedVersion($headers[strtolower(THttpHeaderName::SecWebSocketVersion)] ?? null)) {
@@ -253,6 +285,7 @@ class TWebSocketHandshake
 	/**
 	 * Indicates whether a request's `Host` authority is allowed by the configured allowlist.  A null
 	 * or empty allowlist permits any host; otherwise the request must carry a `Host` the list contains.
+	 * The comparison ignores ASCII case, since a host name is case-insensitive (RFC 3986 §3.2.2).
 	 * @param array<string, string> $headers The lower-cased request headers.
 	 * @param ?string[] $allowed The allowed hosts, or null to allow any.
 	 * @return bool Whether the host is allowed.
@@ -263,7 +296,7 @@ class TWebSocketHandshake
 			return true;
 		}
 		$host = $headers[strtolower(THttpHeaderName::Host)] ?? null;
-		return $host !== null && in_array($host, $allowed, true);
+		return $host !== null && in_array(strtolower($host), array_map('strtolower', $allowed), true);
 	}
 
 	/**
@@ -481,10 +514,13 @@ class TWebSocketHandshake
 	 * Builds the 101 Switching Protocols response for a client key.
 	 * @param string $key The client's Sec-WebSocket-Key.
 	 * @param array<string, string> $extraHeaders Extra response headers (e.g. Sec-WebSocket-Protocol).
+	 * @throws TInvalidDataValueException When the key or a header name or value holds a CR, LF or NUL.
 	 * @return string The response head.
 	 */
 	public static function buildServerResponse(string $key, array $extraHeaders = []): string
 	{
+		self::assertFieldSafe(THttpHeaderName::SecWebSocketKey, $key);
+		self::assertHeadersSafe($extraHeaders);
 		$headers = [
 			THttpHeaderName::Upgrade => 'websocket',
 			THttpHeaderName::Connection => 'Upgrade',
@@ -503,10 +539,15 @@ class TWebSocketHandshake
 	 * @param string $path The request target. Default '/'.
 	 * @param string $key The Sec-WebSocket-Key.
 	 * @param array<string, string> $extraHeaders Extra request headers.
+	 * @throws TInvalidDataValueException When the host, path, key, or a header name or value holds a CR, LF or NUL.
 	 * @return string The request head.
 	 */
 	public static function buildClientRequest(string $host, string $path, string $key, array $extraHeaders = []): string
 	{
+		self::assertFieldSafe(THttpHeaderName::Host, $host);
+		self::assertFieldSafe('path', $path);
+		self::assertFieldSafe(THttpHeaderName::SecWebSocketKey, $key);
+		self::assertHeadersSafe($extraHeaders);
 		$headers = [
 			THttpHeaderName::Host => $host,
 			THttpHeaderName::Upgrade => 'websocket',
@@ -538,34 +579,114 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Reads the HTTP handshake head (through the blank line) from a stream.  A total read deadline,
-	 * measured on the given clock, bounds how long a slow or dribbling peer can hold the read, so it
-	 * cannot stall a serve loop.
+	 * Reads the HTTP handshake head (through the blank line) from a stream.  A total read deadline
+	 * bounds how long a slow, dribbling or silent peer can hold the read, so it cannot stall a serve
+	 * loop.  The deadline is checked before each read, and a resource-backed stream gets the time
+	 * remaining as its read timeout, so a blocking read on a silent peer ends at the deadline too.
+	 * The stream's read timeout returns to `default_socket_timeout` afterward.
+	 *
+	 * The deadline is measured on the given clock: a {@see TMonotonicClock} (the default), which a
+	 * wall-clock change does not move, or an {@see IClock}.
 	 * @param StreamInterface $stream The transport stream.
 	 * @param ?float $timeout The total seconds to read the head, or null for no deadline.
-	 * @param ?IClock $clock The clock the deadline is measured on; the real clock when null.
-	 * @throws TWebSocketException When the head exceeds the limit, the deadline passes, or the stream ends first.
+	 * @param null|IClock|TMonotonicClock $clock The clock the deadline is measured on; a {@see TMonotonicClock} when null.
+	 * @throws TWebSocketException When the head exceeds the limit, the deadline passes, the stream ends
+	 *   first, or the read fails.
 	 * @return string The handshake head, including the terminating blank line.
 	 */
-	public static function readHandshake(StreamInterface $stream, ?float $timeout = null, ?IClock $clock = null): string
+	public static function readHandshake(StreamInterface $stream, ?float $timeout = null, IClock|TMonotonicClock|null $clock = null): string
 	{
-		$clock ??= new TNativeClock();
-		$deadline = ($timeout !== null && $timeout > 0) ? $clock->microtime() + $timeout : null;
+		$clock ??= new TMonotonicClock();
+		$deadline = ($timeout !== null && $timeout > 0) ? self::clockSeconds($clock) + $timeout : null;
+		$bounded = $deadline !== null && $stream instanceof TResource;
 		$data = '';
-		while (!str_ends_with($data, "\r\n\r\n")) {   // one byte is appended per pass, so the blank line can only complete at the tail
-			if (strlen($data) >= self::MAX_HANDSHAKE_BYTES) {
-				throw new TWebSocketException('websocket_handshake_too_large', self::MAX_HANDSHAKE_BYTES);
+		try {
+			while (!str_ends_with($data, "\r\n\r\n")) {   // one byte is appended per pass, so the blank line can only complete at the tail
+				if (strlen($data) >= self::MAX_HANDSHAKE_BYTES) {
+					throw new TWebSocketException('websocket_handshake_too_large', self::MAX_HANDSHAKE_BYTES);
+				}
+				if ($deadline !== null) {
+					$remaining = $deadline - self::clockSeconds($clock);
+					if ($remaining <= 0) {
+						throw new TWebSocketException('websocket_handshake_incomplete');   // a slow/dribbling peer past the deadline
+					}
+					if ($bounded) {
+						$stream->setTimeout((int) $remaining, (int) (($remaining - (int) $remaining) * 1000000));
+					}
+				}
+				$byte = self::readByte($stream);
+				if ($byte === '') {
+					throw new TWebSocketException('websocket_handshake_incomplete');
+				}
+				$data .= $byte;
 			}
-			if ($deadline !== null && $clock->microtime() >= $deadline) {
-				throw new TWebSocketException('websocket_handshake_incomplete');   // a slow/dribbling peer past the deadline
+		} finally {
+			if ($bounded) {
+				$stream->setTimeout((int) ini_get('default_socket_timeout'));
 			}
-			$byte = $stream->eof() ? '' : $stream->read(1);
-			if ($byte === '') {
-				throw new TWebSocketException('websocket_handshake_incomplete');
-			}
-			$data .= $byte;
 		}
 		return $data;
+	}
+
+	/**
+	 * Reads one byte of the handshake head.  The stream's end, its read timeout, and a failed read
+	 * (a reset peer) all read as no byte.
+	 * @param StreamInterface $stream The transport stream.
+	 * @return string The byte, or '' when none was read.
+	 */
+	private static function readByte(StreamInterface $stream): string
+	{
+		if ($stream->eof()) {
+			return '';
+		}
+		try {
+			return $stream->read(1);
+		} catch (\Exception $e) {
+			// A timed-out blocking read or a broken transport: a \RuntimeException from the stream, or the
+			// TPhpErrorException PRADO's error handler raises for an I/O notice.
+			return '';
+		}
+	}
+
+	/**
+	 * Returns the current reading of a deadline clock, in seconds.
+	 * @param IClock|TMonotonicClock $clock The clock.
+	 * @return float The reading in seconds.
+	 */
+	private static function clockSeconds(IClock|TMonotonicClock $clock): float
+	{
+		return $clock instanceof TMonotonicClock ? $clock->seconds() : $clock->microtime();
+	}
+
+	/**
+	 * Writes a handshake head to the stream.
+	 * @param StreamInterface $stream The transport stream.
+	 * @param string $head The head to write.
+	 * @throws TWebSocketException When the write fails (a broken pipe, a reset peer).
+	 */
+	private static function writeHead(StreamInterface $stream, string $head): void
+	{
+		try {
+			$stream->write($head);
+		} catch (\Exception $e) {
+			// A \RuntimeException from the stream, or the TPhpErrorException PRADO's error handler raises for EPIPE/ECONNRESET.
+			throw (new TWebSocketException('websocket_write_failed'))->setCloseCode(TWebSocketCloseCode::GoingAway);
+		}
+	}
+
+	/**
+	 * Writes an HTTP rejection before the handshake fails, ignoring a transport that can no longer
+	 * take it: the failure the caller throws next describes the handshake.
+	 * @param StreamInterface $stream The transport stream.
+	 * @param string $rejection The rejection head.
+	 */
+	private static function writeRejection(StreamInterface $stream, string $rejection): void
+	{
+		try {
+			$stream->write($rejection);
+		} catch (\Exception $e) {
+			// The peer is gone (a \RuntimeException, or PRADO's TPhpErrorException); the handshake fails all the same.
+		}
 	}
 
 	/**
@@ -575,11 +696,12 @@ class TWebSocketHandshake
 	 * When `origins` is set, the request's `Origin` must be in the list or the upgrade is refused with
 	 * a `403`.  An unset or empty `origins` allows any origin.  A `timeout` bounds the request read.
 	 * @param StreamInterface $stream The accepted transport stream.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>, timeout?: ?float, clock?: IClock} $options
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], origins?: string[], allowedHosts?: string[], headers?: array<string, string>, timeout?: ?float, clock?: IClock|TMonotonicClock} $options
 	 *   The supported subprotocols, extension negotiators, allowed origins and hosts, extra response
-	 *   headers, and the seconds allowed to read the request head (null or 0 for no deadline).
+	 *   headers, the seconds allowed to read the request head (null or 0 for no deadline), and the
+	 *   clock that deadline is measured on (see {@see readHandshake()}).
 	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade, is not read in time, or the origin is rejected.
-	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, subprotocol: ?string, extensions: IWebSocketExtension[]}
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, malformed: bool, subprotocol: ?string, extensions: IWebSocketExtension[]}
 	 *   The parsed request with the negotiated subprotocol and extensions.
 	 */
 	public static function acceptConnection(StreamInterface $stream, array $options = []): array
@@ -587,16 +709,16 @@ class TWebSocketHandshake
 		$request = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null, $options['clock'] ?? null));
 		$error = self::upgradeError($request);
 		if ($error !== null) {
-			$stream->write($error);
+			self::writeRejection($stream, $error);
 			throw new TWebSocketException('websocket_handshake_not_upgrade');
 		}
 		$headers = $request['headers'];
 		if (!self::isOriginAllowed($headers, $options['origins'] ?? null)) {
-			$stream->write(self::buildRejection(403, 'Forbidden'));
+			self::writeRejection($stream, self::buildRejection(403, 'Forbidden'));
 			throw new TWebSocketException('websocket_handshake_origin_rejected', $headers[strtolower(THttpHeaderName::Origin)] ?? '');
 		}
 		if (!self::isHostAllowed($headers, $options['allowedHosts'] ?? null)) {
-			$stream->write(self::buildRejection(400, 'Bad Request'));
+			self::writeRejection($stream, self::buildRejection(400, 'Bad Request'));
 			throw new TWebSocketException('websocket_handshake_not_upgrade');   // the Host is not one this server serves
 		}
 		$subprotocol = self::negotiateSubprotocol($headers, $options['subprotocols'] ?? []);
@@ -609,7 +731,7 @@ class TWebSocketHandshake
 		if ($negotiated['header'] !== '') {
 			$responseHeaders[THttpHeaderName::SecWebSocketExtensions] = $negotiated['header'];
 		}
-		$stream->write(self::buildServerResponse($headers[strtolower(THttpHeaderName::SecWebSocketKey)], $responseHeaders));
+		self::writeHead($stream, self::buildServerResponse($headers[strtolower(THttpHeaderName::SecWebSocketKey)], $responseHeaders));
 		return $request + ['subprotocol' => $subprotocol, 'extensions' => $negotiated['extensions']];
 	}
 
@@ -619,12 +741,12 @@ class TWebSocketHandshake
 	 * {@see buildRejection()} / {@see upgradeError()} to refuse.
 	 * @param StreamInterface $stream The accepted transport stream.
 	 * @param ?float $timeout The total seconds to read the request head, or null for no deadline.
-	 * @param ?IClock $clock The clock the deadline is measured on; the real clock when null.
-	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade.
-	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string}
+	 * @param null|IClock|TMonotonicClock $clock The clock the deadline is measured on; a {@see TMonotonicClock} when null.
+	 * @throws TWebSocketException When the request is not a valid WebSocket upgrade, or is not read in time.
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, malformed: bool}
 	 *   The parsed request.
 	 */
-	public static function receiveRequest(StreamInterface $stream, ?float $timeout = null, ?IClock $clock = null): array
+	public static function receiveRequest(StreamInterface $stream, ?float $timeout = null, IClock|TMonotonicClock|null $clock = null): array
 	{
 		$request = self::parseHttpMessage(self::readHandshake($stream, $timeout, $clock));
 		if (self::upgradeError($request) !== null) {
@@ -637,11 +759,40 @@ class TWebSocketHandshake
 	 * Builds an HTTP error response that refuses an upgrade before the 101.
 	 * @param int $status The status code.
 	 * @param string $reason The reason phrase.
+	 * @throws TInvalidDataValueException When the reason phrase holds a CR, LF or NUL.
 	 * @return string The response head.
 	 */
 	public static function buildRejection(int $status = 403, string $reason = 'Forbidden'): string
 	{
+		self::assertFieldSafe('reason', $reason);
 		return "HTTP/1.1 {$status} {$reason}\r\n" . THttpHeaderName::Connection . ": close\r\nContent-Length: 0\r\n\r\n";
+	}
+
+	/**
+	 * Asserts that each header name and value can be written on one line.
+	 * @param array<string, string> $headers The header values, keyed by name.
+	 * @throws TInvalidDataValueException When a name or value holds a CR, LF or NUL.
+	 */
+	private static function assertHeadersSafe(array $headers): void
+	{
+		foreach ($headers as $name => $value) {
+			self::assertFieldSafe((string) $name, (string) $name);
+			self::assertFieldSafe((string) $name, (string) $value);
+		}
+	}
+
+	/**
+	 * Asserts that a value written into an HTTP head holds no CR, LF or NUL, any of which would let
+	 * it end the line and inject a header.
+	 * @param string $field The field the value belongs to, for the error message.
+	 * @param string $value The value.
+	 * @throws TInvalidDataValueException When the value holds a CR, LF or NUL.
+	 */
+	private static function assertFieldSafe(string $field, string $value): void
+	{
+		if (strpbrk($value, "\r\n\0") !== false) {
+			throw new TInvalidDataValueException('websocket_http_field_invalid', strtr($field, ["\r" => '\\r', "\n" => '\\n', "\0" => '\\0']));
+		}
 	}
 
 	/**
@@ -661,11 +812,12 @@ class TWebSocketHandshake
 	 * @param StreamInterface $stream The connected transport stream.
 	 * @param string $host The Host header value.
 	 * @param string $path The request target. Default '/'.
-	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>, timeout?: ?float, clock?: IClock} $options
-	 *   The subprotocols to offer, extension negotiators, extra request headers, and the seconds
-	 *   allowed to read the response head (null or 0 for no deadline).
+	 * @param array{subprotocols?: string[], extensions?: IWebSocketExtensionNegotiator[], headers?: array<string, string>, timeout?: ?float, clock?: IClock|TMonotonicClock} $options
+	 *   The subprotocols to offer, extension negotiators, extra request headers, the seconds allowed to
+	 *   read the response head (null or 0 for no deadline), and the clock that deadline is measured
+	 *   on (see {@see readHandshake()}).
 	 * @throws TWebSocketException When the server does not complete the handshake in time or acceptably.
-	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, subprotocol: ?string, extensions: IWebSocketExtension[]}
+	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, malformed: bool, subprotocol: ?string, extensions: IWebSocketExtension[]}
 	 *   The parsed response with the selected subprotocol and extensions.
 	 */
 	public static function openConnection(StreamInterface $stream, string $host, string $path = '/', array $options = []): array
@@ -681,7 +833,7 @@ class TWebSocketHandshake
 		if ($offer !== '') {
 			$requestHeaders[THttpHeaderName::SecWebSocketExtensions] = $offer;
 		}
-		$stream->write(self::buildClientRequest($host, $path, $key, $requestHeaders));
+		self::writeHead($stream, self::buildClientRequest($host, $path, $key, $requestHeaders));
 		$response = self::parseHttpMessage(self::readHandshake($stream, $options['timeout'] ?? null, $options['clock'] ?? null));
 		if (!self::verifyServerResponse($response, $key)) {
 			throw new TWebSocketException('websocket_handshake_rejected', $response['statusCode'] ?? 0);

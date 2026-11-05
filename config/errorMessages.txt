@@ -26,6 +26,7 @@ websocket_extension_unacceptable		= WebSocket server returned unacceptable param
 websocket_handshake_too_large			= WebSocket handshake exceeds the {0}-byte limit.
 websocket_handshake_incomplete			= WebSocket handshake ended before the header was complete.
 websocket_handshake_not_upgrade			= WebSocket handshake request is not a valid upgrade.
+websocket_http_field_invalid			= The WebSocket handshake field ''{0}'' contains a CR, LF or NUL character.
 websocket_handshake_origin_rejected		= WebSocket upgrade rejected: the Origin ''{0}'' is not allowed.
 websocket_handshake_rejected			= WebSocket server rejected the handshake (status {0}).
 websocket_subprotocol_not_offered		= WebSocket server selected subprotocol ''{0}'' that the client did not offer.

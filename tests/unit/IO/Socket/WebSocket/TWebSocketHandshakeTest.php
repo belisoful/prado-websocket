@@ -4,11 +4,14 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TIOException;
+use Prado\Exceptions\TPhpErrorException;
+use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateExtension;
 use Prado\IO\Socket\WebSocket\TPermessageDeflateNegotiator;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\TStream;
+use Prado\Prado;
 use Prado\Util\Clock\TMockClock;
 use Psr\Http\Message\StreamInterface;
 
@@ -310,6 +313,81 @@ class TWebSocketHandshakeTest extends TestCase
 			self::fail('acceptConnection() forwards the clock option.');
 		} catch (TWebSocketException $e) {
 			self::assertSame(3, $stream->reads, 'The clock option bounds acceptConnection() the same way.');
+		}
+	}
+
+	public function testReadHandshakeMeasuresItsDeadlineOnAMonotonicClock()
+	{
+		$clock = new class () extends TTestMonotonicClock {
+			protected function hrtime(): int
+			{
+				$this->advance(0.25);   // every reading moves 250 ms, exact in binary floating point
+				return parent::hrtime();
+			}
+		};
+		$stream = new DribblingStream(0);
+		try {
+			TWebSocketHandshake::readHandshake($stream, 1.0, $clock);
+			self::fail('The deadline passes on the monotonic clock.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode());
+		}
+		self::assertSame(3, $stream->reads, 'Three 250 ms readings fit before a 1 s deadline measured on the monotonic clock.');
+
+		$stream = new DribblingStream(0);
+		try {
+			TWebSocketHandshake::acceptConnection($stream, ['timeout' => 1.0, 'clock' => $clock]);
+			self::fail('acceptConnection() forwards a monotonic clock option.');
+		} catch (TWebSocketException $e) {
+			self::assertSame(3, $stream->reads, 'The monotonic clock option bounds acceptConnection() the same way.');
+		}
+	}
+
+	public function testASilentPeerOnABlockingStreamFailsAtTheHandshakeTimeout()
+	{
+		$previous = ini_set('default_socket_timeout', '2');   // bounds the test if the deadline did not reach the blocking read
+		try {
+			[$a, $b] = TSocketStream::pair();
+		} finally {
+			ini_set('default_socket_timeout', (string) $previous);
+		}
+		$b->write("GET / HTTP/1.1\r\n");                    // one line, then silence
+		try {
+			TWebSocketHandshake::acceptConnection($a, ['timeout' => 0.1]);
+			self::fail('A silent peer fails the handshake at its deadline.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode(), 'The timeout is the handshake failure serveConnection() handles.');
+		}
+		$a->close();
+		$b->close();
+	}
+
+	public function testATransportFailureDuringTheHandshakeIsAWebSocketException()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$b->close();                                         // the server is gone: writing the request raises EPIPE
+		set_error_handler([Prado::class, 'phpErrorHandler']);   // PRADO turns the fwrite() notice into a TPhpErrorException
+		try {
+			TWebSocketHandshake::openConnection($a, 'example.com');
+			self::fail('The request cannot be written.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_write_failed', $e->getErrorCode());
+		} finally {
+			restore_error_handler();
+		}
+		$a->close();
+
+		$reset = new class (fopen('php://memory', 'r+')) extends TStream {
+			public function read(int $length): string
+			{
+				throw new TPhpErrorException(E_NOTICE, 'fread(): Read of 1 bytes failed with errno=54 Connection reset by peer', __FILE__, __LINE__);
+			}
+		};
+		try {
+			TWebSocketHandshake::readHandshake($reset);
+			self::fail('A reset peer ends the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_handshake_incomplete', $e->getErrorCode());
 		}
 	}
 
