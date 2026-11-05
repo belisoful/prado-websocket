@@ -85,6 +85,33 @@ class FailingBackplane extends TNullBackplane
 	}
 }
 
+/** A backplane with one selectable source, a socket pair end, whose tick reads what the peer end wrote. */
+class SourceBackplane extends TNullBackplane
+{
+	/** @var resource The end a test writes cluster traffic to. */
+	public $peer;
+	public string $received = '';
+	private TSocketStream $_source;
+
+	public function __construct()
+	{
+		parent::__construct();
+		[$local, $this->peer] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+		$this->_source = new TSocketStream($local);
+		$this->_source->setBlocking(false);
+	}
+
+	public function getSources(): array
+	{
+		return [$this->_source];
+	}
+
+	public function tick(): void
+	{
+		$this->received .= $this->_source->read(65536);
+	}
+}
+
 class TWebSocketServerTest extends TestCase
 {
 	/** @var string[] Temporary certificate files to remove. */
@@ -2398,5 +2425,67 @@ class TWebSocketServerTest extends TestCase
 		self::assertSame([], $server->getReactor()->getIdentifiers(), 'No server callback is left on the reactor.');
 		$logs = Prado::getLogger()->getLogs(TLogger::WARNING, TWebSocketServer::class);
 		self::assertNotEmpty(array_filter($logs, fn ($log) => str_contains($log[TLogger::LOG_MESSAGE], 'close failed')), 'The close failure is logged.');
+	}
+
+	public function testAHandlerWaitingOnTheMainFiberSeesItsSessionsMessagesInOrderAndBeforeOnClose()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		TAsync::setLoop($server->getReactor());   // as serve() does
+		$handler = new TWebSocketHandler();
+		$events = [];
+		$clientWs = null;
+		$handler->attachEventHandler('onMessage', function ($conn, $msg) use (&$events, &$clientWs) {
+			$payload = $msg->getPayload();
+			$events[] = $payload;
+			if ($payload === 'msg:1') {
+				$clientWs->send('msg:2');   // the peer keeps sending while this handler waits
+				$clientWs->send('msg:3');
+				$clientWs->close(1000);
+				TAsync::sleep(0.1);   // a wait on the main fiber: the reactor ticks from inside this handler
+				$events[] = 'msg:1 done';
+			}
+		});
+		$handler->attachEventHandler('onClose', function () use (&$events) {
+			$events[] = 'onClose';
+		});
+		$server->setHandler($handler);
+		$client = $this->upgradedClient($server);
+		$client->setBlocking(true);
+		$clientWs = new TWebSocketConnection($client, true);
+		$clientWs->send('msg:1');
+		$this->pumpServerUntil($server, function () use (&$events) {
+			return in_array('onClose', $events, true);
+		});
+
+		self::assertSame(['msg:1', 'msg:1 done', 'msg:2', 'msg:3', 'onClose'], $events, 'The session\'s input waits for the handler: in order, one at a time, onClose last.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testAReadableClusterSourceIsDrainedDuringAMainFiberWait()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		TAsync::setLoop($server->getReactor());   // as serve() does
+		$backplane = new SourceBackplane();
+		$server->setCluster(new TWebSocketCluster('n1', $backplane));
+		$handler = new TWebSocketHandler();
+		$seenDuringWait = null;
+		$handler->attachEventHandler('onMessage', function () use ($server, $backplane, &$seenDuringWait) {
+			fwrite($backplane->peer, 'one');   // cluster traffic arrives while the handler waits
+			$server->getReactor()->delay(0.05, fn () => fwrite($backplane->peer, 'two'));
+			TAsync::sleep(0.15);
+			$seenDuringWait = $backplane->received;
+		});
+		$server->setHandler($handler);
+		$client = $this->upgradedClient($server);
+		$client->setBlocking(true);
+		(new TWebSocketConnection($client, true))->send('wait');
+		$this->pumpServerUntil($server, function () use (&$seenDuringWait) {
+			return $seenDuringWait !== null;
+		});
+
+		self::assertSame('onetwo', $seenDuringWait, 'The cluster ticks on every reactor tick of the wait, so its source is read rather than spun on.');
+		$client->close();
+		$server->close();
 	}
 }
