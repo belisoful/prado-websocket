@@ -43,6 +43,12 @@ use Psr\Http\Message\StreamInterface;
  * and {@see send()} move bytes to and from the transport, so an event-loop server pumps the one
  * socket while many WebSockets run on it.
  *
+ * Each stream fails on its own.  A protocol error or an exception from the handler raises the
+ * handler's {@see IWebSocketHandler::onError()} and closes that stream's connection with the
+ * error's close code (1011 for a handler exception), as the synchronous
+ * {@see IWebSocketHandler::handleConnection()} loop does.  A throwing `onOpen` resets its stream
+ * and raises the closes.  The other streams on the transport carry on.
+ *
  * Events ('on' prefix), raised per multiplexed WebSocket so several observers can react (e.g. an
  * event-loop server and a cluster coordinator):
  *  - onConnection: after a stream's Extended CONNECT is accepted, with its {@see TWebSocketConnection}.
@@ -416,21 +422,24 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	public function serve(TSocketStream $connection, callable $onStream): void
 	{
 		$this->_onStream = $onStream;
-		$connection->write($this->send());                  // initial SETTINGS
-		while ($connection->isOpen()) {
-			$bytes = $connection->read(self::READ_CHUNK);
-			if ($bytes === '' && $connection->eof()) {
-				break;   // the read reached end of stream
+		try {
+			$connection->write($this->send());                  // initial SETTINGS
+			while ($connection->isOpen()) {
+				$bytes = $connection->read(self::READ_CHUNK);
+				if ($bytes === '' && $connection->eof()) {
+					break;   // the read reached end of stream
+				}
+				if ($bytes !== '') {
+					$this->receive($bytes);
+				}
+				$out = $this->send();
+				if ($out !== '') {
+					$connection->write($out);
+				}
 			}
-			if ($bytes !== '') {
-				$this->receive($bytes);
-			}
-			$out = $this->send();
-			if ($out !== '') {
-				$connection->write($out);
-			}
+		} finally {
+			$this->shutdown();   // the transport ended or failed; fire onClose for any streams still open
 		}
-		$this->shutdown();   // the transport ended; fire onClose for any streams still open
 	}
 
 	/**
@@ -484,25 +493,32 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		$connection->setSubprotocol($subprotocol);
 		$connection->setExtensions($negotiated['extensions']);
 		$this->_connections[$stream->getStreamId()] = $connection;
-		if ($this->_onStream !== null) {
-			($this->_onStream)($stream, [
-				'requestLine' => 'CONNECT ' . $headers[':path'] . ' HTTP/2',
-				'method' => 'CONNECT',
-				'target' => $headers[':path'],
-				'protocol' => 'HTTP/2',
-				'statusCode' => null,
-				'headers' => $headers,
-				'body' => '',
-				'subprotocol' => $subprotocol,
-				'extensions' => $negotiated['extensions'],
-			]);
+		try {
+			if ($this->_onStream !== null) {
+				($this->_onStream)($stream, [
+					'requestLine' => 'CONNECT ' . $headers[':path'] . ' HTTP/2',
+					'method' => 'CONNECT',
+					'target' => $headers[':path'],
+					'protocol' => 'HTTP/2',
+					'statusCode' => null,
+					'headers' => $headers,
+					'body' => '',
+					'subprotocol' => $subprotocol,
+					'extensions' => $negotiated['extensions'],
+				]);
+			}
+			$this->onConnection($connection);
+			$this->_handler->onOpen($connection);
+		} catch (\Throwable $e) {
+			Prado::log('WebSocket stream activation failed and is rolled back: ' . $e->getMessage(), TLogger::WARNING, static::class);
+			$this->endConnection($connection);   // reset only this stream; the handler and service closes still run
 		}
-		$this->onConnection($connection);
-		$this->_handler->onOpen($connection);
 	}
 
 	/**
-	 * Feeds a stream's newly received DATA to its WebSocket connection and dispatches messages.
+	 * Feeds a stream's newly received DATA to its WebSocket connection and dispatches messages.  A
+	 * protocol error, or an exception from the handler, fails only this stream's connection
+	 * ({@see failStream()}); the other WebSockets on the transport carry on.
 	 * @param TH2Stream $stream The stream with new buffered data.
 	 */
 	protected function pumpStream(TH2Stream $stream): void
@@ -513,21 +529,47 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		}
 		try {
 			$messages = $connection->feedMessages($stream->getContents());
-		} catch (TWebSocketException $e) {
-			$this->_handler->onError($connection, $e);
-			$connection->close($e->getCloseCode());
-			$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
-			return;
-		}
-		foreach ($messages as $message) {
-			if ($connection->getIsCloseInitiator()) {
-				break;   // the application or server closed the stream: nothing more reaches the handler
+			foreach ($messages as $message) {
+				if ($connection->getIsCloseInitiator()) {
+					break;   // the application or server closed the stream: nothing more reaches the handler
+				}
+				$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
 			}
-			$this->_handler->onMessage($connection, $message->getPayload(), $message->getOpcode());
+		} catch (\Throwable $e) {
+			$this->failStream($stream, $connection, $e);
+			return;
 		}
 		if ($connection->getIsClosed()) {
 			$this->closeStream($stream);
 		}
+	}
+
+	/**
+	 * Fails one stream's connection on an error, as the synchronous
+	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
+	 * {@see IWebSocketHandler::onError()}, sends a Close with the error's close code (1011, Internal
+	 * Server Error, for an error that is not a {@see TWebSocketException}), and ends the stream with
+	 * the handler and service closes.  A failing onError or Close write is logged.
+	 * @param TH2Stream $stream The stream.
+	 * @param TWebSocketConnection $connection The stream's connection.
+	 * @param \Throwable $error The protocol error, or the exception a handler threw.
+	 */
+	private function failStream(TH2Stream $stream, TWebSocketConnection $connection, \Throwable $error): void
+	{
+		if (!$error instanceof TWebSocketException) {
+			Prado::log('Handler failed on an HTTP/2 stream; the stream is failed: ' . $error->getMessage(), TLogger::WARNING, static::class);
+		}
+		try {
+			$this->_handler->onError($connection, $error);
+		} catch (\Throwable $e) {
+			Prado::log('Handler onError failed on an HTTP/2 stream: ' . $e->getMessage(), TLogger::WARNING, static::class);
+		}
+		try {
+			$connection->close($error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError);
+		} catch (\Throwable $e) {
+			// The stream can no longer carry the Close; it still ends below.
+		}
+		$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
 	}
 
 	/**

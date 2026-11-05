@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Exceptions\TPhpErrorException;
 use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\IResource;
@@ -1485,7 +1486,7 @@ class TWebSocketServer extends TSocketServer
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->_cluster?->register($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->onConnection($connection));
 		$protocol->attachEventHandler('onConnection', fn ($sender, $connection) => $this->settleHttp2Handshake($transport));
-		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->_cluster?->unregister($connection));
+		$protocol->attachEventHandler('onClose', fn ($sender, $connection) => $this->unregisterHttp2Connection($connection));
 		$session = ['transport' => $transport, 'protocol' => $protocol, 'outbound' => '', 'active' => $this->getMonotonicClock()->seconds()];
 		if ($this->_handshakeTimeout > 0) {
 			$session['deadline'] = $session['active'] + $this->_handshakeTimeout;   // until its first WebSocket stream opens
@@ -1494,6 +1495,20 @@ class TWebSocketServer extends TSocketServer
 		$this->queueHttp2Output($transport, $protocol->send());   // the initial SETTINGS, queued and drained non-blocking
 		if ($initial !== '') {
 			$this->feedHttp2Session($transport, $protocol, $initial);
+		}
+	}
+
+	/**
+	 * Unregisters a closing HTTP/2 stream's connection from the cluster.  A backplane fault is logged,
+	 * so it neither escapes into the HTTP/2 session nor ends the other streams on the transport.
+	 * @param TWebSocketConnection $connection The closing connection.
+	 */
+	private function unregisterHttp2Connection(TWebSocketConnection $connection): void
+	{
+		try {
+			$this->_cluster?->unregister($connection);
+		} catch (\Throwable $e) {
+			$this->log('Cluster unregister failed: ' . $e->getMessage());
 		}
 	}
 
@@ -1588,8 +1603,10 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Reads a chunk from a ready transport, treating a clean end of stream and an abrupt disconnect
-	 * alike.  A peer that resets the connection surfaces as a read failure ({@see \Prado\IO\TStream::read()}
-	 * throws when the underlying read returns false); both that and an end of stream return null, so a
+	 * alike.  A peer that resets the connection surfaces as a read failure: {@see \Prado\IO\TStream::read()}
+	 * throws a `RuntimeException` when the underlying read returns false, and PRADO's PHP error
+	 * handler raises a read's notice or warning (a TLS stream reports a reset that way) as a
+	 * {@see TPhpErrorException} first.  Any such failure and an end of stream return null, so a
 	 * disconnect ends the session instead of crashing the loop.
 	 * @param TSocketStream $transport The ready transport.
 	 * @return ?string The bytes read, or null at end of stream or on a read failure.
@@ -1598,7 +1615,7 @@ class TWebSocketServer extends TSocketServer
 	{
 		try {
 			$bytes = $transport->read(self::READ_CHUNK);
-		} catch (\RuntimeException $e) {
+		} catch (\Exception $e) {
 			return null;
 		}
 		return ($bytes === '' && $transport->eof()) ? null : $bytes;
@@ -1678,7 +1695,9 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Drains an HTTP/2 session's queued output to its non-blocking transport, keeping any tail the
-	 * send buffer could not accept.  A broken pipe ends the session.
+	 * send buffer could not accept.  A broken pipe ends the session, whether the write reports it as
+	 * a `RuntimeException` or PRADO's PHP error handler raises the write's EPIPE notice as a
+	 * {@see TPhpErrorException}.
 	 * @param TSocketStream $transport The session transport.
 	 */
 	protected function drainHttp2Output(TSocketStream $transport): void
@@ -1699,7 +1718,7 @@ class TWebSocketServer extends TSocketServer
 				}
 				$sent += $wrote;
 			}
-		} catch (\RuntimeException $e) {
+		} catch (\RuntimeException | TPhpErrorException $e) {
 			$this->log('HTTP/2 session ended on a write failure: ' . $e->getMessage(), TLogger::NOTICE);
 			$this->endHttp2Session($transport);
 			return;
@@ -1747,8 +1766,8 @@ class TWebSocketServer extends TSocketServer
 
 	/**
 	 * Feeds bytes into a single-WebSocket session: refreshes its activity, dispatches the complete
-	 * messages, fails the connection on a protocol error, and ends the session once a close
-	 * handshake has completed and drained.
+	 * messages, fails the connection on a protocol error or a throwing handler, and ends the session
+	 * once a close handshake has completed and drained.
 	 * @param TSocketStream $transport The session transport.
 	 * @param TWebSocketConnection $connection The session connection.
 	 * @param string $bytes The bytes received.
@@ -1763,21 +1782,42 @@ class TWebSocketServer extends TSocketServer
 			$messages = $connection->feedMessages($bytes);
 		} catch (TWebSocketException $e) {
 			$this->log('Protocol error; the connection is failed with close code ' . $e->getCloseCode() . ': ' . $e->getMessage(), TLogger::NOTICE);
-			try {
-				$this->getHandler()?->onError($connection, $e);
-			} catch (\Throwable $inner) {
-				$this->log('Handler onError failed: ' . $inner->getMessage());
-			}
-			$this->failHttp1Session($transport, $connection, $e->getCloseCode());
+			$this->failHttp1Connection($transport, $connection, $e);
 			return;
 		}
 		foreach ($messages as $message) {
 			if ($connection->getIsCloseInitiator()) {
 				break;   // the application or server closed the connection: nothing more reaches the handler
 			}
-			$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
+			try {
+				$this->getHandler()?->onMessage($connection, $message->getPayload(), $message->getOpcode());
+			} catch (\Throwable $e) {
+				$this->log('Handler onMessage failed; the connection is failed: ' . $e->getMessage());
+				$this->failHttp1Connection($transport, $connection, $e);
+				return;
+			}
 		}
 		$this->settleHttp1Session($transport, $connection);
+	}
+
+	/**
+	 * Fails a single-WebSocket session on an error, as the synchronous
+	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
+	 * {@see IWebSocketHandler::onError()} and closes with the error's close code, or 1011 (Internal
+	 * Server Error) for an error that is not a {@see TWebSocketException}.  Only this session fails.
+	 * @param TSocketStream $transport The session transport.
+	 * @param TWebSocketConnection $connection The session connection.
+	 * @param \Throwable $error The protocol error, or the exception a handler threw.
+	 */
+	private function failHttp1Connection(TSocketStream $transport, TWebSocketConnection $connection, \Throwable $error): void
+	{
+		try {
+			$this->getHandler()?->onError($connection, $error);
+		} catch (\Throwable $inner) {
+			$this->log('Handler onError failed: ' . $inner->getMessage());
+		}
+		$code = $error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError;
+		$this->failHttp1Session($transport, $connection, $code);
 	}
 
 	/**
