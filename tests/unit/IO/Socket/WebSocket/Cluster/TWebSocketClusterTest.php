@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketCluster;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketPolledBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
@@ -181,10 +182,66 @@ class TWebSocketClusterTest extends TestCase
 		self::assertGreaterThan(0, $sa->getSize(), 'A local direct send is delivered directly.');
 		self::assertCount(0, $this->spy->published, 'A local direct send is not put on the backplane.');
 
-		self::assertFalse($this->cluster->sendToClient('nodeB-7', 'yo'), 'An unknown client is reported absent.');
+		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'nodeB', '', null, 'nodeB-7', ['node' => 'nodeB']));
+		self::assertTrue($this->cluster->sendToClient('nodeB-7', 'yo'), 'A remote client in the mirror is reachable.');
 		self::assertCount(1, $this->spy->published, 'A remote direct send is routed through the backplane.');
 		self::assertSame(TWebSocketEnvelope::DIRECT, $this->spy->published[0]->getType());
 		self::assertSame('nodeB-7', $this->spy->published[0]->getClientId());
+	}
+
+	public function testDirectSendToAnUnknownClientSendsNothing()
+	{
+		self::assertFalse($this->cluster->sendToClient('nodeB-7', 'yo'), 'An unknown client is reported absent.');
+		self::assertSame([], $this->spy->published, 'Nothing is put on the backplane for a client no node holds.');
+	}
+
+	public function testUnregisterCostsOnlyTheClientsOwnSubscriptions()
+	{
+		$cluster = new class ('nodeA', new SpyBackplane()) extends TWebSocketCluster {
+			public int $unsubscribes = 0;
+
+			public function unsubscribe(string $clientId, string $channel): void
+			{
+				$this->unsubscribes++;
+				parent::unsubscribe($clientId, $channel);
+			}
+		};
+		[$busy] = $this->makeConnection();
+		[$leaving] = $this->makeConnection();
+		$busyId = $cluster->register($busy);
+		$leavingId = $cluster->register($leaving);
+		for ($i = 0; $i < 100; $i++) {
+			$cluster->subscribe($busyId, 'room-' . $i);
+		}
+		$cluster->subscribe($leavingId, 'room-7');
+		$cluster->subscribe($leavingId, 'lobby');
+
+		$cluster->unregister($leavingId);
+
+		self::assertSame(2, $cluster->unsubscribes, 'A disconnect visits the client\'s own two channels, not all 101.');
+		self::assertSame([$busyId], $cluster->getChannelSubscribers('room-7'));
+		self::assertArrayNotHasKey('lobby', $cluster->getChannels(), 'The vacated channel is withdrawn.');
+		$cluster->unsubscribe($busyId, 'room-7');
+		$cluster->subscribe($busyId, 'room-7');
+		$cluster->unregister($busy);
+		self::assertSame([], $cluster->getChannels(), 'Every channel of the unregistered client is withdrawn.');
+	}
+
+	public function testGetHasBacklogAsksAPolledBackplane()
+	{
+		self::assertFalse($this->cluster->getHasBacklog(), 'A backplane that is not polled has no backlog.');
+		$polled = new class () extends TNullBackplane implements IWebSocketPolledBackplane {
+			public bool $backlog = true;
+
+			public function getHasBacklog(): bool
+			{
+				return $this->backlog;
+			}
+		};
+		$cluster = new TWebSocketCluster('nodeA', $polled);
+		self::assertTrue($cluster->getHasBacklog(), 'A polled backplane with traffic left reports a backlog.');
+		$polled->backlog = false;
+		self::assertFalse($cluster->getHasBacklog());
 	}
 
 	public function testReceivePublishDeliversLocallyWithoutRepublishing()

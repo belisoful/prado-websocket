@@ -9,9 +9,14 @@ use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Stream\TBufferStream;
+use Prado\Test\Unit\IO\Socket\WebSocket\TTestMonotonicClock;
 use Prado\Util\Clock\TMockClock;
 
-/** An in-memory stand-in for the phpredis client, covering the commands the backplane issues. */
+/**
+ * An in-memory stand-in for a Redis server, covering the commands the backplane issues.  Every
+ * backplane talks to it through its own {@see FakeRedisConnection}, which holds that client's
+ * transaction state, as a real connection does.
+ */
 class FakeRedis
 {
 	/** @var array<string, array<string, true>> */
@@ -22,6 +27,10 @@ class FakeRedis
 	public array $lists = [];
 	/** @var array<string, string> */
 	public array $strings = [];
+	/** @var array<string, int> The expiry, in seconds, last set on each key. */
+	public array $ttls = [];
+	/** @var array<string, int> A write count per key, which a WATCH compares. */
+	public array $versions = [];
 	/** @var bool Whether every command fails, as when the server is down. */
 	public bool $failing = false;
 	public int $connects = 0;
@@ -32,18 +41,81 @@ class FakeRedis
 	public bool $selectOk = true;
 	/** @var array<int, int|string> The passwords and databases the client was given. */
 	public array $calls = [];
+	/** @var array<int, array{0: string, 1: array<int, mixed>, 2: callable}> Hooks run once after a matching command. */
+	private array $hooks = [];
+	/** @var callable[] Hooks a transaction deferred until it completed. */
+	private array $deferred = [];
+	private int $inExec = 0;
 
 	/** Forgets everything, as a restarted Redis would. */
 	public function flush(): void
 	{
-		$this->sets = $this->hashes = $this->lists = $this->strings = [];
+		$this->sets = $this->hashes = $this->lists = $this->strings = $this->ttls = [];
 	}
 
-	private function guard(): void
+	/**
+	 * Runs a hook once, after the next command named $command whose leading arguments are $args.  A
+	 * command inside a MULTI transaction runs its hook after the whole transaction, which is atomic.
+	 * @param string $command
+	 * @param array<int, mixed> $args
+	 * @param callable $hook
+	 */
+	public function after(string $command, array $args, callable $hook): void
+	{
+		$this->hooks[] = [$command, $args, $hook];
+	}
+
+	public function guard(): void
 	{
 		if ($this->failing) {
 			throw new \RuntimeException('redis is down');
 		}
+	}
+
+	/**
+	 * Runs one data command.
+	 * @param string $name
+	 * @param array<int, mixed> $args
+	 */
+	public function run(string $name, array $args): mixed
+	{
+		$this->guard();
+		$result = $this->{'do' . ucfirst($name)}(...$args);
+		foreach ($this->hooks as $i => [$command, $prefix, $hook]) {
+			if ($command === $name && array_slice($args, 0, count($prefix)) === $prefix) {
+				unset($this->hooks[$i]);
+				if ($this->inExec > 0) {
+					$this->deferred[] = $hook;
+				} else {
+					$hook();
+				}
+			}
+		}
+		return $result;
+	}
+
+	/**
+	 * Runs a queued transaction or pipeline with no other client's command in between.
+	 * @param array<int, array{0: string, 1: array<int, mixed>}> $queue
+	 * @return array<int, mixed>
+	 */
+	public function runAtomically(array $queue): array
+	{
+		$results = [];
+		$this->inExec++;
+		try {
+			foreach ($queue as [$name, $args]) {
+				$results[] = $this->run($name, $args);
+			}
+		} finally {
+			$this->inExec--;
+		}
+		$deferred = $this->deferred;
+		$this->deferred = [];
+		foreach ($deferred as $hook) {
+			$hook();
+		}
+		return $results;
 	}
 
 	public function connect(string $host, int $port, float $timeout): bool
@@ -51,11 +123,6 @@ class FakeRedis
 		$this->guard();
 		$this->connects++;
 		return $this->connectOk;
-	}
-
-	public function setOption(int $option, mixed $value): bool
-	{
-		return true;
 	}
 
 	public function auth(string $password): bool
@@ -76,108 +143,209 @@ class FakeRedis
 		return true;
 	}
 
-	public function multi(int $mode = 1): static
+	private function touch(string $key): void
 	{
-		$this->guard();
-		return $this;
+		$this->versions[$key] = ($this->versions[$key] ?? 0) + 1;
 	}
 
-	public function exec(): array
+	private function doSAdd(string $key, string $member): int
 	{
-		return [];
-	}
-
-	public function sAdd(string $key, string $member): int
-	{
-		$this->guard();
-		$new = !isset($this->sets[$key][$member]);
+		if (isset($this->sets[$key][$member])) {
+			return 0;
+		}
 		$this->sets[$key][$member] = true;
-		return $new ? 1 : 0;
+		$this->touch($key);
+		return 1;
 	}
 
-	public function sRem(string $key, string $member): int
+	private function doSRem(string $key, string $member): int
 	{
-		$this->guard();
-		$had = isset($this->sets[$key][$member]);
+		if (!isset($this->sets[$key][$member])) {
+			return 0;
+		}
 		unset($this->sets[$key][$member]);
-		return $had ? 1 : 0;
+		$this->touch($key);
+		return 1;
 	}
 
-	public function sMembers(string $key): array
+	private function doSMembers(string $key): array
 	{
-		$this->guard();
-		return array_keys($this->sets[$key] ?? []);
+		return array_map('strval', array_keys($this->sets[$key] ?? []));
 	}
 
-	public function setex(string $key, int $ttl, string $value): bool
+	private function doSetex(string $key, int $ttl, string $value): bool
 	{
-		$this->guard();
 		$this->strings[$key] = $value;
+		$this->ttls[$key] = $ttl;
+		$this->touch($key);
 		return true;
 	}
 
-	public function exists(string $key): int
+	private function doExpire(string $key, int $ttl): bool
 	{
-		$this->guard();
+		$this->ttls[$key] = $ttl;
+		return true;
+	}
+
+	private function doExists(string $key): int
+	{
 		return isset($this->strings[$key]) ? 1 : 0;
 	}
 
-	public function del(string $key): int
+	private function doDel(string $key): int
 	{
-		$this->guard();
 		$had = isset($this->sets[$key]) || isset($this->hashes[$key]) || isset($this->lists[$key]) || isset($this->strings[$key]);
-		unset($this->sets[$key], $this->hashes[$key], $this->lists[$key], $this->strings[$key]);
+		unset($this->sets[$key], $this->hashes[$key], $this->lists[$key], $this->strings[$key], $this->ttls[$key]);
+		if ($had) {
+			$this->touch($key);
+		}
 		return $had ? 1 : 0;
 	}
 
-	public function hSet(string $key, string $field, string $value): int
+	private function doHSet(string $key, string $field, string $value): int
 	{
-		$this->guard();
 		$new = !isset($this->hashes[$key][$field]);
 		$this->hashes[$key][$field] = $value;
+		$this->touch($key);
 		return $new ? 1 : 0;
 	}
 
-	public function hDel(string $key, string $field): int
+	private function doHDel(string $key, string $field): int
 	{
-		$this->guard();
-		$had = isset($this->hashes[$key][$field]);
+		if (!isset($this->hashes[$key][$field])) {
+			return 0;
+		}
 		unset($this->hashes[$key][$field]);
-		return $had ? 1 : 0;
+		$this->touch($key);
+		return 1;
 	}
 
-	public function hGet(string $key, string $field): string|false
+	private function doHGet(string $key, string $field): string|false
 	{
-		$this->guard();
 		return $this->hashes[$key][$field] ?? false;
 	}
 
-	public function hGetAll(string $key): array
+	private function doHGetAll(string $key): array
 	{
-		$this->guard();
 		return $this->hashes[$key] ?? [];
 	}
 
-	public function rPush(string $key, string $value): int
+	private function doRPush(string $key, string $value): int
 	{
-		$this->guard();
 		$this->lists[$key][] = $value;
+		$this->touch($key);
 		return count($this->lists[$key]);
 	}
 
-	public function lRange(string $key, int $start, int $stop): array
+	private function doLRange(string $key, int $start, int $stop): array
 	{
-		$this->guard();
 		$list = $this->lists[$key] ?? [];
 		return array_slice($list, $start, $stop < 0 ? null : $stop - $start + 1);
 	}
 
-	public function lTrim(string $key, int $start, int $stop): bool
+	private function doLTrim(string $key, int $start, int $stop): bool
 	{
-		$this->guard();
 		$list = $this->lists[$key] ?? [];
-		$this->lists[$key] = array_slice($list, $start, $stop < 0 ? null : $stop - $start + 1);
+		$length = count($list);
+		$start = $start < 0 ? max(0, $length + $start) : $start;
+		$stop = $stop < 0 ? $length + $stop : min($stop, $length - 1);
+		$this->lists[$key] = $start > $stop ? [] : array_slice($list, $start, $stop - $start + 1);
+		$this->touch($key);
 		return true;
+	}
+}
+
+/**
+ * One client connection to the {@see FakeRedis} server: it forwards each command, and holds its own
+ * MULTI queue and WATCHed keys.  In MULTI or pipeline mode a command is queued and returns the
+ * connection; EXEC runs the queue atomically, or returns false when a WATCHed key changed.
+ */
+class FakeRedisConnection
+{
+	/** @var ?array<int, array{0: string, 1: array<int, mixed>}> The queued commands, or null outside MULTI. */
+	private ?array $queue = null;
+	/** @var array<string, int> The WATCHed keys and their versions when watched. */
+	private array $watched = [];
+	public int $aborted = 0;
+
+	public function __construct(public FakeRedis $server)
+	{
+	}
+
+	public function connect(string $host, int $port, float $timeout): bool
+	{
+		return $this->server->connect($host, $port, $timeout);
+	}
+
+	public function setOption(int $option, mixed $value): bool
+	{
+		return true;
+	}
+
+	public function auth(string $password): bool
+	{
+		return $this->server->auth($password);
+	}
+
+	public function select(int $database): bool
+	{
+		return $this->server->select($database);
+	}
+
+	public function close(): bool
+	{
+		return $this->server->close();
+	}
+
+	public function multi(int $mode = 1): static
+	{
+		$this->server->guard();
+		$this->queue = [];
+		return $this;
+	}
+
+	public function exec(): array|false
+	{
+		$queue = $this->queue ?? [];
+		$watched = $this->watched;
+		$this->queue = null;
+		$this->watched = [];
+		foreach ($watched as $key => $version) {
+			if (($this->server->versions[$key] ?? 0) !== $version) {
+				$this->aborted++;
+				return false;
+			}
+		}
+		return $this->server->runAtomically($queue);
+	}
+
+	public function watch(array|string $key, string ...$others): bool
+	{
+		$this->server->guard();
+		foreach ([...(array) $key, ...$others] as $name) {
+			$this->watched[$name] = $this->server->versions[$name] ?? 0;
+		}
+		return true;
+	}
+
+	public function unwatch(): bool
+	{
+		$this->watched = [];
+		return true;
+	}
+
+	/**
+	 * Queues a command inside MULTI, or runs it.
+	 * @param string $name
+	 * @param array<int, mixed> $args
+	 */
+	public function __call(string $name, array $args): mixed
+	{
+		if ($this->queue !== null) {
+			$this->queue[] = [$name, $args];
+			return $this;
+		}
+		return $this->server->run($name, $args);
 	}
 }
 
@@ -191,7 +359,7 @@ class FakeRedisBackplane extends TRedisBackplane
 
 	protected function createRedis(): object
 	{
-		return $this->fake;
+		return new FakeRedisConnection($this->fake);
 	}
 }
 
@@ -208,6 +376,7 @@ class TRedisBackplaneTest extends TestCase
 {
 	private FakeRedis $redis;
 	private TMockClock $clock;
+	private TTestMonotonicClock $mono;
 	private string $prefix;
 
 	protected function setUp(): void
@@ -215,6 +384,7 @@ class TRedisBackplaneTest extends TestCase
 		$this->redis = new FakeRedis();
 		$this->clock = new TMockClock();
 		$this->clock->setMicrotime(1000.0);
+		$this->mono = new TTestMonotonicClock(1000.0);
 		$this->prefix = (new TRedisBackplane())->getPrefix();
 	}
 
@@ -223,6 +393,7 @@ class TRedisBackplaneTest extends TestCase
 	{
 		$backplane = new FakeRedisBackplane($this->redis);
 		$backplane->setClock($this->clock);
+		$backplane->setMonotonicClock($this->mono);
 		return [new TWebSocketCluster($nodeId, $backplane), $backplane];
 	}
 
@@ -292,7 +463,7 @@ class TRedisBackplaneTest extends TestCase
 		$this->redis->flush();
 		$this->redis->sets[$this->prefix . 'nodes'] = ['n2' => true];
 		$this->redis->strings[$this->prefix . 'node:n2'] = '1';   // its heartbeat is live, so the prune keeps it
-		$this->clock->setMicrotime(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
+		$this->mono->setSeconds(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
 		$cluster->tick();
 
 		self::assertSame(2, $this->redis->connects, 'The backplane reconnected.');
@@ -319,7 +490,7 @@ class TRedisBackplaneTest extends TestCase
 		$cluster->unregister($clientId);   // the hash still holds the client; the delete was a no-op
 
 		$this->redis->failing = false;
-		$this->clock->setMicrotime(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
+		$this->mono->setSeconds(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
 		$cluster->tick();
 
 		self::assertArrayNotHasKey($clientId, $this->redis->hashes[$this->prefix . 'presence'] ?? [], 'A client that left during the outage is not resurrected.');
@@ -395,7 +566,7 @@ class TRedisBackplaneTest extends TestCase
 
 		// n1 stalls past the TTL: its heartbeat key expires and n2 reaps it.
 		unset($this->redis->strings[$this->prefix . 'node:n1']);
-		$this->clock->setMicrotime(1000.0 + $bp1->getNodeTtl() + 1);
+		$this->mono->setSeconds(1000.0 + $bp1->getNodeTtl() + 1);
 		$n2->tick();
 		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'nodes']);
 		self::assertArrayNotHasKey('n1', $this->redis->sets[$this->prefix . 'ch:news'] ?? [], "The reap withdrew the stalled node's channel interest.");
@@ -431,7 +602,7 @@ class TRedisBackplaneTest extends TestCase
 
 		// C crashes and its heartbeat key expires.  A prunes first; C is then gone from the registry, so B's prune never finds it.
 		unset($this->redis->strings[$this->prefix . 'node:C']);
-		$this->clock->setMicrotime(1000.0 + $bpC->getNodeTtl() + 1);
+		$this->mono->setSeconds(1000.0 + $bpC->getNodeTtl() + 1);
 		$a->tick();
 		$b->tick();
 
@@ -454,7 +625,7 @@ class TRedisBackplaneTest extends TestCase
 		$q->tick();                  // Q faults and disconnects
 		$q->unregister($leaving);    // the drop is lost: Redis is down
 		$this->redis->failing = false;
-		$this->clock->setMicrotime(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
+		$this->mono->setSeconds(1000.0 + TRedisBackplane::RECONNECT_INTERVAL + 1);
 		$q->tick();                  // Q reconnects and replaces its presence
 		$p->tick();
 
@@ -558,14 +729,15 @@ class TRedisBackplaneTest extends TestCase
 
 	public function testDirectToAClientWithoutAResolvableNodeIsNotRouted()
 	{
-		[$n1] = $this->openNode('n1');
+		[, $bp1] = $this->openNode('n1');
 		$this->openNode('n2');
 		$this->redis->hashes[$this->prefix . 'presence']['broken'] = '{not json';
 		$this->redis->hashes[$this->prefix . 'presence']['nodeless'] = '{"user":"x"}';
 
-		$n1->sendToClient('broken', 'lost');
-		$n1->sendToClient('nodeless', 'lost');
-		$n1->sendToClient('unknown', 'lost');
+		foreach (['broken', 'nodeless', 'unknown'] as $clientId) {
+			$bp1->publish(new TWebSocketEnvelope(TWebSocketEnvelope::DIRECT, 'n1', 'lost', null, $clientId));
+		}
+
 
 		self::assertSame([], array_filter($this->inbox('n2'), fn ($e) => $e->getType() === TWebSocketEnvelope::DIRECT), 'A direct to a client with no resolvable node goes nowhere.');
 		self::assertSame(2, $this->redis->connects, 'A malformed entry is not a Redis fault.');
@@ -634,6 +806,11 @@ class TRedisBackplaneTest extends TestCase
 		self::assertSame(30, $backplane->getNodeTtl());
 		self::assertSame(2.0, $backplane->getTimeout());
 		self::assertSame(10000, $backplane->getInboxLimit());
+		self::assertSame(10000, $backplane->getDrainLimit());
+		self::assertSame($backplane, $backplane->setDrainLimit('25'));
+		self::assertSame(25, $backplane->getDrainLimit());
+		self::assertSame(0, $backplane->setDrainLimit(-1)->getDrainLimit(), 'A negative drain limit means a time bound only.');
+		self::assertFalse($backplane->getHasBacklog(), 'A backplane that has not ticked has no backlog.');
 
 		self::assertSame($backplane, $backplane->setHost('redis.internal')->setPort('6380')->setPassword('pw')->setDatabase('2')->setPrefix('app:')->setNodeTtl('12')->setTimeout('0.5')->setInboxLimit('50'));
 		self::assertSame('redis.internal', $backplane->getHost());
@@ -650,6 +827,193 @@ class TRedisBackplaneTest extends TestCase
 		self::assertSame(1, $backplane->getNodeTtl(), 'The TTL is at least one second.');
 		self::assertSame(0, $backplane->getInboxLimit(), 'A negative limit means unlimited.');
 		self::assertSame([], $backplane->getSources(), 'Redis is polled, not selected on.');
+	}
+
+	/** Queues $count publishes for 'news' on a node's inbox. */
+	private function queuePublishes(string $node, int $count): void
+	{
+		for ($i = 0; $i < $count; $i++) {
+			$this->redis->lists[$this->prefix . 'inbox:' . $node][] = (new TWebSocketEnvelope(TWebSocketEnvelope::PUBLISH, 'n2', 'm' . $i, 'news'))->encode();
+		}
+	}
+
+	public function testATickDrainsUpToTheDrainLimitAndReportsTheBacklog()
+	{
+		[$cluster, $backplane] = $this->openNode('n1');
+		$backplane->setDrainLimit(10);
+		$this->queuePublishes('n1', 25);
+		$inbox = $this->prefix . 'inbox:n1';
+
+		$cluster->tick();
+		self::assertCount(15, $this->redis->lists[$inbox], 'One tick drains up to the drain limit.');
+		self::assertTrue($backplane->getHasBacklog(), 'A tick that stops at the limit with envelopes left reports a backlog.');
+		self::assertTrue($cluster->getHasBacklog(), 'The coordinator reports the backplane backlog to the server.');
+		$cluster->tick();
+		self::assertCount(5, $this->redis->lists[$inbox]);
+		$cluster->tick();
+		self::assertSame([], $this->redis->lists[$inbox], 'Successive ticks drain the rest.');
+		self::assertFalse($backplane->getHasBacklog(), 'An emptied inbox leaves no backlog.');
+
+		$backplane->setDrainLimit(0);
+		$this->queuePublishes('n1', 2500);
+		$cluster->tick();
+		self::assertSame([], $this->redis->lists[$inbox], 'Without a count limit one tick reads every batch while time allows.');
+		self::assertFalse($backplane->getHasBacklog());
+	}
+
+	public function testADrainStopsAtItsTimeBound()
+	{
+		[$cluster, $backplane] = $this->openNode('n1');
+		$backplane->setDrainLimit(0);
+		$slow = new class ($this->mono) extends \Prado\TComponent implements \Prado\IO\Socket\WebSocket\Cluster\IWebSocketCluster {
+			public int $received = 0;
+
+			public function __construct(private TTestMonotonicClock $mono)
+			{
+				parent::__construct();
+			}
+
+			public function getNodeId(): string
+			{
+				return 'n1';
+			}
+
+			public function receiveEnvelope(TWebSocketEnvelope $envelope): void
+			{
+				$this->received++;
+				$this->mono->advance(0.001);   // each delivery takes a millisecond
+			}
+
+			public function hasLocalClient(string $clientId): bool
+			{
+				return false;
+			}
+
+			public function dropNodePresence(string $node): void
+			{
+			}
+
+			public function getLocalPresence(): array
+			{
+				return [];
+			}
+		};
+		$backplane->setCluster($slow);
+		$this->queuePublishes('n1', 2500);
+
+		$backplane->tick();
+
+		self::assertSame(TRedisBackplane::DRAIN_LIMIT, $slow->received, 'The drain stops after the batch that passed DRAIN_TIME.');
+		self::assertTrue($backplane->getHasBacklog(), 'The rest is left for the next tick, which the server runs at once.');
+		self::assertCount(2500 - TRedisBackplane::DRAIN_LIMIT, $this->redis->lists[$this->prefix . 'inbox:n1']);
+	}
+
+	public function testADrainRacingAProducersTrimLosesNothing()
+	{
+		[$consumer] = $this->openNode('n1');
+		[$producer, $bp2] = $this->openNode('n2');
+		$bp2->setInboxLimit(3);
+		[$connection, $sink] = $this->makeConnection();
+		$consumer->subscribe($consumer->register($connection), 'news');
+		$producer->tick();
+		$inbox = $this->prefix . 'inbox:n1';
+		$this->redis->lists[$inbox] = [];
+		foreach (['a', 'b', 'c'] as $payload) {
+			$producer->broadcast($payload);   // the inbox is at the producer's limit
+		}
+
+		// The producer pushes (and trims to its limit) while the consumer is reading its batch.
+		$this->redis->after('lRange', [$inbox], fn () => $producer->broadcast('d'));
+		$consumer->tick();
+		$consumer->tick();
+
+		foreach (['a', 'b', 'c', 'd'] as $payload) {
+			self::assertStringContainsString($payload, (string) $sink, "Envelope {$payload} is delivered: the read and its removal are one transaction.");
+		}
+	}
+
+	public function testAReapRacingTheNodesRejoinKeepsItsClientsOnEveryNode()
+	{
+		[$n1, $bp1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		[$n3] = $this->openNode('n3');
+		[$connection] = $this->makeConnection();
+		$clientId = $n1->register($connection);
+		$n2->tick();
+		$n3->tick();
+		self::assertArrayHasKey($clientId, $n3->presence());
+
+		// n1 stalls past the TTL; n2 reaps it, and n1 resumes just after the reap removes it from the registry.
+		unset($this->redis->strings[$this->prefix . 'node:n1']);
+		$this->mono->setSeconds(1000.0 + $bp1->getNodeTtl() + 1);
+		$this->redis->after('sRem', [$this->prefix . 'nodes', 'n1'], fn () => $n1->tick());
+		$n2->tick();
+		$n2->tick();
+		$n3->tick();
+
+		self::assertArrayHasKey('n1', $this->redis->sets[$this->prefix . 'nodes'], 'The resumed node is in the registry.');
+		self::assertArrayHasKey($clientId, $this->redis->hashes[$this->prefix . 'presence'], "The resumed node's client stays in the presence hash.");
+		self::assertArrayHasKey($clientId, $n3->presence(), 'A third node sees the node-down before the re-announce, never after it.');
+		self::assertArrayHasKey($clientId, $n2->presence(), 'The reaping node learns the client again.');
+	}
+
+	public function testAHeartbeatDuringAReapAbortsIt()
+	{
+		[$n1, $bp1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		[$n3] = $this->openNode('n3');
+		[$connection] = $this->makeConnection();
+		$clientId = $n1->register($connection);
+		$n2->tick();
+		$n3->tick();
+
+		// n2 finds n1's heartbeat expired, and n1 heartbeats before n2's reap commits.
+		unset($this->redis->strings[$this->prefix . 'node:n1']);
+		$this->mono->setSeconds(1000.0 + $bp1->getNodeTtl() + 1);
+		$this->redis->after('exists', [$this->prefix . 'node:n1'], fn () => $n1->tick());
+		$n2->tick();
+		$n3->tick();
+
+		self::assertArrayHasKey('n1', $this->redis->sets[$this->prefix . 'nodes'], 'The live node is not reaped.');
+		self::assertArrayHasKey($clientId, $this->redis->hashes[$this->prefix . 'presence']);
+		self::assertArrayHasKey($clientId, $n2->presence(), 'The node that started the reap keeps the client.');
+		self::assertArrayHasKey($clientId, $n3->presence(), 'No node-down reaches the other nodes.');
+	}
+
+	public function testAnInboxAPushRecreatesAfterItsNodeWasReapedExpires()
+	{
+		[$n1, $bp1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		[$n3] = $this->openNode('n3');
+		[$connection] = $this->makeConnection();
+		$n2->subscribe($n2->register($connection), 'news');
+
+		// n2 dies; n3 reads the channel's interested nodes, then n1 reaps n2 before n3 pushes.
+		unset($this->redis->strings[$this->prefix . 'node:n2']);
+		$this->mono->setSeconds(1000.0 + $bp1->getNodeTtl() + 1);
+		$this->redis->after('sMembers', [$this->prefix . 'ch:news'], fn () => $n1->tick());
+		$n3->publish('news', 'late');
+
+		$orphan = $this->prefix . 'inbox:n2';
+		self::assertArrayNotHasKey('n2', $this->redis->sets[$this->prefix . 'nodes'], 'The dead node was reaped.');
+		self::assertNotEmpty($this->redis->lists[$orphan] ?? [], 'The racing push recreated the reaped inbox.');
+		self::assertSame(3 * $bp1->getNodeTtl(), $this->redis->ttls[$orphan] ?? null, 'The recreated inbox expires.');
+	}
+
+	public function testAWallClockStepDoesNotHastenAReconnect()
+	{
+		[$cluster] = $this->openNode('n1');
+		$this->redis->failing = true;
+		$cluster->tick();   // the fault disconnects; a reconnect is due RECONNECT_INTERVAL later
+		$this->redis->failing = false;
+
+		$this->clock->setMicrotime(1000.0 + 3600);   // the wall clock steps forward an hour
+		$cluster->tick();
+		self::assertSame(1, $this->redis->connects, 'A wall-clock step does not end the reconnect delay.');
+
+		$this->mono->advance(TRedisBackplane::RECONNECT_INTERVAL + 1);
+		$cluster->tick();
+		self::assertSame(2, $this->redis->connects, 'The delay ends on the monotonic clock.');
 	}
 
 	public function testOpenRequiresTheRedisExtension()

@@ -9,15 +9,27 @@ use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Stream\TBufferStream;
+use Prado\Prado;
+use Prado\Test\Unit\IO\Socket\WebSocket\TTestMonotonicClock;
 use Prado\Util\Clock\TMockClock;
+use Prado\Util\Log\TLogger;
 
 class TFileBackplaneTest extends TestCase
 {
 	private string $dir;
+	private TTestMonotonicClock $mono;
 
 	protected function setUp(): void
 	{
 		$this->dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'wscluster_' . uniqid('', true);
+		$this->mono = new TTestMonotonicClock(1000.0);
+	}
+
+	/** Moves the wall clock and the monotonic clock forward together, as time passing does. */
+	private function advance(TMockClock $clock, float $seconds): void
+	{
+		$clock->setMicrotime($clock->microtime() + $seconds);
+		$this->mono->advance($seconds);
 	}
 
 	protected function tearDown(): void
@@ -58,6 +70,7 @@ class TFileBackplaneTest extends TestCase
 		$backplane = new TFileBackplane();
 		$backplane->setDirectory($this->dir);
 		$backplane->setClock($clock);
+		$backplane->setMonotonicClock($this->mono);
 		$cluster = new TWebSocketCluster($nodeId, $backplane);
 		$cluster->open();
 		return $cluster;
@@ -84,7 +97,7 @@ class TFileBackplaneTest extends TestCase
 
 		// C crashes: it stops refreshing its file.  Whichever node reaps the file first, both forget the client.
 		for ($i = 0; $i < 20; $i++) {
-			$clock->setMicrotime($clock->microtime() + 5);
+			$this->advance($clock, 5);
 			$a->tick();
 			$b->tick();
 		}
@@ -106,7 +119,7 @@ class TFileBackplaneTest extends TestCase
 		self::assertArrayHasKey($clientId, $p->presence());
 
 		for ($i = 0; $i < 20; $i++) {
-			$clock->setMicrotime($clock->microtime() + 5);
+			$this->advance($clock, 5);
 			$p->tick();   // Q has crashed
 		}
 
@@ -165,7 +178,7 @@ class TFileBackplaneTest extends TestCase
 		$x->tick();
 
 		for ($i = 0; $i < 20; $i++) {
-			$clock->setMicrotime($clock->microtime() + 5);
+			$this->advance($clock, 5);
 			$x->tick();   // Y stalls: X reaps its file and drops the client
 		}
 		self::assertArrayNotHasKey($clientId, $x->presence());
@@ -178,6 +191,105 @@ class TFileBackplaneTest extends TestCase
 		self::assertGreaterThan(0, filesize($this->presenceFile($clientId)), 'The rewritten file holds the metadata, not an empty touch.');
 		self::assertArrayHasKey($clientId, $x->presence(), 'The resumed node announces its live client again.');
 		self::assertArrayHasKey($clientId, $this->makeClockedNode('Z', $clock)->presence(), 'A late joiner sees the live client.');
+	}
+
+	public function testAWallClockStepDoesNotHastenThePresenceRefresh()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$x = $this->makeClockedNode('X', $clock);
+		[$connection] = $this->makeConnection();
+		$clientId = $x->register($connection);
+		$x->tick();   // the first refresh
+		$refreshed = filemtime($this->presenceFile($clientId));
+
+		$clock->setMicrotime($clock->microtime() + 3600);   // the wall clock steps forward an hour
+		$x->tick();
+		clearstatcache();
+		self::assertSame($refreshed, filemtime($this->presenceFile($clientId)), 'A wall-clock step does not bring the next refresh forward.');
+
+		$this->mono->advance($x->getBackplane()->getPresenceTtl() / 3);
+		$x->tick();
+		clearstatcache();
+		self::assertSame((int) $clock->time(), filemtime($this->presenceFile($clientId)), 'The refresh runs a third of the TTL later on the monotonic clock, stamping the wall time.');
+	}
+
+	public function testAResumedNodeNeverReapsItsOwnLiveClient()
+	{
+		$clock = new TMockClock();
+		$clock->setMicrotime((float) time());
+		$x = $this->makeClockedNode('X', $clock);
+		$y = $this->makeClockedNode('Y', $clock);
+		[$connection] = $this->makeConnection();
+		$clientId = $x->register($connection);
+		$x->tick();
+		$y->tick();
+		self::assertArrayHasKey($clientId, $y->presence());
+
+		$this->advance($clock, 10 * $x->getBackplane()->getPresenceTtl());   // the whole host was suspended
+		$x->tick();   // X resumes first: it refreshes its client's file and reaps what is stale
+		$y->tick();
+
+		self::assertFileExists($this->presenceFile($clientId), 'The refreshed file is not reaped by its own node.');
+		self::assertArrayHasKey($clientId, $y->presence(), 'No drop of the live client reaches the other node.');
+	}
+
+	public function testATickReadsUpToTheDrainLimitAndReportsTheBacklog()
+	{
+		$node1 = $this->makeNode('node1');
+		$node2 = $this->makeNode('node2');
+		$backplane = $node2->getBackplane();
+		[$connection, $sink] = $this->makeConnection();
+		$node2->subscribe($node2->register($connection), 'news');
+		$node2->tick();   // reads the node's own join entries
+		$backplane->setDrainLimit(3);
+		for ($i = 1; $i <= 7; $i++) {
+			$node1->publish('news', 'm' . $i);
+		}
+
+		$node2->tick();
+		self::assertStringContainsString('m3', (string) $sink);
+		self::assertStringNotContainsString('m4', (string) $sink, 'One tick reads up to the drain limit.');
+		self::assertTrue($backplane->getHasBacklog(), 'A tick that stops at the limit with entries left reports a backlog.');
+		self::assertTrue($node2->getHasBacklog());
+		$node2->tick();
+		$node2->tick();
+		self::assertStringContainsString('m7', (string) $sink, 'Successive ticks read the rest.');
+		self::assertFalse($backplane->getHasBacklog(), 'A tick that reaches the end of the log leaves no backlog.');
+
+		self::assertSame(10000, (new TFileBackplane())->getDrainLimit());
+		self::assertSame(0, $backplane->setDrainLimit(-2)->getDrainLimit(), 'A negative limit means unlimited.');
+		for ($i = 8; $i <= 20; $i++) {
+			$node1->publish('news', 'm' . $i);
+		}
+		$node2->tick();
+		self::assertStringContainsString('m20', (string) $sink, 'An unlimited tick reads the whole log.');
+	}
+
+	public function testAWritableParentDirectoryIsReported()
+	{
+		$parent = $this->dir . '_parent';
+		mkdir($parent, 0o777, true);
+		chmod($parent, 0o777);   // another user could rename the spool inside it
+		$sticky = $this->dir . '_sticky';
+		mkdir($sticky, 0o777, true);
+		chmod($sticky, 0o1777);   // as /tmp: others can write, but cannot rename what they do not own
+		$warnings = function (string $spool): array {
+			Prado::getLogger()->deleteLogs(null, TFileBackplane::class);
+			$backplane = new TFileBackplane();
+			$backplane->setDirectory($spool);
+			new TWebSocketCluster('n1', $backplane);
+			$backplane->open();
+			return array_filter(Prado::getLogger()->getLogs(TLogger::WARNING, TFileBackplane::class), fn ($log) => str_contains($log[0], 'unsafe parent'));
+		};
+		try {
+			self::assertCount(1, $warnings($parent . DIRECTORY_SEPARATOR . 'spool'), 'A parent that others can write is reported.');
+			self::assertCount(0, $warnings($sticky . DIRECTORY_SEPARATOR . 'spool'), 'A sticky parent is safe.');
+			self::assertCount(0, $warnings($this->dir), 'The temporary directory is safe.');
+		} finally {
+			$this->removeTree($parent);
+			$this->removeTree($sticky);
+		}
 	}
 
 	public function testOpenRequiresADirectory()

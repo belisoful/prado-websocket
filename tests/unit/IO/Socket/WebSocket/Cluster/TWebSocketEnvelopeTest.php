@@ -62,6 +62,35 @@ class TWebSocketEnvelopeTest extends TestCase
 		self::assertNull($decoded->getClientId());
 	}
 
+	public function testDecodeRequiresAWellFormedStringTypeAndOrigin()
+	{
+		self::assertNull(TWebSocketEnvelope::decode('{"t":1,"o":"n"}'), 'A numeric type is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode('{"t":true,"o":"n"}'), 'A boolean type is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"broadcast","o":7}'), 'A numeric origin is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"","o":"n"}'), 'An empty type is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"Broadcast all","o":"n"}'), 'A type that is not a type name is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode('{"t":"' . str_repeat('a', 65) . '","o":"n"}'), 'An overlong type is rejected.');
+		self::assertNull(TWebSocketEnvelope::decode((string) json_encode(['t' => "broadcast\n", 'o' => 'n'])), 'A trailing newline is not part of a type name.');
+		$future = TWebSocketEnvelope::decode('{"t":"node.future-2","o":"n","i":"x"}');
+		self::assertNotNull($future, 'A well-formed type this version does not know is kept, so a mesh can relay it.');
+		self::assertSame('node.future-2', $future->getType());
+		self::assertNotNull(TWebSocketEnvelope::decode((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_SYNC, 'n'))->encode()));
+	}
+
+	public function testAMissingIdIsDerivedTheSameWayOnEveryHop()
+	{
+		$json = '{"t":"broadcast","o":"n","p":"x"}';
+		$first = TWebSocketEnvelope::decode($json);
+		$second = TWebSocketEnvelope::decode($json);
+		self::assertNotNull($first);
+		self::assertNotSame('', $first->getId());
+		self::assertSame($first->getId(), $second->getId(), 'Two decodes of the same id-less bytes agree on the id, so a relayed copy is a duplicate.');
+		self::assertSame($first->getId(), TWebSocketEnvelope::decode($first->encode())->getId(), 'The derived id travels with the re-encoded envelope.');
+		self::assertNotSame($first->getId(), TWebSocketEnvelope::decode('{"t":"broadcast","o":"n","p":"y"}')->getId());
+		$empty = '{"t":"broadcast","o":"n","p":"x","i":""}';
+		self::assertSame(TWebSocketEnvelope::decode($empty)->getId(), TWebSocketEnvelope::decode($empty)->getId(), 'An empty id is derived too.');
+	}
+
 	public function testBinaryAndNonUtf8PayloadsSurviveTheWire()
 	{
 		$bytes = "\x00\xff\xfe\x80binary";

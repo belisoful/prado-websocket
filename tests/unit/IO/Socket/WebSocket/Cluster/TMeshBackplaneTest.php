@@ -12,7 +12,7 @@ use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Stream\TBufferStream;
 use Prado\TComponent;
-use Prado\Util\Clock\TMockClock;
+use Prado\Test\Unit\IO\Socket\WebSocket\TTestMonotonicClock;
 
 /** A coordinator stand-in that records the envelopes a backplane delivers. */
 class SpyCluster extends TComponent implements IWebSocketCluster
@@ -121,11 +121,20 @@ class TMeshBackplaneTest extends TestCase
 		return [$rawA, $rawB];
 	}
 
+	/** @return string A `tcp://` URI on a loopback port the OS chose and nothing listens on. */
+	private function closedPortUri(): string
+	{
+		$listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+		$uri = 'tcp://127.0.0.1:' . $listener->getLocalAddress()->getPort();
+		$listener->close();
+		return $uri;
+	}
+
 	/** @return array{0: TWebSocketCluster, 1: TMeshBackplane} A coordinator on a mesh backplane. */
-	private function makeClusterNode(string $id, TMockClock $clock): array
+	private function makeClusterNode(string $id, TTestMonotonicClock $clock): array
 	{
 		$mesh = new TMeshBackplane();
-		$mesh->setClock($clock);
+		$mesh->setMonotonicClock($clock);
 		return [new TWebSocketCluster($id, $mesh), $mesh];
 	}
 
@@ -189,8 +198,8 @@ class TMeshBackplaneTest extends TestCase
 
 	public function testARestartedNodesPreviousClientsAreDroppedOnItsNewIncarnation()
 	{
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
+		$clock = new TTestMonotonicClock();
+		$clock->setSeconds(1000.0);
 		[$ca, $a] = $this->makeClusterNode('A', $clock);
 		[$cb1, $b1] = $this->makeClusterNode('B', $clock);
 		[, $rawB1] = $this->linkPair($a, $b1);
@@ -211,8 +220,8 @@ class TMeshBackplaneTest extends TestCase
 
 	public function testARestartIsDetectedBehindAnIntermediary()
 	{
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
+		$clock = new TTestMonotonicClock();
+		$clock->setSeconds(1000.0);
 		[$cp, $p] = $this->makeClusterNode('P', $clock);
 		[, $q] = $this->makeClusterNode('Q', $clock);
 		[$cr1, $r1] = $this->makeClusterNode('R', $clock);
@@ -331,19 +340,19 @@ class TMeshBackplaneTest extends TestCase
 	{
 		[$a] = $this->makeNode('A');
 
-		$clock = new TMockClock();
-		$b = (new TMeshBackplane())->setClock($clock);
+		$clock = new TTestMonotonicClock();
+		$b = (new TMeshBackplane())->setMonotonicClock($clock);
 		$b->setNodeTtl(10);
 		$spyB = new SpyCluster('B');
 		$b->setCluster($spyB);
 		$this->link($a, $b);
 
 		$a->putPresence('a-client', ['node' => 'A']);   // floods PRESENCE_SET, originNode 'A'
-		$clock->setMicrotime(1000.0);
+		$clock->setSeconds(1000.0);
 		$b->tick();   // B ingests the presence and records that node A is alive
 		self::assertNotContains('A', $spyB->droppedNodes, 'A node just heard from is not declared down.');
 
-		$clock->setMicrotime(1000.0 + 11.0);   // A never heartbeats again; advance B past the TTL
+		$clock->setSeconds(1000.0 + 11.0);   // A never heartbeats again; advance B past the TTL
 		$b->tick();
 		self::assertContains('A', $spyB->droppedNodes, 'A node unheard past the TTL is declared down and its presence reaped.');
 	}
@@ -351,21 +360,21 @@ class TMeshBackplaneTest extends TestCase
 	public function testAliveNodeIsNotDeclaredDown()
 	{
 		[$a] = $this->makeNode('A');
-		$clock = new TMockClock();
-		$b = (new TMeshBackplane())->setClock($clock);
+		$clock = new TTestMonotonicClock();
+		$b = (new TMeshBackplane())->setMonotonicClock($clock);
 		$b->setNodeTtl(10);
 		$b->setCluster($spyB = new SpyCluster('B'));
 		$this->link($a, $b);
 
 		$a->putPresence('a-client', ['node' => 'A']);
-		$clock->setMicrotime(1000.0);
+		$clock->setSeconds(1000.0);
 		$b->tick();
 
 		// A keeps heartbeating (a fresh envelope from A) before the TTL elapses.
 		$a->publish(new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', 'alive'));
-		$clock->setMicrotime(1000.0 + 8.0);
+		$clock->setSeconds(1000.0 + 8.0);
 		$b->tick();   // refreshes _nodeSeen[A]
-		$clock->setMicrotime(1000.0 + 12.0);
+		$clock->setSeconds(1000.0 + 12.0);
 		$b->tick();   // 12 since the last scan, but only 4 since A was last heard
 		self::assertNotContains('A', $spyB->droppedNodes, 'A node still being heard within the TTL stays alive.');
 	}
@@ -694,19 +703,19 @@ class TMeshBackplaneTest extends TestCase
 
 	public function testUnansweredChallengeIsDroppedAfterTheTimeout()
 	{
-		$clock = new TMockClock();
-		$b = (new TMeshBackplane())->setClock($clock);
+		$clock = new TTestMonotonicClock();
+		$b = (new TMeshBackplane())->setMonotonicClock($clock);
 		$b->setSecret('clustersecret');
 		$b->setCluster(new SpyCluster('B'));
 		[$rawAtk, $rawB] = TSocketStream::pair();
 		$rawAtk->setBlocking(false);
 		$rawB->setBlocking(false);
 
-		$clock->setMicrotime(1000.0);
+		$clock->setSeconds(1000.0);
 		$b->addPeer(new TWebSocketConnection($rawB, false), $rawB);   // authDeadline = 1000 + Timeout
 		self::assertSame(1, $b->getPeerCount());
 
-		$clock->setMicrotime(1000.0 + $b->getTimeout() + 1.0);   // the peer never answers; advance past the deadline
+		$clock->setSeconds(1000.0 + $b->getTimeout() + 1.0);   // the peer never answers; advance past the deadline
 		$b->tick();
 		self::assertSame(0, $b->getPeerCount(), 'A peer that never answers the challenge is dropped after the timeout.');
 	}
@@ -815,30 +824,31 @@ class TMeshBackplaneTest extends TestCase
 
 	public function testADeadNodesLinkIsDroppedSoItsUriCanBeRedialed()
 	{
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
+		$clock = new TTestMonotonicClock();
+		$clock->setSeconds(1000.0);
 		[$a] = $this->makeSecretNode('A', 'clustersecret');
 		[$b] = $this->makeSecretNode('B', 'clustersecret');
-		$a->setClock($clock);
-		$b->setClock($clock);
+		$a->setMonotonicClock($clock);
+		$b->setMonotonicClock($clock);
 		[$rawA, $rawB] = TSocketStream::pair();
 		$rawA->setBlocking(false);
 		$rawB->setBlocking(false);
 		$a->addPeer(new TWebSocketConnection($rawA, false), $rawA);
-		$b->addPeer(new TWebSocketConnection($rawB, true), $rawB, 'tcp://127.0.0.1:1');   // B dialed A at this URI
+		$uriA = $this->closedPortUri();
+		$b->addPeer(new TWebSocketConnection($rawB, true), $rawB, $uriA);   // B dialed A at this URI
 		for ($round = 0; $round < 4; $round++) {
 			$a->tick();   // mutual verification, then A's first heartbeat proves it alive to B
 			$b->tick();
 		}
 		self::assertSame(1, $b->getPeerCount());
-		$b->connectPeer('tcp://127.0.0.1:1');
+		$b->connectPeer($uriA);
 		self::assertSame(0, $b->getPendingCount(), 'A linked URI is not dialed again.');
 
 		// A falls silent (a half-open link keeps reading nothing) past the TTL.
-		$clock->setMicrotime(1000.0 + $b->getNodeTtl() + 1);
+		$clock->setSeconds(1000.0 + $b->getNodeTtl() + 1);
 		$b->tick();
 		self::assertSame(0, $b->getPeerCount(), 'The link to a node declared down is dropped.');
-		$b->connectPeer('tcp://127.0.0.1:1');
+		$b->connectPeer($uriA);
 		self::assertSame(1, $b->getPendingCount(), 'The dead node\'s URI is free to be dialed again.');
 		$b->close();
 		$a->close();
@@ -846,22 +856,22 @@ class TMeshBackplaneTest extends TestCase
 
 	public function testUnlinkedSeedPeersAreRedialedOncePerTtl()
 	{
-		$clock = new TMockClock();
-		$clock->setMicrotime(1000.0);
+		$clock = new TTestMonotonicClock();
+		$clock->setSeconds(1000.0);
 		[$mesh] = $this->makeSecretNode('A', 'clustersecret');
-		$mesh->setClock($clock);
-		$mesh->setPeers(['tcp://127.0.0.1:1']);   // nothing listens there
+		$mesh->setMonotonicClock($clock);
+		$mesh->setPeers([$this->closedPortUri()]);   // nothing listens there
 		$mesh->setTimeout(2);
 		$mesh->open();
 		self::assertSame(1, $mesh->getPendingCount(), 'The seed is dialed on open.');
 
-		$clock->setMicrotime(1003.0);   // past the dial timeout: the attempt fails and the first re-dial is due
+		$clock->setSeconds(1003.0);   // past the dial timeout: the attempt fails and the first re-dial is due
 		$mesh->tick();
 		self::assertSame(1, $mesh->getPendingCount(), 'A failed seed dial is retried.');
-		$clock->setMicrotime(1006.0);
+		$clock->setSeconds(1006.0);
 		$mesh->tick();
 		self::assertSame(0, $mesh->getPendingCount(), 'Re-dials are throttled to once per TTL.');
-		$clock->setMicrotime(1006.0 + $mesh->getNodeTtl());
+		$clock->setSeconds(1006.0 + $mesh->getNodeTtl());
 		$mesh->tick();
 		self::assertSame(1, $mesh->getPendingCount(), 'The seed is dialed again after a TTL.');
 		$mesh->close();
@@ -871,16 +881,277 @@ class TMeshBackplaneTest extends TestCase
 	{
 		[$b, , $peer] = $this->verifiedPeer('A');
 		// A relays C's announce first: B must dial C, not bind C's URI to A's link.
-		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => 'tcp://127.0.0.1:2']))->encode());
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => $this->closedPortUri()]))->encode());
 		$b->tick();
 		self::assertSame(1, $b->getPendingCount(), 'A distant node announced through the peer is dialed.');
 		// Then A announces itself: that binds to the link, so B never dials A's URI.
-		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'A', '', null, null, ['uri' => 'tcp://127.0.0.1:3']))->encode());
+		$uriA = $this->closedPortUri();
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'A', '', null, null, ['uri' => $uriA]))->encode());
 		$b->tick();
 		$pending = $b->getPendingCount();   // the refused dial to C may already have failed; only the delta matters
-		$b->connectPeer('tcp://127.0.0.1:3');
+		$b->connectPeer($uriA);
 		self::assertSame($pending, $b->getPendingCount(), 'The direct peer\'s own URI is bound to its link and not dialed.');
 		$b->close();
+	}
+
+	public function testATlsDialDoesNotBlockOnAPeerThatStallsTheHandshake()
+	{
+		if (!extension_loaded('openssl')) {
+			self::markTestSkipped('ext-openssl is not available.');
+		}
+		$clock = new TTestMonotonicClock(1000.0);
+		[$mesh] = $this->makeSecretNode('A', 'clustersecret');
+		$mesh->setMonotonicClock($clock);
+		$mesh->setTimeout(0.5);
+		$listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);   // accepts TCP in its backlog and never speaks TLS
+		$uri = 'tls://127.0.0.1:' . $listener->getLocalAddress()->getPort();
+
+		$mesh->connectPeer($uri);   // returns at once: no TLS handshake inside the connect
+		self::assertSame(1, $mesh->getPendingCount(), 'The dial is in flight, not failed inside a blocking handshake.');
+		for ($i = 0; $i < 5; $i++) {
+			$mesh->tick();   // the connect completes and the handshake waits for a reply that never comes
+		}
+		self::assertSame(1, $mesh->getPendingCount(), 'The stalled handshake waits without blocking.');
+
+		$clock->advance(1.0);   // past the dial timeout
+		$mesh->tick();
+		self::assertSame(0, $mesh->getPendingCount(), 'A handshake that does not finish by the deadline fails the dial.');
+		$mesh->close();
+		$listener->close();
+	}
+
+	public function testAConnectingDialIsAWriteSourceThatWritabilityAdvances()
+	{
+		[$mesh] = $this->makeSecretNode('A', 'clustersecret');
+		$listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+		$mesh->connectPeer('tcp://127.0.0.1:' . $listener->getLocalAddress()->getPort());
+		$sources = $mesh->getWriteSources();
+		self::assertCount(1, $sources, 'A connecting dial is watched for writability, which reports its connect.');
+		self::assertSame($mesh->getSources()[0], $sources[0]);
+
+		for ($i = 0; $i < 200 && $mesh->getWriteSources() !== []; $i++) {
+			$mesh->flushSource($sources[0]);   // the server reports the dial writable; no cluster tick runs
+			usleep(1000);
+		}
+
+		self::assertSame([], $mesh->getWriteSources(), 'Writability completes the connect and sends the upgrade, without a tick.');
+		self::assertSame(1, $mesh->getPendingCount(), 'The dial now waits for the upgrade response.');
+		$accepted = stream_socket_accept($listener->getResource(), 1.0);
+		self::assertIsResource($accepted);
+		stream_set_blocking($accepted, false);
+		$request = '';
+		for ($i = 0; $i < 200 && !str_contains($request, "\r\n\r\n"); $i++) {
+			$request .= (string) fread($accepted, 4096);
+			usleep(1000);
+		}
+		self::assertStringStartsWith('GET /cluster HTTP/1.1', $request, 'The upgrade request was sent from flushSource().');
+		fclose($accepted);
+		$mesh->close();
+		$listener->close();
+	}
+
+	public function testAnUnverifiedAcceptedPeerCannotSendALargeMessage()
+	{
+		[$b, , $attacker] = $this->challengedAttacker();
+		$attacker->send((new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'evil', '', null, 'evil-1', ['pad' => str_repeat('x', 2 * TMeshBackplane::UNVERIFIED_MESSAGE_SIZE)]))->encode());
+		$b->tick();
+		self::assertSame(0, $b->getPeerCount(), 'A message over the unverified limit drops the peer before it is buffered.');
+	}
+
+	public function testAVerifiedPeerGetsTheLinksFullMessageSizeBack()
+	{
+		[$b, $spyB, $peer] = $this->verifiedPeer('A');
+		$payload = str_repeat('y', 64 * 1024);
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::BROADCAST, 'A', $payload))->encode());
+		for ($i = 0; $i < 200 && $spyB->traffic() === []; $i++) {
+			$peer->flushOutbound();
+			$b->tick();
+		}
+		self::assertSame(1, $b->getPeerCount(), 'A verified peer may send a large message.');
+		self::assertSame($payload, $spyB->traffic()[0]->getPayload() ?? null);
+	}
+
+	/**
+	 * Pumps mesh nodes, moving the clock forward between rounds.
+	 * @param TTestMonotonicClock $clock
+	 * @param TMeshBackplane[] $nodes
+	 * @param int $rounds
+	 * @param float $step
+	 */
+	private function pump(TTestMonotonicClock $clock, array $nodes, int $rounds, float $step = 0.5): void
+	{
+		for ($i = 0; $i < $rounds; $i++) {
+			foreach ($nodes as $node) {
+				$node->tick();
+			}
+			$clock->advance($step);
+		}
+	}
+
+	/** @return array{0: TWebSocketCluster, 1: TMeshBackplane} A coordinator on a mesh backplane with a short TTL. */
+	private function makeLineNode(string $id, TTestMonotonicClock $clock): array
+	{
+		[$cluster, $mesh] = $this->makeClusterNode($id, $clock);
+		$mesh->setNodeTtl(3);
+		return [$cluster, $mesh];
+	}
+
+	public function testPresenceBehindAnIntermediaryConvergesAfterATransientSilence()
+	{
+		$clock = new TTestMonotonicClock(1000.0);
+		[$ca, $a] = $this->makeLineNode('A', $clock);
+		[, $b] = $this->makeLineNode('B', $clock);
+		[$cc, $c] = $this->makeLineNode('C', $clock);
+		$this->linkPair($a, $b);
+		[$rawB] = $this->linkPair($b, $c);   // a line: A - B - C
+		$a1 = $ca->register(new TWebSocketConnection(new TBufferStream(), false));
+		$c1 = $cc->register(new TWebSocketConnection(new TBufferStream(), false));
+		$this->pump($clock, [$a, $b, $c], 6);
+		self::assertArrayHasKey($c1, $ca->presence());
+		self::assertArrayHasKey($a1, $cc->presence());
+
+		$rawB->close();   // the B - C link breaks, and stays down past the TTL
+		$this->pump($clock, [$a, $b, $c], 16);
+		self::assertArrayNotHasKey($c1, $ca->presence(), 'A declared C down.');
+		self::assertArrayNotHasKey($a1, $cc->presence(), 'C declared A down.');
+
+		$this->linkPair($b, $c);   // the link is restored
+		$this->pump($clock, [$a, $b, $c], 8);
+
+		self::assertArrayHasKey($c1, $ca->presence(), "A re-learns C's client through B.");
+		self::assertArrayHasKey($a1, $cc->presence(), "C re-learns the client of A, which is not its direct peer.");
+	}
+
+	public function testPresenceBehindAnIntermediaryConvergesAfterTheDirectLinkFlaps()
+	{
+		$clock = new TTestMonotonicClock(1000.0);
+		[$ca, $a] = $this->makeLineNode('A', $clock);
+		[$cb, $b] = $this->makeLineNode('B', $clock);
+		[$cc, $c] = $this->makeLineNode('C', $clock);
+		[$rawA] = $this->linkPair($a, $b);
+		$this->linkPair($b, $c);
+		$b1 = $cb->register(new TWebSocketConnection(new TBufferStream(), false));
+		$c1 = $cc->register(new TWebSocketConnection(new TBufferStream(), false));
+		$this->pump($clock, [$a, $b, $c], 6);
+		self::assertArrayHasKey($c1, $ca->presence());
+
+		$rawA->close();   // A's only link breaks past the TTL: A declares B and C down
+		$this->pump($clock, [$a, $b, $c], 16);
+		self::assertSame([], array_diff_key($ca->presence(), array_flip($ca->getLocalClientIds())), 'A holds no remote client.');
+
+		$this->linkPair($a, $b);
+		$this->pump($clock, [$a, $b, $c], 8);
+
+		self::assertArrayHasKey($b1, $ca->presence(), "A re-learns its direct peer's client from the join state.");
+		self::assertArrayHasKey($c1, $ca->presence(), "A re-learns the client of C, behind B.");
+	}
+
+	public function testPresenceRequestsAreAnsweredAtMostOncePerInterval()
+	{
+		[$b, , $peer, $raw] = $this->verifiedPeer('A');
+		$clock = new TTestMonotonicClock(1000.0);
+		$b->setMonotonicClock($clock);
+		$b->putPresence('B-1', ['node' => 'B']);
+		$read = function () use ($peer, $raw): array {
+			$types = [];
+			$bytes = $raw->read(1 << 20);
+			foreach ($bytes === '' ? [] : $peer->feed($bytes) as $message) {
+				$types[] = TWebSocketEnvelope::decode($message)->getType();
+			}
+			return $types;
+		};
+		$b->tick();
+		$read();   // the join state and the first heartbeat
+		$request = fn (array $nodes) => $peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_SYNC, 'A', '', null, null, ['nodes' => $nodes]))->encode());
+
+		$request(['C']);
+		$b->tick();
+		self::assertNotContains(TWebSocketEnvelope::PRESENCE_SET, $read(), 'A request naming another node is not answered here.');
+
+		$request(['B', 'C']);
+		$request(['B']);
+		$b->tick();
+		$answer = $read();
+		self::assertSame(1, count(array_keys($answer, TWebSocketEnvelope::NODE_UP, true)), 'Two requests in one tick get one announce.');
+		self::assertContains(TWebSocketEnvelope::PRESENCE_SET, $answer, 'The local clients are re-announced.');
+
+		$request(['B']);
+		$b->tick();
+		self::assertNotContains(TWebSocketEnvelope::PRESENCE_SET, $read(), 'A request within the interval waits.');
+		$clock->advance(TMeshBackplane::ANNOUNCE_INTERVAL);
+		$b->tick();
+		self::assertContains(TWebSocketEnvelope::PRESENCE_SET, $read(), 'It is answered once the interval passes.');
+		$b->close();
+	}
+
+	public function testANodeHeardForTheFirstTimeIsAskedForItsPresenceOnce()
+	{
+		[$b, $spyB, $peer, $raw] = $this->verifiedPeer('A');
+		$requests = function () use ($peer, $raw): array {
+			$nodes = [];
+			$bytes = $raw->read(1 << 20);
+			foreach ($bytes === '' ? [] : $peer->feed($bytes) as $message) {
+				$envelope = TWebSocketEnvelope::decode($message);
+				if ($envelope->getType() === TWebSocketEnvelope::NODE_SYNC) {
+					$nodes[] = $envelope->getMeta()['nodes'];
+				}
+			}
+			return $nodes;
+		};
+		$b->tick();
+		self::assertSame([], $requests(), 'The verified direct peer sends its join state; it is not asked.');
+
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => '']))->encode());
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, 'D', '', null, 'D-1', ['node' => 'D']))->encode());
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => '']))->encode());
+		$b->tick();
+		self::assertSame([['C', 'D']], $requests(), 'The nodes first heard in one tick are asked for in one request.');
+
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => '']))->encode());
+		$b->tick();
+		self::assertSame([], $requests(), 'A node already heard is not asked again.');
+		self::assertNotContains(TWebSocketEnvelope::NODE_SYNC, array_map(fn ($e) => $e->getType(), $spyB->received), 'A request is not routed to the coordinator.');
+		$b->close();
+	}
+
+	public function testAWallClockStepDoesNotDeclareANodeDown()
+	{
+		[$b, $spyB, $peer] = $this->verifiedPeer('A');
+		$wall = new \Prado\Util\Clock\TMockClock();
+		$wall->setMicrotime(1000.0);
+		$b->setClock($wall);
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'A', '', null, null, ['uri' => '']))->encode());
+		$b->tick();
+
+		$wall->setMicrotime(1000.0 + 3600);   // the wall clock steps forward an hour
+		$b->tick();
+
+		self::assertSame([], $spyB->droppedNodes, 'A wall-clock step is not a silence.');
+		self::assertSame(1, $b->getPeerCount());
+		$b->close();
+	}
+
+	public function testPeerPatternLimitsWhichAnnouncedPeersAreDialed()
+	{
+		$mesh = new RecordingMesh();
+		$mesh->setPeerPattern('#^tcp://10\.0\.#');
+		$mesh->setCluster(new SpyCluster('B'));
+
+		$this->feedGossip($mesh, 'tcp://remote:1', ['tcp://10.0.0.9:1', 'tcp://169.254.169.254:80', 'tcp://10.0.0.9:1']);
+		self::assertSame(['tcp://10.0.0.9:1'], $mesh->dialed, 'Only an announced URI matching the pattern is dialed.');
+		self::assertSame('#^tcp://10\.0\.#', $mesh->getPeerPattern());
+		self::assertSame('', (new TMeshBackplane())->getPeerPattern(), 'Any announced URI is dialed by default.');
+
+		$this->expectException(\Prado\Exceptions\TInvalidDataValueException::class);
+		$mesh->setPeerPattern('#unclosed');
+	}
+
+	public function testSslContextRoundTrips()
+	{
+		$mesh = new TMeshBackplane();
+		self::assertSame([], $mesh->getSslContext());
+		self::assertSame($mesh, $mesh->setSslContext(['cafile' => '/etc/cluster-ca.pem']));
+		self::assertSame(['cafile' => '/etc/cluster-ca.pem'], $mesh->getSslContext());
 	}
 
 	public function testTrafficUnderThisNodesOwnIdFromAPeerIsIgnored()
