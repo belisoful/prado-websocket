@@ -86,6 +86,62 @@ test('answers calls and reports server errors by code', async ({ page }) => {
 	});
 });
 
+test('relays empty objects and objects with numeric keys as sent', async ({ page }) => {
+	const res = await page.evaluate(async ({ url }) => {
+		const ps = new window.Prado.WebSocket.PubSub(url);
+		const got = [];
+		let resolve;
+		const both = new Promise((r) => { resolve = r; });
+		await ps.subscribe('room:4', (d) => {
+			got.push(d);
+			if (got.length === 2) {
+				resolve();
+			}
+		});
+		await ps.publish('room:4', {});
+		await ps.publish('room:4', { 0: 'x', 1: 'y', nested: {} });
+		await both;
+		ps.close();
+		return got;
+	}, { url: url(PUBSUB_PORT) });
+	expect(res).toEqual([{}, { 0: 'x', 1: 'y', nested: {} }]);
+});
+
+test('settles a request the server cannot decode', async ({ page }) => {
+	const res = await page.evaluate(async ({ url }) => {
+		const ps = new window.Prado.WebSocket.PubSub(url, { requestTimeout: 5000 });
+		const errors = [];
+		ps.on('error', (e) => errors.push(e.code));
+		// JSON.stringify writes a lone surrogate (half of a cut emoji) as \ud83d, which PHP refuses to decode.
+		const code = await ps.publish('room:1', { text: '🌍'.slice(0, 1) }).then(() => 'resolved', (e) => e.code);
+		ps.close();
+		return { code, errors };
+	}, { url: url(PUBSUB_PORT) });
+	expect(res).toEqual({ code: 'bad_request', errors: [] });
+});
+
+test('reconnects after the server refuses a message as too big', async ({ page }) => {
+	const server = startWsServer({ port: RESTART_PORT, pubsub: true, maxMessage: 1024, maxFrame: 0 });
+	await server.ready();
+	try {
+		const res = await page.evaluate(async ({ url }) => {
+			const ps = new window.Prado.WebSocket.PubSub(url, { minDelay: 50, maxDelay: 100 });
+			const closes = [];
+			ps.on('close', (e) => closes.push(e));
+			await ps.call('echo', null);
+			const big = await ps.publish('room:1', 'x'.repeat(4096)).then(() => 'resolved', (e) => e.code);
+			const after = await ps.call('echo', 'still here');
+			ps.close();
+			return { big, close: closes[0], after };
+		}, { url: url(RESTART_PORT) });
+		expect(res.big).toBe('disconnected');
+		expect(res.close).toMatchObject({ code: 1009, willReconnect: true });
+		expect(res.after).toBe('still here');
+	} finally {
+		await server.stop();
+	}
+});
+
 test('stops delivering after unsubscribe', async ({ page }) => {
 	const res = await page.evaluate(async ({ url }) => {
 		const PubSub = window.Prado.WebSocket.PubSub;

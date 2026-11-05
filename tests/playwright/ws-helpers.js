@@ -73,9 +73,9 @@ export function startPhp({ args, port, env = {} }) {
 /**
  * Spawns the PHP echo WebSocket server ({@link ./ws-server.php}) and returns a
  * handle to await its readiness and stop it.
- * @param {{ port: number, subprotocols?: string, deflate?: boolean, pubsub?: boolean, heartbeat?: number }} options
+ * @param {{ port: number, subprotocols?: string, deflate?: boolean, pubsub?: boolean, heartbeat?: number, maxMessage?: number, maxFrame?: number }} options
  */
-export function startWsServer({ port, subprotocols = '', deflate = false, pubsub = false, heartbeat = 0 }) {
+export function startWsServer({ port, subprotocols = '', deflate = false, pubsub = false, heartbeat = 0, maxMessage, maxFrame }) {
 	return startPhp({
 		args: [SERVER],
 		port,
@@ -86,6 +86,8 @@ export function startWsServer({ port, subprotocols = '', deflate = false, pubsub
 			WS_DEFLATE: deflate ? '1' : '0',
 			WS_PUBSUB: pubsub ? '1' : '0',
 			WS_HEARTBEAT: heartbeat ? String(heartbeat) : '',
+			WS_MAX_MESSAGE: maxMessage === undefined ? '' : String(maxMessage),
+			WS_MAX_FRAME: maxFrame === undefined ? '' : String(maxFrame),
 		},
 	});
 }

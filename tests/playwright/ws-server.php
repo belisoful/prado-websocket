@@ -15,6 +15,8 @@
  *   WS_DEFLATE      "1" to offer RFC 7692 permessage-deflate
  *   WS_PUBSUB       "1" to serve prado.pubsub.v1 with TWebSocketPubSubHandler instead of echoing
  *   WS_HEARTBEAT    the pub/sub heartbeat in seconds (default 25)
+ *   WS_MAX_MESSAGE  the server MaxMessageSize in bytes (default the server's)
+ *   WS_MAX_FRAME    the pub/sub MaxFrameSize in bytes (default the handler's; 0 for none)
  *
  * In pub/sub mode, clients may publish to `room:*` channels, and the `echo` call returns its
  * params while `kick` closes the caller with 4401.
@@ -47,6 +49,9 @@ if (getenv('WS_PUBSUB') === '1') {
 	$handler = new TWebSocketPubSubHandler();
 	$handler->setCluster($cluster);
 	$handler->setHeartbeat(getenv('WS_HEARTBEAT') ?: TWebSocketPubSubHandler::DEFAULT_HEARTBEAT);
+	if (($maxFrame = getenv('WS_MAX_FRAME')) !== false && $maxFrame !== '') {
+		$handler->setMaxFrameSize($maxFrame);
+	}
 	$handler->attachEventHandler('onPublish', function ($connection, TWebSocketPubSubEventParameter $param): void {
 		$param->setAllowed(str_starts_with($param->getChannel(), 'room:'));
 	});
@@ -76,6 +81,9 @@ if (getenv('WS_PUBSUB') === '1') {
 
 if (($subprotocols = getenv('WS_SUBPROTOCOLS')) !== false && $subprotocols !== '') {
 	$server->setSubprotocols(array_map('trim', explode(',', $subprotocols)));
+}
+if (($maxMessage = getenv('WS_MAX_MESSAGE')) !== false && $maxMessage !== '') {
+	$server->setMaxMessageSize($maxMessage);
 }
 if (getenv('WS_DEFLATE') === '1') {
 	$server->setExtensions([new TPermessageDeflateNegotiator()]);
