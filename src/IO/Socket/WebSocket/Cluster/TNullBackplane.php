@@ -17,8 +17,8 @@ use Prado\TComponent;
  *
  * The default backplane: a single node with no peers.  Every method is inert, so a
  * {@see TWebSocketCluster} using it delivers only to its own local clients.  This is the
- * zero-dependency mode a server runs in until a real backplane (Redis pub/sub, a WebSocket peer
- * mesh) is configured.
+ * zero-dependency mode a server runs in until a real backplane ({@see TRedisBackplane},
+ * {@see TFileBackplane} or {@see TMeshBackplane}) is configured.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */

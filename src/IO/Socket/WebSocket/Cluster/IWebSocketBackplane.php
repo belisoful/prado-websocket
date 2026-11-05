@@ -15,14 +15,16 @@ namespace Prado\IO\Socket\WebSocket\Cluster;
  *
  * The pluggable transport that carries {@see TWebSocketEnvelope} traffic between cluster nodes and
  * keeps the shared presence and node registries.  A {@see TWebSocketCluster} coordinator owns one
- * backplane and drives it; the backplane is the only part that knows the medium, so a Redis
- * pub/sub driver and a WebSocket peer-mesh driver are interchangeable behind this contract.
+ * backplane and drives it; the backplane is the only part that knows the medium, so the Redis,
+ * shared-directory and WebSocket peer-mesh drivers are interchangeable behind this contract.
  *
  * Loop integration: {@see getSources()} returns any selectable resources to fold into the server's
  * event loop, and {@see tick()} is pumped once per loop iteration to read inbound traffic and run
  * housekeeping (heartbeats, registry expiry).  A driver that has no selectable resource returns an
  * empty array and does its work in {@see tick()}.  A driver whose sources queue output implements
- * {@see IWebSocketBufferedBackplane}, so the server drains them on writability.
+ * {@see IWebSocketBufferedBackplane}, so the server drains them on writability.  A polled driver that
+ * bounds each tick's read implements {@see IWebSocketPolledBackplane}, so the server ticks again at once
+ * while traffic remains.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */
@@ -83,7 +85,7 @@ interface IWebSocketBackplane
 	/**
 	 * Records a local client in the shared presence registry and announces it to the cluster.
 	 * @param string $clientId The cluster client id.
-	 * @param array<string, mixed> $meta The presence metadata; the backplane adds the node id.
+	 * @param array<string, mixed> $meta The presence metadata, already carrying the node id that the coordinator adds.
 	 */
 	public function putPresence(string $clientId, array $meta): void;
 

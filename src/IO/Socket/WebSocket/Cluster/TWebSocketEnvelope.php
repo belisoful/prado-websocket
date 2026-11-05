@@ -31,11 +31,18 @@ use Prado\TComponent;
  *  - {@see NODE_DOWN}: drop every presence entry of the node named by the `node` metadata (the origin
  *    node when absent).  A backplane sends it when it reaps a dead node, and a node sends it about
  *    itself before re-announcing its clients, so every node replaces that node's presence.
+ *  - {@see NODE_SYNC}: a mesh-only request that the nodes named by the `nodes` metadata re-announce
+ *    their presence, sent by a node that hears from a node whose presence it does not hold.
  *  - {@see AUTH_CHALLENGE}/{@see AUTH_RESPONSE}: a mesh-only peer authentication handshake (a nonce and its
  *    signed answer) consumed by the backplane itself, never routed to the coordinator.
  *
  * Each envelope carries OriginNode and a unique {@see getId() Id} so a coordinator drops its own
- * echo and a mesh backplane can suppress duplicate relays.
+ * echo and a mesh backplane can suppress duplicate relays.  An encoded envelope without an id is given
+ * one derived from its encoded form, so every node that decodes the same bytes assigns the same id.
+ *
+ * {@see decode()} accepts a type it does not know, provided it is a well-formed type name: a
+ * coordinator ignores it and a mesh still relays it, so a node can relay an envelope type that a newer
+ * node introduced.
  *
  * The wire form is JSON.  A payload that is not valid UTF-8, or one flagged {@see getIsBinary()
  * binary} (to reach clients as a Binary frame), travels base64-encoded, so any byte string crosses
@@ -65,6 +72,15 @@ class TWebSocketEnvelope extends TComponent
 
 	/** A node's clients left the cluster: the node named by the `node` metadata (else the origin) was reaped, or is re-announcing its presence. */
 	public const NODE_DOWN = 'node.down';
+
+	/**
+	 * A mesh node asks the nodes named by the `nodes` metadata to re-announce their presence.
+	 * @since 1.2.0
+	 */
+	public const NODE_SYNC = 'node.sync';
+
+	/** The pattern a decoded {@see getType() type} must match: a lowercase name of up to 64 characters. */
+	private const TYPE_PATTERN = '/^[a-z][a-z0-9._-]{0,63}$/D';
 
 	/** A mesh peer's anti-replay challenge: a fresh nonce each side of a new peer link asks the other to sign. */
 	public const AUTH_CHALLENGE = 'auth.challenge';
@@ -224,14 +240,16 @@ class TWebSocketEnvelope extends TComponent
 	}
 
 	/**
-	 * Reconstructs an envelope from its {@see encode() encoded} form.
+	 * Reconstructs an envelope from its {@see encode() encoded} form.  The type and the origin must be
+	 * strings, and the type a well-formed type name.  An envelope without an id is given one derived from
+	 * the encoded bytes, so the copies a mesh relays over several paths keep one id.
 	 * @param string $json The encoded envelope.
 	 * @return ?self The envelope, or null when the input is malformed.
 	 */
 	public static function decode(string $json): ?self
 	{
 		$data = json_decode($json, true);
-		if (!is_array($data) || !isset($data['t'], $data['o']) || !is_scalar($data['t']) || !is_scalar($data['o'])) {
+		if (!is_array($data) || !isset($data['t'], $data['o']) || !is_string($data['t']) || !is_string($data['o']) || preg_match(self::TYPE_PATTERN, $data['t']) !== 1) {
 			return null;
 		}
 		foreach (['p', 'c', 'k', 'i', 'e', 'b'] as $field) {
@@ -253,7 +271,7 @@ class TWebSocketEnvelope extends TComponent
 			isset($data['c']) ? (string) $data['c'] : null,
 			isset($data['k']) ? (string) $data['k'] : null,
 			is_array($data['m'] ?? null) ? $data['m'] : [],
-			(string) ($data['i'] ?? ''),
+			($id = (string) ($data['i'] ?? '')) !== '' ? $id : 'h-' . substr(hash('sha256', $json), 0, 32),   // derived, not drawn at random, so every hop agrees on it
 			!empty($data['b']),
 		);
 	}

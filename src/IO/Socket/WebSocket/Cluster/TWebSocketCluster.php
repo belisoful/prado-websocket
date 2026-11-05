@@ -52,6 +52,9 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	/** @var array<string, array<string, true>> The local subscribers, keyed by channel then client id. */
 	private array $_channels = [];
 
+	/** @var array<string, array<string, true>> The channels of each local client, keyed by client id then channel; the reverse of {@see $_channels}. */
+	private array $_clientChannels = [];
+
 	/** @var array<string, array<string, mixed>> The presence mirror (local and remote), keyed by client id. */
 	private array $_presence = [];
 
@@ -95,7 +98,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 			$this->_backplane->dropPresence($clientId);
 		}
 		$this->_backplane->close();
-		$this->_clients = $this->_localIds = $this->_channels = $this->_presence = [];
+		$this->_clients = $this->_localIds = $this->_channels = $this->_clientChannels = $this->_presence = [];
 	}
 
 	/**
@@ -104,6 +107,18 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	public function tick(): void
 	{
 		$this->_backplane->tick();
+	}
+
+	/**
+	 * Indicates whether the backplane's last tick left inbound traffic for the next one, so the server
+	 * ticks the cluster again without waiting.  Only an {@see IWebSocketPolledBackplane} reports a
+	 * backlog.
+	 * @return bool Whether inbound traffic remains to be drained.
+	 * @since 1.2.0
+	 */
+	public function getHasBacklog(): bool
+	{
+		return $this->_backplane instanceof IWebSocketPolledBackplane && $this->_backplane->getHasBacklog();
 	}
 
 	/**
@@ -139,7 +154,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 
 	/**
 	 * Unregisters a local client by its id or its connection, removing its subscriptions and
-	 * announcing its departure.
+	 * announcing its departure.  The cost is proportional to the client's own subscriptions.
 	 * @param string|TWebSocketConnection $client The client id or its connection.
 	 */
 	public function unregister(string|TWebSocketConnection $client): void
@@ -150,10 +165,10 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		if ($clientId === null || !isset($this->_clients[$clientId])) {
 			return;
 		}
-		foreach (array_keys($this->_channels) as $channel) {
-			$this->unsubscribe($clientId, $channel);
+		foreach (array_keys($this->_clientChannels[$clientId] ?? []) as $channel) {
+			$this->unsubscribe($clientId, (string) $channel);
 		}
-		unset($this->_localIds[spl_object_id($this->_clients[$clientId])], $this->_clients[$clientId], $this->_presence[$clientId]);
+		unset($this->_clientChannels[$clientId], $this->_localIds[spl_object_id($this->_clients[$clientId])], $this->_clients[$clientId], $this->_presence[$clientId]);
 		$this->_backplane->dropPresence($clientId);
 	}
 
@@ -194,6 +209,7 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		}
 		$first = !isset($this->_channels[$channel]);
 		$this->_channels[$channel][$clientId] = true;
+		$this->_clientChannels[$clientId][$channel] = true;
 		if ($first) {
 			$this->_backplane->subscribe($channel);
 		}
@@ -210,7 +226,10 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		if (!isset($this->_channels[$channel][$clientId])) {
 			return;
 		}
-		unset($this->_channels[$channel][$clientId]);
+		unset($this->_channels[$channel][$clientId], $this->_clientChannels[$clientId][$channel]);
+		if (($this->_clientChannels[$clientId] ?? null) === []) {
+			unset($this->_clientChannels[$clientId]);
+		}
 		if ($this->_channels[$channel] === []) {
 			unset($this->_channels[$channel]);
 			$this->_backplane->unsubscribe($channel);
@@ -245,8 +264,9 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 	}
 
 	/**
-	 * Sends a payload to one client wherever it is connected.  A local client is sent to directly;
-	 * a remote one is routed through the backplane.
+	 * Sends a payload to one client wherever it is connected.  A local client is sent to directly; a
+	 * remote one in the presence mirror is routed through the backplane.  A client the mirror does not
+	 * hold is reported unknown and nothing is sent.
 	 * @param string $clientId The cluster client id.
 	 * @param string $payload The message payload.
 	 * @param bool $binary Whether to deliver the payload as a Binary frame rather than Text.
@@ -258,8 +278,11 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 			$this->sendLocal($clientId, $payload, $binary);
 			return true;
 		}
+		if (!isset($this->_presence[$clientId])) {
+			return false;
+		}
 		$this->_backplane->publish(new TWebSocketEnvelope(TWebSocketEnvelope::DIRECT, $this->_nodeId, $payload, null, $clientId, [], '', $binary));
-		return isset($this->_presence[$clientId]);
+		return true;
 	}
 
 	/**
