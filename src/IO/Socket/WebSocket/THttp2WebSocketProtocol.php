@@ -33,21 +33,36 @@ use Psr\Http\Message\StreamInterface;
  * (RFC 8441 §5); one that does not is refused with `400`, or `426` for another version.  The
  * origin and `:authority` allowlists apply as on HTTP/1.1, and the subprotocol and extensions
  * ({@see setSubprotocols()}, {@see setExtensions()}) are negotiated from the stream's headers and
- * echoed in the `200` response.
+ * echoed in the `200` response.  A valid request the {@see setAdmission() admission} check refuses
+ * is answered with `503`.
  *
  * Each accepted CONNECT stream becomes a {@see TH2Stream} (a {@see StreamInterface}) wrapped in a
- * server {@see TWebSocketConnection} configured with the negotiated subprotocol and extensions;
+ * server {@see TWebSocketConnection} configured with the negotiated subprotocol and extensions,
+ * {@see setMaxMessageSize() MaxMessageSize}, and {@see setMaxSendBufferBytes() MaxSendBufferBytes};
  * the RFC 6455 frames flow as that stream's DATA.  Because HTTP/2 multiplexes, the bridge is event
- * driven: incoming DATA is fed to the connection's {@see TWebSocketConnection::feed()} and complete
- * messages dispatch to the handler, rather than a per-connection blocking loop.  {@see receive()}
- * and {@see send()} move bytes to and from the transport, so an event-loop server pumps the one
- * socket while many WebSockets run on it.
+ * driven: incoming DATA is fed to the connection's {@see TWebSocketConnection::feedMessages()} and
+ * complete messages dispatch to the handler, with no per-connection blocking loop.
+ * {@see receive()} and {@see send()} move bytes to and from the transport, so an event-loop server
+ * pumps the one socket while many WebSockets run on it.  Input that arrives while a handler keeps
+ * the session busy is held, up to {@see MAX_DEFERRED_BYTES}, and fed in order afterward.
+ *
+ * The session advertises SETTINGS_MAX_CONCURRENT_STREAMS:
+ * {@see TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS} (100) until {@see setMaxConcurrentStreams()}
+ * sets another limit.  nghttp2 refuses a stream past it.
  *
  * Each stream fails on its own.  A protocol error or an exception from the handler raises the
  * handler's {@see IWebSocketHandler::onError()} and closes that stream's connection with the
  * error's close code (1011 for a handler exception), as the synchronous
  * {@see IWebSocketHandler::handleConnection()} loop does.  A throwing `onOpen` resets its stream
  * and raises the closes.  The other streams on the transport carry on.
+ *
+ * A stream this side has finished with leaves the session without waiting for the peer.  A refused
+ * request is answered on a HEADERS frame that ends the stream.  A closed or failed WebSocket's
+ * stream ends after its queued Close frame.  Once that END_STREAM is sent, the stream is reset
+ * (RST_STREAM NO_ERROR, RFC 9113 §8.1) when the peer has not ended its side, and the DATA the peer
+ * sends meanwhile is discarded.  A finished stream whose last frame cannot be sent, because the
+ * peer grants no flow-control window, stays in {@see getEndingStreams()} until {@see endStream()}
+ * resets it; {@see TWebSocketServer} does so at its CloseTimeout.
  *
  * Events ('on' prefix), raised per multiplexed WebSocket so several observers can react (e.g. an
  * event-loop server and a cluster coordinator):
@@ -115,6 +130,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/** @var ?callable The capacity check a WebSocket stream must pass to open, or null for none. */
 	private $_admission;
 
+	/** @var array<int, TH2Stream> The streams this side has finished with that the session may still hold, keyed by stream id. */
+	private array $_endingStreams = [];
+
 	/**
 	 * @param IWebSocketHandler $handler The handler each WebSocket stream is run through.
 	 * @throws \Prado\IO\Http2\THttp2Exception When libnghttp2 is unavailable.
@@ -126,7 +144,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		$this->_session->submitSettings([TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL => 1]);
 		$this->_session->attachEventHandler('onRequest', fn ($session, $stream) => $this->acceptStream($stream));
 		$this->_session->attachEventHandler('onData', fn ($session, $stream) => $this->pumpStream($stream));
-		$this->_session->attachEventHandler('onClose', fn ($session, $stream) => $this->closeStream($stream));
+		$this->_session->attachEventHandler('onClose', fn ($session, $stream) => $this->forgetStream($stream));
 		parent::__construct();
 	}
 
@@ -299,10 +317,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Advertises the most WebSocket streams the peer may open at once on this session
-	 * (SETTINGS_MAX_CONCURRENT_STREAMS), so a conforming client queues further streams rather than
-	 * having them refused.  Call it before the session's first {@see send()}.
-	 * @param int $value The limit, or 0 to advertise none.
+	 * Advertises the most streams the peer may have open at once on this session
+	 * (SETTINGS_MAX_CONCURRENT_STREAMS).  A conforming client queues further streams, and nghttp2
+	 * refuses the streams of a client that does not.  The session advertises
+	 * {@see TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS} (100) until this sets another limit.  Call it
+	 * before the session's first {@see send()}.
+	 * @param int $value The limit, or 0 to keep the limit the session already advertises.
 	 * @since 1.2.0
 	 */
 	public function setMaxConcurrentStreams(int $value): void
@@ -331,6 +351,54 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			// The stream was already closed; only the closes remain to raise.
 		}
 		$this->raiseClose($connection);
+	}
+
+	/**
+	 * Returns the streams this side has finished with that the session still holds: a refused
+	 * request whose response has not been sent, and a closed or failed WebSocket whose queued bytes
+	 * and END_STREAM wait on the peer's flow-control window.  Such a stream carries no
+	 * {@see getConnections() connection}, and the DATA its peer sends is discarded.  It leaves the
+	 * session once its last frame is sent, and counts toward SETTINGS_MAX_CONCURRENT_STREAMS until
+	 * then.  {@see endStream()} ends the wait.
+	 * @return array<int, TH2Stream> The finished streams still in the session, keyed by stream id.
+	 * @since 1.2.0
+	 */
+	public function getEndingStreams(): array
+	{
+		foreach ($this->_endingStreams as $streamId => $stream) {
+			if ($this->_session->getStream($streamId) !== $stream) {
+				unset($this->_endingStreams[$streamId]);   // the session closed it
+			}
+		}
+		return $this->_endingStreams;
+	}
+
+	/**
+	 * Resets a stream of this session (RST_STREAM CANCEL), discarding what it still has queued.  The
+	 * server uses it to end a {@see getEndingStreams() finished stream} whose last frame the peer's
+	 * flow-control window has held back for CloseTimeout.  A stream that still carries a WebSocket
+	 * connection is ended through {@see endConnection()}, so its closes are raised.  A stream the
+	 * session no longer holds is ignored.
+	 * @param TH2Stream $stream A stream of this session.
+	 * @since 1.2.0
+	 */
+	public function endStream(TH2Stream $stream): void
+	{
+		$streamId = $stream->getStreamId();
+		$connection = $this->_connections[$streamId] ?? null;
+		if ($connection !== null && $connection->getStream() === $stream) {
+			$this->endConnection($connection);
+			return;
+		}
+		unset($this->_endingStreams[$streamId]);
+		if ($this->_session->getStream($streamId) !== $stream) {
+			return;
+		}
+		try {
+			$this->_session->resetStream($streamId, TNgHttp2::CANCEL);
+		} catch (\Throwable $e) {
+			// The session is closed, or nghttp2 no longer has the stream.
+		}
 	}
 
 	/**
@@ -524,7 +592,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		}
 		$this->_session->respond($stream, $response);
 		$connection = Prado::createComponent(TWebSocketConnection::class, $stream, false);
-		$connection->setValidateMasking(false);   // RFC 8441 carries WebSocket DATA without RFC 6455 masking
+		// RFC 8441 keeps RFC 6455 framing, client masking included.  Only the receive check is relaxed:
+		// a masked frame is unmasked as usual, and an unmasked frame is accepted as well.
+		$connection->setValidateMasking(false);
 		$connection->setMaxMessageSize($this->_maxMessageSize);
 		$connection->setMaxSendBufferBytes($this->_maxSendBufferBytes);
 		$connection->setSubprotocol($subprotocol);
@@ -555,13 +625,21 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/**
 	 * Feeds a stream's newly received DATA to its WebSocket connection and dispatches messages.  A
 	 * protocol error, or an exception from the handler, fails only this stream's connection
-	 * ({@see failStream()}); the other WebSockets on the transport carry on.
+	 * ({@see failStream()}); the other WebSockets on the transport carry on.  A protocol error on a
+	 * connection this side already closed raises no `onError`: the stream is ended, so its queued
+	 * Close frame is still sent and nothing more is fed.  DATA for a stream that carries no
+	 * connection (a refused request, a stream being reset) is read and discarded.
 	 * @param TH2Stream $stream The stream with new buffered data.
 	 */
 	protected function pumpStream(TH2Stream $stream): void
 	{
 		$connection = $this->_connections[$stream->getStreamId()] ?? null;
 		if ($connection === null) {
+			try {
+				$stream->getContents();   // nothing reads this stream: the bytes are dropped, not buffered
+			} catch (\Throwable $e) {
+				// A detached stream holds nothing.
+			}
 			return;
 		}
 		try {
@@ -583,6 +661,13 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			}
 		} catch (\Throwable $e) {
 			$this->failStream($stream, $connection, $e);
+			return;
+		}
+		if ($failure !== null) {
+			// This side had closed the connection, so the handler hears nothing of the error.  The
+			// malformed frame stays at the head of the connection's buffer: the stream ends here.
+			Prado::log('Protocol error on an HTTP/2 stream this side had closed; the stream is ended: ' . $failure->getMessage(), TLogger::NOTICE, static::class);
+			$this->closeStream($stream);
 			return;
 		}
 		if ($connection->getIsClosed()) {
@@ -619,16 +704,19 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Responds to a stream with a rejection status and ends it, so a refused Extended CONNECT does not
-	 * linger half-open (the deferred data provider otherwise keeps the stream alive indefinitely).
+	 * Responds to a stream with a rejection status and ends it on that HEADERS frame, which needs no
+	 * flow-control window.  Once the frame is sent the stream is reset when the peer has not ended
+	 * its side, and the DATA the peer sends meanwhile is discarded, so a refused Extended CONNECT
+	 * leaves the session whether or not the client ends it.
 	 * @param TH2Stream $stream The request stream to reject.
 	 * @param string $status The HTTP/2 status to respond with.
 	 * @param array<string, string> $headers Extra response headers (e.g. `sec-websocket-version` on a 426).
 	 */
 	protected function rejectStream(TH2Stream $stream, string $status, array $headers = []): void
 	{
-		$this->_session->respond($stream, [':status' => $status] + $headers);
-		$this->endLocalStream($stream);
+		$stream->setResetAfterEnd(true);
+		$this->_endingStreams[$stream->getStreamId()] = $stream;
+		$this->_session->respond($stream, [':status' => $status] + $headers, true);
 	}
 
 	/**
@@ -648,16 +736,35 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	}
 
 	/**
-	 * Ends the local (server) half of a stream so nghttp2 emits END_STREAM and reclaims it; best effort,
-	 * since the stream may already be gone.
+	 * Ends the local (server) half of a stream.  The bytes still queued on it (a Close frame) are
+	 * sent, then END_STREAM, and the stream is then reset when the peer has not ended its side
+	 * ({@see TH2Stream::setResetAfterEnd()}), so nghttp2 reclaims it without waiting for the peer.
+	 * The DATA the peer sends from here on is discarded.  Best effort, since the stream may already
+	 * be gone.
 	 * @param TH2Stream $stream The stream to end.
 	 */
 	protected function endLocalStream(TH2Stream $stream): void
 	{
 		try {
+			$stream->setResetAfterEnd(true);
+			$this->_endingStreams[$stream->getStreamId()] = $stream;
 			$stream->markLocalClosed();
 		} catch (\Throwable $e) {
 			// The stream was already reset or closed by the peer; nothing to end.
+		}
+	}
+
+	/**
+	 * Handles a stream the session has closed (both sides ended, or a reset): closes the WebSocket
+	 * connection it still carries and drops it from the {@see getEndingStreams() ending streams}.
+	 * @param TH2Stream $stream The stream nghttp2 closed.
+	 */
+	private function forgetStream(TH2Stream $stream): void
+	{
+		try {
+			$this->closeStream($stream);
+		} finally {
+			unset($this->_endingStreams[$stream->getStreamId()]);
 		}
 	}
 

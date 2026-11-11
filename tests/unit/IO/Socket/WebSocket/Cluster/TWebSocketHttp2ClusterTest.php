@@ -11,9 +11,13 @@ use Prado\IO\Socket\WebSocket\THttp2WebSocketProtocol;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 
 /**
- * Verifies that WebSocket-over-HTTP/2 streams join and leave the cluster per stream, using the
- * protocol's {@see THttp2WebSocketProtocol::onConnection}/{@see THttp2WebSocketProtocol::onClose}
- * events the server wires to the cluster.  Skipped when libnghttp2 is unavailable.
+ * Verifies that {@see THttp2WebSocketProtocol} raises {@see THttp2WebSocketProtocol::onConnection}
+ * and {@see THttp2WebSocketProtocol::onClose} once per WebSocket stream, so a cluster can follow
+ * each stream.  The test attaches its own handlers, which register and unregister the stream with
+ * a {@see TWebSocketCluster}; it does not run a server.  The server's own wiring of these events to
+ * its cluster is checked through the server by
+ * `TWebSocketServerHttp2Test::testHttp2StreamsJoinAndLeaveTheServersCluster`.  Skipped when
+ * libnghttp2 is unavailable.
  */
 class TWebSocketHttp2ClusterTest extends TestCase
 {
