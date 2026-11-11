@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket\Cluster;
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidOperationException;
+use Prado\IO\Socket\WebSocket\Cluster\IWebSocketPolledBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TFileBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
@@ -22,6 +23,32 @@ class TestableWebSocketModule extends TWebSocketModule
 	public function createBackplanePublic(array $properties): void
 	{
 		$this->createBackplane($properties);
+	}
+}
+
+/** A polled backplane whose inbound traffic takes several ticks to drain, as a burst past DrainLimit does. */
+class DrainingBackplane extends TNullBackplane implements IWebSocketPolledBackplane
+{
+	public int $ticks = 0;
+	/** @var ?\Closure Called once the last slice is drained. */
+	public ?\Closure $drained = null;
+
+	public function __construct(private int $slices)
+	{
+		parent::__construct();
+	}
+
+	public function tick(): void
+	{
+		$this->ticks++;
+		if ($this->ticks === $this->slices && $this->drained !== null) {
+			($this->drained)();
+		}
+	}
+
+	public function getHasBacklog(): bool
+	{
+		return $this->ticks < $this->slices;
 	}
 }
 
@@ -275,5 +302,24 @@ class TWebSocketModuleClusterTest extends TestCase
 		self::assertFalse($module->sendToClient('nobody', 'x'), 'An unknown client is reported.');
 
 		$cluster->close();
+	}
+
+	public function testAClusterBacklogDrainsWithoutWaitingOutTheModulesOneSecondTick()
+	{
+		$module = new TWebSocketModule();
+		$module->setEndpoint('tcp://127.0.0.1:0');
+		$backplane = new DrainingBackplane(6);
+		$backplane->drained = fn () => $module->stop();
+		$module->setBackplane($backplane);
+		$reactor = $module->getEventLoop();
+		$safetyNet = $reactor->delay(15.0, fn () => $module->stop());   // so a regression cannot hang the suite
+
+		$started = microtime(true);
+		self::assertTrue($module->serve());
+		$elapsed = microtime(true) - $started;
+		$reactor->cancel($safetyNet);
+
+		self::assertGreaterThanOrEqual(6, $backplane->ticks, 'Every slice of the backlog was drained.');
+		self::assertLessThan(3.0, $elapsed, 'The slices drain back to back; one per one-second module tick would take five seconds.');
 	}
 }
