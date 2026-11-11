@@ -2,7 +2,7 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
-import { startPhp } from './ws-helpers.js';
+import { builtInServerReady, startPhp } from './ws-helpers.js';
 
 /*
  * Smoke tests of the chat example (examples/chat), driven by browser pages that join a room,
@@ -27,16 +27,22 @@ const APP_PAGE = withWs(APP_PORT, APP_WS_PORT);
 
 test.beforeAll(async () => {
 	servers.push(
-		startPhp({ args: [join(EXAMPLE, 'server.php')], port: WS_PORT, env: { CHAT_PORT: String(WS_PORT) } }),
-		startPhp({ args: ['-S', `127.0.0.1:${PAGE_PORT}`, join(EXAMPLE, 'router.php')], port: PAGE_PORT }),
+		startPhp({
+			args: [join(EXAMPLE, 'server.php')],
+			port: WS_PORT,
+			ready: new RegExp(`Chat WebSocket server on ws://127\\.0\\.0\\.1:${WS_PORT}/`),
+			env: { CHAT_PORT: String(WS_PORT) },
+		}),
+		startPhp({ args: ['-S', `127.0.0.1:${PAGE_PORT}`, join(EXAMPLE, 'router.php')], port: PAGE_PORT, ready: builtInServerReady(PAGE_PORT) }),
 		// The extension's autoloader is prepended because, in this checkout, vendor/pradosoft/prado
 		// may be a symlink, and prado-cli then loads the framework's own autoloader.
 		startPhp({
 			args: ['-d', `auto_prepend_file=${join(ROOT, 'vendor/autoload.php')}`, join(ROOT, 'vendor/bin/prado-cli'),
 				`-d=${join(EXAMPLE, 'app/protected')}`, 'websocket/serve', `--port=${APP_WS_PORT}`],
 			port: APP_WS_PORT,
+			ready: new RegExp(`Socket server listening on tcp://127\\.0\\.0\\.1:${APP_WS_PORT}\\b`),
 		}),
-		startPhp({ args: ['-S', `127.0.0.1:${APP_PORT}`, '-t', join(EXAMPLE, 'app')], port: APP_PORT }),
+		startPhp({ args: ['-S', `127.0.0.1:${APP_PORT}`, '-t', join(EXAMPLE, 'app')], port: APP_PORT, ready: builtInServerReady(APP_PORT) }),
 	);
 	await Promise.all(servers.map((s) => s.ready(20_000)));
 });

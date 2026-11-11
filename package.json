@@ -6,7 +6,7 @@
 	"scripts": {
 		"playwright": "playwright test",
 		"playwright:headed": "HEADLESS=false playwright test",
-		"playwright:install": "playwright install chromium firefox webkit"
+		"playwright:install": "playwright install --with-deps chromium firefox webkit"
 	},
 	"devDependencies": {
 		"@playwright/test": "1.62.1"

@@ -17,14 +17,19 @@
  *   WS_HEARTBEAT    the pub/sub heartbeat in seconds (default 25)
  *   WS_MAX_MESSAGE  the server MaxMessageSize in bytes (default the server's)
  *   WS_MAX_FRAME    the pub/sub MaxFrameSize in bytes (default the handler's; 0 for none)
+ *   WS_ORIGINS      comma-separated origins allowed to upgrade (default any)
+ *   WS_REFUSE_AFTER seconds the pub/sub `onOpen` handler waits on the event loop before it
+ *                   refuses every client with 4401 (default: clients are admitted)
  *
  * In pub/sub mode, clients may publish to `room:*` channels, and the `echo` call returns its
  * params while `kick` closes the caller with 4401.
  *
- * The process runs until killed (SIGTERM/SIGINT); the Playwright harness
- * spawns it before the suite and stops it after.
+ * Once it listens, the process prints `ws-server listening on <host>:<port>`, the line the
+ * Playwright harness waits for.  It runs until killed (SIGTERM/SIGINT); the harness spawns it
+ * before a spec and stops it after.
  */
 
+use Prado\IO\Async\TAsync;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubEventParameter;
 use Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubHandler;
@@ -51,6 +56,13 @@ if (getenv('WS_PUBSUB') === '1') {
 	$handler->setHeartbeat(getenv('WS_HEARTBEAT') ?: TWebSocketPubSubHandler::DEFAULT_HEARTBEAT);
 	if (($maxFrame = getenv('WS_MAX_FRAME')) !== false && $maxFrame !== '') {
 		$handler->setMaxFrameSize($maxFrame);
+	}
+	if (($refuseAfter = getenv('WS_REFUSE_AFTER')) !== false && $refuseAfter !== '') {
+		// An application that authenticates with an asynchronous lookup, and refuses the client.
+		$handler->attachEventHandler('onOpen', function (TWebSocketConnection $connection) use ($refuseAfter): void {
+			TAsync::sleep((float) $refuseAfter);
+			$connection->close(4401, 'unauthorized');
+		});
 	}
 	$handler->attachEventHandler('onPublish', function ($connection, TWebSocketPubSubEventParameter $param): void {
 		$param->setAllowed(str_starts_with($param->getChannel(), 'room:'));
@@ -88,8 +100,11 @@ if (($maxMessage = getenv('WS_MAX_MESSAGE')) !== false && $maxMessage !== '') {
 if (getenv('WS_DEFLATE') === '1') {
 	$server->setExtensions([new TPermessageDeflateNegotiator()]);
 }
+if (($origins = getenv('WS_ORIGINS')) !== false && $origins !== '') {
+	$server->setOrigins($origins);
+}
 
-// Signal a ready line for any launcher that greps stdout; the harness also polls the TCP port.
+// The ready line the harness waits for: the socket is bound, so a connection made now is accepted.
 fwrite(STDOUT, "ws-server listening on {$host}:{$port}\n");
 
 $server->serve();
