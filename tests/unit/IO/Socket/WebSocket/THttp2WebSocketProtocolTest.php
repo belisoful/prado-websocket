@@ -423,11 +423,26 @@ class THttp2WebSocketProtocolTest extends TestCase
 		}
 	}
 
-	/** nghttp2's NGHTTP2_ERR_HTTP_HEADER: a header field it refuses (an empty pseudo-header). */
-	private const ERR_HTTP_HEADER = -531;
-
-	/** nghttp2's NGHTTP2_ERR_HTTP_MESSAGING: a request that breaks the HTTP messaging rules (a missing pseudo-header). */
-	private const ERR_HTTP_MESSAGING = -532;
+	/**
+	 * Asserts that a malformed request opened nothing and was refused either by nghttp2 itself (a
+	 * reset with no response, the adapter never asked) or by the adapter (a 400).  Which of the two
+	 * happens depends on the libnghttp2 release; the adapter's own check is asserted separately.
+	 * @param array{status: ?string, reset: bool, invalid: int[], connections: int} $result What {@see attempt()} reported.
+	 * @param ProbeHttp2WebSocketProtocol $protocol The protocol that served the request.
+	 * @param string $message What was sent.
+	 */
+	private static function assertRefusedByTheLibraryOrTheAdapter(array $result, ProbeHttp2WebSocketProtocol $protocol, string $message): void
+	{
+		self::assertSame(0, $result['connections'], "$message opens no WebSocket.");
+		self::assertTrue($result['reset'], "$message has its stream ended.");
+		if ($result['status'] === null) {
+			self::assertNotSame([], $result['invalid'], "$message is refused by nghttp2 when the adapter does not answer it.");
+			self::assertSame([], $protocol->rejections, "$message is not also refused by the adapter.");
+		} else {
+			self::assertSame('400', $result['status'], "$message is answered with 400.");
+			self::assertSame(['400'], $protocol->rejections);
+		}
+	}
 
 	/**
 	 * Sends one request to a protocol and reports what came of it.
@@ -465,18 +480,16 @@ class THttp2WebSocketProtocolTest extends TestCase
 	public function testMissingPseudoHeaderIsRejected()
 	{
 		foreach ([':scheme', ':path', ':authority'] as $pseudo) {
-			// On the wire nghttp2 refuses the request itself: the adapter never sees it, and the client gets a reset with no response.
+			// On the wire nghttp2 1.70 refuses the request itself: the adapter never sees it, and the client gets a reset with no response.
 			$headers = $this->connectHeaders();
 			unset($headers[$pseudo]);
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 			$result = $this->attempt($protocol, $headers);
-			self::assertSame(['status' => null, 'reset' => true, 'invalid' => [self::ERR_HTTP_MESSAGING], 'connections' => 0], $result, "nghttp2 resets a CONNECT without $pseudo.");
-			self::assertSame([], $protocol->rejections, "The adapter is not asked about a CONNECT without $pseudo.");
+			self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT without $pseudo");
 
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 			$result = $this->attempt($protocol, [$pseudo => ''] + $this->connectHeaders());
-			self::assertSame(['status' => null, 'reset' => true, 'invalid' => [self::ERR_HTTP_HEADER], 'connections' => 0], $result, "nghttp2 resets a CONNECT with an empty $pseudo.");
-			self::assertSame([], $protocol->rejections);
+			self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT with an empty $pseudo");
 
 			// The adapter's own check (RFC 8441 §5) answers 400 when such a request does reach it: with the header absent...
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
@@ -516,8 +529,7 @@ class THttp2WebSocketProtocolTest extends TestCase
 		// nghttp2 refuses `:protocol` on a method other than CONNECT itself; the adapter's check covers it all the same.
 		$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 		$result = $this->attempt($protocol, [':method' => 'POST'] + $this->connectHeaders());
-		self::assertSame(['status' => null, 'reset' => true, 'invalid' => [self::ERR_HTTP_MESSAGING], 'connections' => 0], $result);
-		self::assertSame([], $protocol->rejections);
+		self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, 'A POST with `:protocol`');
 		$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 		$protocol->recordOnly = true;
 		$protocol->accept(new TH2Stream($protocol->getSession(), 1, [':method' => 'POST'] + $this->connectHeaders()));
