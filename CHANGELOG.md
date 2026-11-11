@@ -3,6 +3,11 @@
 All notable changes to `belisoful/prado-websocket` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- Tests: the chat example spec gives a page 20 s to come online, and when one does not, the failure names the page's URL and state, its failed requests, and the WebSocket frames it sent and received. One Firefox run on CI had a second page stay offline for the 5 s the spec allowed.
+
 ## [1.2.0] - 2026-11-10
 
 This release adds pub/sub for browsers (the `prado.pubsub.v1` subprotocol, a browser client and a chat example), runs on PRADO 4.4's event loop and monotonic clock, and lands two audits of hardening across the server, the protocol layer, HTTP/2 and the cluster backplanes. It raises two minimums, PHP 8.2 and `belisoful/prado-http2` 1.5 for HTTP/2, and changes some behavior; see [Upgrading from 1.1.0](#upgrading-from-110).
@@ -244,6 +249,7 @@ This release resyncs the extension with PRADO 4.4 development HEAD and lands a f
 ### Added
 - Initial release: RFC 6455 WebSockets over HTTP/1.1, RFC 8441 over HTTP/2 through `belisoful/prado-http2`, RFC 7692 permessage-deflate, a standalone `TWebSocketServer` that selects HTTP/1.1 or HTTP/2 per connection, a client connection, the `websocket` PRADO service, and a clustering layer (`TWebSocketModule`, `TWebSocketCluster`) with Null, File, Redis and Mesh backplanes.
 
+[Unreleased]: https://github.com/belisoful/prado-websocket/compare/v1.2.0...HEAD
 [1.2.0]: https://github.com/belisoful/prado-websocket/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/belisoful/prado-websocket/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/belisoful/prado-websocket/compare/v1.0.0...v1.0.1

@@ -66,13 +66,55 @@ test.afterEach(async () => {
 	await Promise.all(contexts.splice(0).map((c) => c.close()));
 });
 
+/** How long a page may take to come online, for a cold browser on a loaded runner. */
+const ONLINE_TIMEOUT = 20_000;
+
+/**
+ * Records what a page does on the network, so a join that never comes online can say why: a
+ * script that did not load, a form that was submitted without the page's handler, a WebSocket the
+ * server never answered, or a join the server refused.
+ * @param {import('@playwright/test').Page} page
+ * @returns {() => Promise<string>} Describes the page and what was recorded so far.
+ */
+function watchPage(page) {
+	/** @type {string[]} */ const seen = [];
+	const started = Date.now();
+	const note = (/** @type {string} */ what) => seen.push(`+${Date.now() - started}ms ${what}`);
+	page.on('websocket', (ws) => {
+		note(`WebSocket created ${ws.url()}`);
+		ws.on('framesent', (frame) => note(`sent ${String(frame.payload).slice(0, 120)}`));
+		ws.on('framereceived', (frame) => note(`received ${String(frame.payload).slice(0, 120)}`));
+		ws.on('socketerror', (error) => note(`WebSocket error ${error}`));
+		ws.on('close', () => note('WebSocket closed'));
+	});
+	page.on('requestfailed', (request) => note(`request failed ${request.url()} (${request.failure()?.errorText})`));
+	page.on('response', (response) => { if (response.status() >= 400) { note(`${response.status()} ${response.url()}`); } });
+	page.on('pageerror', (error) => note(`page error ${error.message}`));
+	page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) { note(`navigated to ${frame.url()}`); } });
+	return async () => {
+		const state = await page.evaluate(() => ({
+			status: document.getElementById('status')?.textContent,
+			joinError: document.getElementById('join-error')?.textContent,
+			joinFormHidden: document.getElementById('join')?.hidden,
+			client: typeof window.Prado?.WebSocket?.PubSub,
+		})).catch((e) => ({ unreadable: String(e) }));
+		return `Page ${page.url()} ${JSON.stringify(state)}; events: ${seen.join('; ') || 'none'}`;
+	};
+}
+
 /** Opens the chat page and joins a room. */
 async function joinAs(page, nick, room, url = PAGE) {
+	const describe = watchPage(page);
 	await page.goto(url);
 	await page.fill('#nick', nick);
 	await page.fill('#room', room);
 	await page.click('#join button[type=submit]');
-	await expect(page.locator('#status')).toHaveText('online');
+	try {
+		await expect(page.locator('#status')).toHaveText('online', { timeout: ONLINE_TIMEOUT });
+	} catch (e) {
+		e.message += `\n${nick} did not come online within ${ONLINE_TIMEOUT} ms. ${await describe()}`;
+		throw e;
+	}
 	await expect(page.locator('#members')).toContainText(`${nick} (you)`);
 }
 
