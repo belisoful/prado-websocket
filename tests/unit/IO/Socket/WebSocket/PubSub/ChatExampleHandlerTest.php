@@ -182,5 +182,62 @@ class ChatExampleHandlerTest extends TestCase
 		self::assertStringContainsString('1 to 32 characters', $this->join($ada, str_repeat('r', 33), 'ada')['message']);
 		self::assertStringContainsString('1 to 24 characters', $this->join($ada, 'lobby', str_repeat('n', 25))['message']);
 		self::assertSame(TWebSocketPubSubException::FORBIDDEN, $this->request($ada[0], $ada[1], ['type' => 'subscribe', 'channel' => 'room:' . str_repeat('r', 33)])['code']);
+		self::assertSame('ack', $this->join($ada, str_repeat('r', 32), str_repeat('é', 24))['type'], 'The longest room name and nickname are accepted; a nickname is counted in characters.');
+	}
+
+	public function testARoomNameWithATrailingNewlineIsRefused()
+	{
+		$ada = $this->client();
+		$reply = $this->join($ada, "lobby\n", 'ada');
+		self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $reply['code']);
+		self::assertStringContainsString('1 to 32 characters', $reply['message']);
+		self::assertSame([], $this->handler->getSubscriptions($ada[0]), 'No second room that renders as "lobby" exists.');
+		self::assertSame(0, preg_match(ChatHandler::ROOM_PATTERN, str_repeat('r', 32) . "\n"));
+	}
+
+	/** @return array<string, array{0: string}> Nicknames that render as another nickname, or as nothing. */
+	public static function invisibleNicknames(): array
+	{
+		return [
+			'zero-width space' => ["bob\u{200B}"],
+			'zero-width joiner' => ["bo\u{200D}b"],
+			'word joiner' => ["bob\u{2060}"],
+			'byte order mark' => ["\u{FEFF}bob"],
+			'right-to-left override' => ["bob\u{202E}"],
+			'isolate' => ["\u{2066}bob\u{2069}"],
+			'soft hyphen' => ["bo\u{00AD}b"],
+			'no-break space' => ["\u{00A0}bob"],
+			'ideographic space' => ["bob\u{3000}"],
+			'line separator' => ["bob\u{2028}"],
+			'control character' => ["bob\u{0007}"],
+			'inner newline' => ["bo\nb"],
+			'inner space' => ['bo b'],
+			'variation selector' => ["bob\u{FE0F}"],
+			'Hangul filler' => ["\u{3164}"],
+			'blank Braille pattern' => ["\u{2800}"],
+			'combining grapheme joiner' => ["bob\u{034F}"],
+			'tag character' => ["bob\u{E0062}"],
+			'private use' => ["bob\u{E000}"],
+		];
+	}
+
+	/** @dataProvider invisibleNicknames */
+	public function testANicknameWithAnInvisibleCharacterIsRefused(string $nick)
+	{
+		$ada = $this->client();
+		self::assertSame('ack', $this->join($ada, 'lobby', 'bob')['type']);
+		$impostor = $this->client();
+		$reply = $this->join($impostor, 'lobby', $nick);
+		self::assertSame('error', $reply['type']);
+		self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $reply['code']);
+		self::assertStringContainsString('invisible characters', $reply['message']);
+		self::assertSame([], $this->handler->getSubscriptions($impostor[0]), 'No second "bob" joins the room.');
+	}
+
+	public function testVisibleNicknamesOfAnyScriptAreAccepted()
+	{
+		foreach (['ada', 'Zoë', 'Ωmega', '名前', 'имя', '🙂', 'a.b-c_d!', str_repeat('n', 24)] as $i => $nick) {
+			self::assertSame('ack', $this->join($this->client(), 'room' . $i, $nick)['type'], $nick);
+		}
 	}
 }
