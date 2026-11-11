@@ -10,6 +10,7 @@
 
 namespace Prado\IO\Socket\WebSocket;
 
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\Exceptions\TPhpErrorException;
 use Prado\IO\Socket\TSocketServer;
 use Prado\IO\TResource;
@@ -46,6 +47,12 @@ use Psr\Http\Message\StreamInterface;
  * `websocket_read_failed`), whether the stream reports it as a \RuntimeException or PRADO's error
  * handler turns the PHP notice into a {@see TPhpErrorException}.
  *
+ * A protocol error ends reading.  The exception that reports it leaves the connection
+ * {@see getIsFailed() failed}: the buffered input is dropped, {@see feedMessages()} discards the
+ * bytes that arrive afterward and returns no message, and {@see receiveFrame()} returns null
+ * without reading.  The caller sends the Close the exception names and ends the transport
+ * (RFC 6455 section 7.1.7).
+ *
  * Once a Close frame has been sent no further frame is written: {@see send()}, {@see ping()} and
  * {@see pong()} return 0 and a second {@see close()} is a no-op.
  *
@@ -77,6 +84,15 @@ class TWebSocketConnection extends TComponent
 	/** @var int The most bytes one transport read requests while a frame arrives. */
 	private const READ_CHUNK = 65536;
 
+	/** @var int The size a held piece of an arriving frame grows to before the next piece starts a new one. */
+	private const READ_COALESCE = 65536;
+
+	/** @var int The most bytes one transport write is handed from behind the send offset. */
+	private const WRITE_CHUNK = 65536;
+
+	/** @var int The shortest frame on the wire: the two header bytes of an empty unmasked frame. */
+	private const MIN_FRAME_LENGTH = 2;
+
 	/** @var float The longest single wait, in seconds, of {@see drainClose()} between polls of the clock. */
 	public const DRAIN_POLL_INTERVAL = 0.05;
 
@@ -98,7 +114,11 @@ class TWebSocketConnection extends TComponent
 	/** @var string Unparsed bytes carried between {@see feed()} calls, starting at a frame boundary. */
 	private string $_readBuffer = '';
 
-	/** @var string[] Bytes received after {@see $_readBuffer} while a frame of known length is still arriving, joined once it is complete. */
+	/**
+	 * @var string[] Bytes received after {@see $_readBuffer} while a frame of known length is still
+	 *   arriving, joined once it is complete.  Each entry grows to {@see READ_COALESCE} bytes before
+	 *   the next begins, so the entry count follows the frame size, whatever the number of reads.
+	 */
 	private array $_readChunks = [];
 
 	/** @var int The total length of {@see $_readChunks}. */
@@ -109,6 +129,15 @@ class TWebSocketConnection extends TComponent
 
 	/** @var bool Whether the last {@see receiveFrame()} ended at the stream's read timeout. */
 	private bool $_readTimedOut = false;
+
+	/** @var bool Whether a protocol error or a broken transport ended reading. */
+	private bool $_failed = false;
+
+	/** @var ?float The monotonic time {@see receiveFrame()} stops reading at while {@see drainClose()} runs, or null for none. */
+	private ?float $_readDeadline = null;
+
+	/** @var bool Whether {@see receiveFrame()} found {@see $_readDeadline} passed. */
+	private bool $_readDeadlinePassed = false;
 
 	/** @var string Reassembly buffer for a fragmented message across {@see feed()} calls. */
 	private string $_messageBuffer = '';
@@ -125,8 +154,11 @@ class TWebSocketConnection extends TComponent
 	/** @var int The maximum reassembled message size in bytes, or 0 for unlimited. */
 	private int $_maxMessageSize = self::DEFAULT_MAX_MESSAGE_SIZE;
 
-	/** @var string Bytes queued for the wire that a non-blocking socket has not yet accepted. */
+	/** @var string Bytes queued for the wire; those from {@see $_outboundOffset} on are not yet accepted by the socket. */
 	private string $_outbound = '';
+
+	/** @var int The length of the prefix of {@see $_outbound} that is already written. */
+	private int $_outboundOffset = 0;
 
 	/** @var int The maximum queued outbound bytes before a slow reader is dropped, or 0 for unlimited. */
 	private int $_maxSendBufferBytes = self::DEFAULT_MAX_SEND_BUFFER;
@@ -247,6 +279,19 @@ class TWebSocketConnection extends TComponent
 	}
 
 	/**
+	 * Returns whether reading has failed: a malformed frame, a protocol violation, an oversized or
+	 * undecodable message, or a broken transport threw from {@see feedMessages()},
+	 * {@see receiveFrame()} or {@see receiveMessage()}.  A failed connection parses no further input.
+	 * It still sends: the caller writes the Close the exception names, then ends the transport.
+	 * @return bool Whether reading has failed.
+	 * @since 1.2.0
+	 */
+	public function getIsFailed(): bool
+	{
+		return $this->_failed;
+	}
+
+	/**
 	 * Encodes a frame, masking it on the client side, and queues it for the wire.  A frame after a
 	 * Close is not sent (RFC 6455 section 5.5.1: the Close frame is the last one written).
 	 * @param TWebSocketFrame $frame The frame to send.
@@ -284,13 +329,23 @@ class TWebSocketConnection extends TComponent
 	 */
 	private function writeAll(string $data): int
 	{
-		if ($this->_maxSendBufferBytes > 0 && $this->getQueuedLength() + strlen($data) > $this->_maxSendBufferBytes) {
-			throw (new TWebSocketException('websocket_send_buffer_overflow', $this->_maxSendBufferBytes))
-				->setCloseCode(TWebSocketCloseCode::GoingAway);
-		}
+		$this->assertSendBufferRoom(strlen($data));
 		$this->_outbound .= $data;
 		$this->flushOutbound();
 		return strlen($data);
+	}
+
+	/**
+	 * Asserts that a byte count fits in the send buffer behind what is already queued.
+	 * @param int $length The bytes about to be queued.
+	 * @throws TWebSocketException When the backlog would exceed {@see getMaxSendBufferBytes()}.
+	 */
+	private function assertSendBufferRoom(int $length): void
+	{
+		if ($this->_maxSendBufferBytes > 0 && $this->getQueuedLength() + $length > $this->_maxSendBufferBytes) {
+			throw (new TWebSocketException('websocket_send_buffer_overflow', $this->_maxSendBufferBytes))
+				->setCloseCode(TWebSocketCloseCode::GoingAway);
+		}
 	}
 
 	/**
@@ -303,7 +358,7 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function getQueuedLength(): int
 	{
-		$queued = strlen($this->_outbound);
+		$queued = $this->getPendingOutboundLength();
 		if (method_exists($this->_stream, 'getOutgoingLength')) {
 			$queued += $this->_stream->getOutgoingLength();
 		}
@@ -314,45 +369,63 @@ class TWebSocketConnection extends TComponent
 	 * Drains the queued outbound bytes to the socket without blocking, keeping any tail the socket
 	 * could not accept.  The event loop calls this when the transport becomes writable; a blocking
 	 * socket drains fully in one call.
+	 *
+	 * The written bytes stay at the head of the queue behind a send offset, and the queue is
+	 * compacted once they pass half of it.  A write behind the offset is handed at most
+	 * {@see WRITE_CHUNK} bytes.  A peer that accepts a few bytes per writable event costs time
+	 * linear in the backlog, since no event copies the whole of it.  Until it is compacted the
+	 * queue holds the written prefix too, at most as many bytes again as are waiting;
+	 * {@see getPendingOutboundLength()} and {@see getQueuedLength()} count the waiting bytes only.
+	 *
 	 * A failed write discards the queue and marks the connection {@see getIsClosed() closed}.
 	 * @throws TWebSocketException When the underlying write fails (a broken pipe, a reset peer).
 	 * @return int The number of bytes flushed on this call.
 	 */
 	public function flushOutbound(): int
 	{
-		if ($this->_outbound === '') {
+		$length = strlen($this->_outbound);
+		$start = $this->_outboundOffset;
+		if ($start >= $length) {
 			return 0;
 		}
-		$length = strlen($this->_outbound);
-		$sent = 0;
+		$offset = $start;
 		try {
-			while ($sent < $length) {
-				$wrote = $this->_stream->write($sent === 0 ? $this->_outbound : substr($this->_outbound, $sent));
+			while ($offset < $length) {
+				$wrote = $this->_stream->write($offset === 0 ? $this->_outbound : substr($this->_outbound, $offset, self::WRITE_CHUNK));
 				if ($wrote <= 0) {
 					break;   // the non-blocking send buffer is full; keep the tail for the next writable event
 				}
-				$sent += $wrote;
+				$offset += $wrote;
 			}
 		} catch (\Exception $e) {
 			// A \RuntimeException from the stream, or the TPhpErrorException PRADO's error handler raises for EPIPE/ECONNRESET.
 			$this->_outbound = '';
+			$this->_outboundOffset = 0;
 			$this->_closed = true;
 			throw (new TWebSocketException('websocket_write_failed'))->setCloseCode(TWebSocketCloseCode::GoingAway);
 		}
-		$this->_outbound = $sent >= $length ? '' : substr($this->_outbound, $sent);
-		return $sent;
+		if ($offset >= $length) {
+			$this->_outbound = '';
+			$this->_outboundOffset = 0;
+		} elseif ($offset > $length - $offset) {
+			$this->_outbound = substr($this->_outbound, $offset);   // the written prefix passed half of the queue
+			$this->_outboundOffset = 0;
+		} else {
+			$this->_outboundOffset = $offset;
+		}
+		return $offset - $start;
 	}
 
 	/** @return bool Whether bytes are queued for the wire awaiting a writable socket. */
 	public function hasPendingOutbound(): bool
 	{
-		return $this->_outbound !== '';
+		return strlen($this->_outbound) > $this->_outboundOffset;
 	}
 
 	/** @return int The number of bytes queued for the wire. */
 	public function getPendingOutboundLength(): int
 	{
-		return strlen($this->_outbound);
+		return strlen($this->_outbound) - $this->_outboundOffset;
 	}
 
 	/**
@@ -378,8 +451,15 @@ class TWebSocketConnection extends TComponent
 	/**
 	 * Sends a data message as a single frame, folding the extension pipeline over the payload in
 	 * order and setting the reserved bits the extensions report.  A no-op once a Close has been sent.
+	 *
+	 * The send-buffer limit is applied around the extensions, whose state a refused message must
+	 * not change:
+	 *  - a send buffer with no room for the shortest frame → the message is refused before an extension encodes it.
+	 *  - a message whose encoded frame does not fit, or whose write fails → the message is refused
+	 *    after encoding, and {@see discardEncodedMessage()} returns the extensions to a state the peer decodes from.
 	 * @param int $opcode The data opcode (Text or Binary).
 	 * @param string $payload The message payload.
+	 * @throws TWebSocketException When the backlog would exceed the send-buffer limit, or the write fails.
 	 * @return int The bytes written, or 0 when the connection is closing.
 	 */
 	private function sendDataMessage(int $opcode, string $payload): int
@@ -387,19 +467,40 @@ class TWebSocketConnection extends TComponent
 		if ($this->_closing) {
 			return 0;
 		}
+		$this->assertSendBufferRoom(self::MIN_FRAME_LENGTH);
 		$rsv = 0;
 		foreach ($this->_extensions as $extension) {
 			[$payload, $bits] = $extension->encodeMessage($payload);
 			$rsv |= $bits;
 		}
-		return $this->sendFrame(new TWebSocketFrame(
-			$opcode,
-			$payload,
-			true,
-			($rsv & IWebSocketExtension::RSV1) !== 0,
-			($rsv & IWebSocketExtension::RSV2) !== 0,
-			($rsv & IWebSocketExtension::RSV3) !== 0,
-		));
+		try {
+			return $this->sendFrame(new TWebSocketFrame(
+				$opcode,
+				$payload,
+				true,
+				($rsv & IWebSocketExtension::RSV1) !== 0,
+				($rsv & IWebSocketExtension::RSV2) !== 0,
+				($rsv & IWebSocketExtension::RSV3) !== 0,
+			));
+		} catch (TWebSocketException $e) {
+			$this->discardEncodedMessage();
+			throw $e;
+		}
+	}
+
+	/**
+	 * Returns the extensions to a state the peer decodes from after a message they encoded was not
+	 * sent.  A {@see TPermessageDeflateExtension} restarts its DEFLATE stream: its context holds the
+	 * unsent message as history, which the peer's context lacks, and a restarted stream refers to
+	 * no history.
+	 */
+	private function discardEncodedMessage(): void
+	{
+		foreach ($this->_extensions as $extension) {
+			if ($extension instanceof TPermessageDeflateExtension) {
+				$extension->resetDeflateContext();
+			}
+		}
 	}
 
 	/**
@@ -446,51 +547,102 @@ class TWebSocketConnection extends TComponent
 
 	/**
 	 * Completes the close handshake: sends a Close (when not already closing), then reads and
-	 * discards frames until the peer's Close arrives, the stream ends, or the timeout passes.  The
-	 * timeout is measured on {@see getMonotonicClock() the monotonic clock}, so a wall-clock change
-	 * does not move it.  A blocking transport also gets it as its read timeout, and a non-blocking
-	 * socket is waited on with select between reads, so a peer that never answers cannot hold the
-	 * caller past the timeout.
+	 * discards frames until the peer's Close arrives, the stream ends, or the timeout passes.
+	 *
+	 * The timeout bounds the whole drain.  It is measured on {@see getMonotonicClock() the
+	 * monotonic clock}, so a wall-clock change does not move it, and it is checked before every
+	 * transport read, so a peer that keeps sending frames, or one frame a few bytes at a time,
+	 * holds the caller no longer than a silent one.  A blocking transport gets the time remaining
+	 * as its read timeout before each read and is left with the full timeout afterward; a
+	 * non-blocking socket is waited on with select between reads.
+	 *
+	 * The result by case:
+	 *  - the peer's Close arrives or the stream ends → true.
+	 *  - the timeout passes first → false; the connection is still {@see getIsClosing() closing}.
+	 *  - the Close cannot be written, or the peer's input is malformed → true; the connection is closed regardless.
+	 *  - the connection has {@see getIsFailed() failed} → true once the Close is sent; nothing is
+	 *    read, as a failed connection processes no further input (RFC 6455 section 7.1.7).
+	 *  - the code or reason is one {@see close()} refuses → the exception is thrown, nothing is sent
+	 *    and the connection stays open.
 	 * @param int $code A {@see TWebSocketCloseCode} value. Default Normal.
 	 * @param string $reason A reason phrase. Default ''.
 	 * @param ?float $timeout The seconds to wait for the peer's Close, or null for an unbounded wait.
+	 * @throws TInvalidDataValueException When the connection is not yet closing and the code is not sendable or the reason is invalid.
 	 * @return bool Whether the connection closed (the peer's Close or end of stream) before the timeout.
 	 */
 	public function drainClose(int $code = TWebSocketCloseCode::Normal, string $reason = '', ?float $timeout = 1.0): bool
 	{
 		try {
 			$this->close($code, $reason);
-			$deadline = $timeout === null ? null : $this->getMonotonicClock()->seconds() + $timeout;
-			if ($timeout !== null && $this->_stream instanceof TResource) {
-				$seconds = (int) $timeout;
-				$this->_stream->setTimeout($seconds, (int) (($timeout - $seconds) * 1000000));
-			}
+		} catch (TInvalidDataValueException $e) {
+			throw $e;   // the caller's error: no Close was built, so the connection is neither closing nor closed
+		} catch (\Throwable $e) {
+			$this->_closed = true;   // the Close could not be written: the peer is gone or its backlog is full
+			return true;
+		}
+		if ($this->_failed) {
+			$this->_closed = true;
+			return true;
+		}
+		$this->_readDeadline = $timeout === null ? null : $this->getMonotonicClock()->seconds() + $timeout;
+		$this->_readDeadlinePassed = false;
+		try {
 			while (!$this->_closed) {
 				if ($this->receiveFrame() !== null) {
 					continue;   // receiveFrame() handles the peer's Close inline, marking the connection closed
 				}
-				if ($this->getIsClosed() || !$this->awaitReadable($deadline)) {
+				if ($this->getIsClosed() || !$this->awaitReadable($this->_readDeadline)) {
 					break;
 				}
 			}
 		} catch (\Throwable $e) {
-			// The peer is gone or unresponsive (a broken pipe, a read timeout, a protocol error);
-			// the drain ends and the connection is considered closed regardless.
+			// The peer is gone or sent a malformed frame; the drain ends and the connection is
+			// considered closed regardless.
 			$this->_closed = true;
+		} finally {
+			$this->_readDeadline = null;
+			if ($timeout !== null && $this->_stream instanceof TResource) {
+				$seconds = (int) $timeout;
+				$this->_stream->setTimeout($seconds, (int) (($timeout - $seconds) * 1000000));
+			}
 		}
 		return $this->_closed;
 	}
 
 	/**
+	 * Returns whether a read may start under the deadline {@see drainClose()} set, giving a
+	 * resource-backed stream the time remaining as its read timeout so a blocking read ends at the
+	 * deadline too.  With no deadline every read may start.
+	 * @return bool Whether the deadline, if any, is still ahead.
+	 */
+	private function withinReadDeadline(): bool
+	{
+		if ($this->_readDeadline === null) {
+			return true;
+		}
+		$remaining = $this->_readDeadline - $this->getMonotonicClock()->seconds();
+		if ($remaining <= 0) {
+			$this->_readDeadlinePassed = true;
+			return false;
+		}
+		if ($this->_stream instanceof TResource) {
+			$seconds = (int) $remaining;
+			$this->_stream->setTimeout($seconds, (int) (($remaining - $seconds) * 1000000));
+		}
+		return true;
+	}
+
+	/**
 	 * Waits for the transport to become readable, until the deadline on
 	 * {@see getMonotonicClock() the monotonic clock}.  Only a socket transport can be waited on; any
-	 * other stream reports nothing more to wait for.
+	 * other stream reports nothing more to wait for, as does a deadline {@see receiveFrame()}
+	 * already found passed.
 	 * @param ?float $deadline The monotonic time to give up at, or null to wait until readable.
 	 * @return bool Whether more may be read (true), or the wait ended without data (false).
 	 */
 	private function awaitReadable(?float $deadline): bool
 	{
-		if (!$this->_stream instanceof TResource || $this->_stream->eof()) {
+		if ($this->_readDeadlinePassed || !$this->_stream instanceof TResource || $this->_stream->eof()) {
 			return false;
 		}
 		$remaining = $deadline === null ? self::DRAIN_POLL_INTERVAL : $deadline - $this->getMonotonicClock()->seconds();
@@ -516,33 +668,61 @@ class TWebSocketConnection extends TComponent
 	 *  - a blocking stream that reaches its read timeout → null, with {@see getReadTimedOut()} true; the connection stays open.
 	 *  - the end of the stream → null, and the connection is {@see getIsClosed() closed}; a frame cut short by it throws.
 	 *  - a failed read (a reset peer) → the connection is closed and `websocket_read_failed` is thrown.
+	 *  - a connection that has {@see getIsFailed() failed} → null, without reading.
+	 *
+	 * An exception thrown here leaves the connection {@see getIsFailed() failed} and drops the
+	 * buffered input, so the malformed frame is reported once.
 	 * @throws TWebSocketException When a frame is malformed, the stream ends inside a frame, or the read fails.
 	 * @return ?TWebSocketFrame The frame, or null at end of stream or when no frame is available yet.
 	 */
 	public function receiveFrame(): ?TWebSocketFrame
 	{
 		$this->_readTimedOut = false;
-		while (($frame = $this->takeBufferedFrame()) === null) {
-			$wanted = $this->bytesWanted();
-			$bytes = $this->readTransport(min(self::READ_CHUNK, $wanted));
-			if ($bytes === '') {
-				if ($this->_stream->eof()) {
-					$this->_closed = true;
-					$buffered = strlen($this->_readBuffer);
-					if ($buffered > 0) {
-						$this->_readBuffer = '';
-						throw new TWebSocketException('websocket_frame_incomplete', $buffered + $wanted, $buffered);
-					}
-				}
-				return null;
-			}
-			$this->_readBuffer .= $bytes;
+		if ($this->_failed) {
+			return null;
 		}
-		$this->validateFrame($frame);
-		if ($frame->getIsControl()) {
-			$this->handleControlFrame($frame);
+		try {
+			while (($frame = $this->takeBufferedFrame()) === null) {
+				if (!$this->withinReadDeadline()) {
+					return null;
+				}
+				$wanted = $this->bytesWanted();
+				$bytes = $this->readTransport(min(self::READ_CHUNK, $wanted));
+				if ($bytes === '') {
+					if ($this->_stream->eof()) {
+						$this->_closed = true;
+						$buffered = strlen($this->_readBuffer);
+						if ($buffered > 0) {
+							throw new TWebSocketException('websocket_frame_incomplete', $buffered + $wanted, $buffered);
+						}
+					}
+					return null;
+				}
+				$this->_readBuffer .= $bytes;
+			}
+			$this->validateFrame($frame);
+			if ($frame->getIsControl()) {
+				$this->handleControlFrame($frame);
+			}
+		} catch (TWebSocketException $e) {
+			$this->failRead();
+			throw $e;
 		}
 		return $frame;
+	}
+
+	/**
+	 * Marks reading as failed and drops the buffered input and the message being reassembled.  A
+	 * failed connection holds no received bytes and parses none.
+	 */
+	private function failRead(): void
+	{
+		$this->_failed = true;
+		$this->_readBuffer = '';
+		$this->_readChunks = [];
+		$this->_readChunksLength = 0;
+		$this->_awaitingLength = 0;
+		$this->resetMessage();
 	}
 
 	/**
@@ -647,9 +827,11 @@ class TWebSocketConnection extends TComponent
 	/**
 	 * Reads the next complete data message with its opcode, reassembling fragments and handling
 	 * control frames transparently (a lone Ping is answered and the wait continues for the next data
-	 * message).
-	 * @return ?TWebSocketMessage The message, or null when the connection closes, the stream ends, or
-	 *   (on a non-blocking stream) no frame is available yet.
+	 * message).  A protocol error leaves the connection {@see getIsFailed() failed}, as
+	 * {@see receiveFrame()} describes.
+	 * @throws TWebSocketException When a frame or message is malformed, the stream ends inside a frame, or the read fails.
+	 * @return ?TWebSocketMessage The message, or null when the connection closes, the stream ends,
+	 *   reading has failed, or (on a non-blocking stream) no frame is available yet.
 	 */
 	public function receiveMessage(): ?TWebSocketMessage
 	{
@@ -661,7 +843,12 @@ class TWebSocketConnection extends TComponent
 			if ($frame->getIsControl()) {
 				continue;
 			}
-			$message = $this->ingestDataFrame($frame);
+			try {
+				$message = $this->ingestDataFrame($frame);
+			} catch (TWebSocketException $e) {
+				$this->failRead();
+				throw $e;
+			}
 			if ($message !== null) {
 				return $message;
 			}
@@ -692,12 +879,16 @@ class TWebSocketConnection extends TComponent
 	 * The frames are decoded at an advancing offset and the buffer is compacted once per call, so a
 	 * read holding thousands of small frames costs time linear in its size.  A frame whose length is
 	 * known but whose bytes are still arriving is collected in pieces and joined once, so a large
-	 * frame trickled in small reads also costs time linear in its size.  Once the connection is
-	 * {@see getIsClosed() closed}, further bytes are discarded.
+	 * frame trickled in small reads also costs time linear in its size.  The pieces are held as
+	 * strings of about 64 KiB each, whatever the size of the reads, so the frame costs memory in
+	 * proportion to its own size.  Once the connection is {@see getIsClosed() closed}, further
+	 * bytes are discarded.
 	 *
 	 * A malformed frame throws.  When complete messages precede it in the same call, the exception
 	 * carries them in {@see TWebSocketException::getDecodedMessages()}, so the caller delivers them
-	 * before it fails the connection.
+	 * before it fails the connection.  The connection is then {@see getIsFailed() failed}: the
+	 * buffered input is dropped with the malformed frame, and every later call discards its bytes
+	 * and returns no message.
 	 *
 	 * @param string $bytes The bytes just read from the transport.
 	 * @throws TWebSocketException When a frame is malformed (the caller should close).
@@ -705,14 +896,13 @@ class TWebSocketConnection extends TComponent
 	 */
 	public function feedMessages(string $bytes): array
 	{
-		if ($this->_closed) {
-			$this->_readBuffer = '';   // the close handshake is over: nothing after the peer's Close is read
+		if ($this->_closed || $this->_failed) {
+			$this->_readBuffer = '';   // the close handshake is over, or reading failed: nothing more is read
 			return [];
 		}
 		if ($this->_awaitingLength > 0) {
 			// A frame of known length is still arriving: hold the piece, and join only once it is whole.
-			$this->_readChunks[] = $bytes;
-			$this->_readChunksLength += strlen($bytes);
+			$this->holdChunk($bytes);
 			if (strlen($this->_readBuffer) + $this->_readChunksLength < $this->_awaitingLength) {
 				return [];
 			}
@@ -754,16 +944,34 @@ class TWebSocketConnection extends TComponent
 				}
 			}
 		} catch (TWebSocketException $e) {
+			$this->failRead();   // the malformed frame and what follows it are dropped, not kept for the next call
 			throw $messages === [] ? $e : $e->setDecodedMessages($messages);
 		} finally {
-			if ($this->_closed) {
-				$this->_readBuffer = '';   // bytes behind the peer's Close are discarded, not held
+			if ($this->_closed || $this->_failed) {
+				$this->_readBuffer = '';   // bytes behind the peer's Close, or behind a malformed frame, are discarded
 			} else {
 				$this->_readBuffer = $offset === 0 ? $buffer : (string) substr($buffer, $offset);
 				$this->_awaitingLength = $awaiting;
 			}
 		}
 		return $messages;
+	}
+
+	/**
+	 * Holds a piece of the frame that is still arriving.  The piece extends the last held string
+	 * while that is shorter than {@see READ_COALESCE}, and starts a new one otherwise, so a frame
+	 * of n bytes is held in about n / 64 KiB strings however small its reads are.
+	 * @param string $bytes The bytes just read.
+	 */
+	private function holdChunk(string $bytes): void
+	{
+		$last = count($this->_readChunks) - 1;
+		if ($last >= 0 && strlen($this->_readChunks[$last]) < self::READ_COALESCE) {
+			$this->_readChunks[$last] .= $bytes;
+		} else {
+			$this->_readChunks[] = $bytes;
+		}
+		$this->_readChunksLength += strlen($bytes);
 	}
 
 	/**
@@ -1064,7 +1272,10 @@ class TWebSocketConnection extends TComponent
 
 	/**
 	 * Sets whether to enforce the RFC 6455 mask rule on received frames.  A standalone server keeps
-	 * this enabled; the HTTP/2 transport disables it, since RFC 8441 carries its own framing.
+	 * this enabled.  The HTTP/2 transport disables it: RFC 8441 keeps the RFC 6455 framing, client
+	 * masking included, and a server on an HTTP/2 stream accepts a frame in either mask state.
+	 * Disabling it relaxes the receive check only.  The frames this side sends are masked by its
+	 * role either way.
 	 * @param bool $value Whether to enforce the mask rule.
 	 */
 	public function setValidateMasking(bool $value): void

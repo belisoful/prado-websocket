@@ -241,6 +241,24 @@ class TWebSocketHandshakeTest extends TestCase
 		}
 	}
 
+	public function testOpenConnectionFailsOnAStatusThatOnlyStartsWith101()
+	{
+		$answer = fn (string $status) => new RespondingStream(function (string $request) use ($status): string {
+			$key = TWebSocketHandshake::parseHttpMessage($request)['headers']['sec-websocket-key'];
+			return str_replace('HTTP/1.1 101 ', 'HTTP/1.1 ' . $status . ' ', TWebSocketHandshake::buildServerResponse($key));
+		});
+		self::assertSame(101, TWebSocketHandshake::openConnection($answer('101'), 'example.com')['statusCode'], 'The response is otherwise a valid 101.');
+		foreach (['101abc', '1010', '101.0'] as $status) {
+			try {
+				TWebSocketHandshake::openConnection($answer($status), 'example.com');
+				self::fail("\"$status\" is not the status 101.");
+			} catch (TWebSocketException $e) {
+				self::assertSame('websocket_handshake_rejected', $e->getErrorCode());
+				self::assertStringContainsString('status 0', $e->getMessage(), 'A status that is not three digits is no status code.');
+			}
+		}
+	}
+
 	public function testOpenConnectionFailsOnAWrongAcceptKey()
 	{
 		$stream = new RespondingStream(fn () => TWebSocketHandshake::buildServerResponse(TWebSocketHandshake::generateKey()));
@@ -502,8 +520,12 @@ class TWebSocketHandshakeTest extends TestCase
 		} catch (TWebSocketException $e) {
 			self::assertSame('websocket_url_invalid', $e->getErrorCode());
 		}
-		$this->expectException(TWebSocketException::class);
-		TWebSocketHandshake::parseUrl('ws://example.com/#');   // an empty fragment is still a fragment
+		try {
+			TWebSocketHandshake::parseUrl('ws://example.com/#');   // an empty fragment is still a fragment
+			self::fail('An empty fragment is invalid too.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_url_invalid', $e->getErrorCode());
+		}
 	}
 
 	public function testBuildServerResponse()
@@ -553,9 +575,17 @@ class TWebSocketHandshakeTest extends TestCase
 
 	public function testAcceptConnectionRejectsNonUpgrade()
 	{
-		$s = TStream::fromString("GET / HTTP/1.1\r\nHost: ex\r\n\r\n");
-		self::expectException(TIOException::class);
-		TWebSocketHandshake::acceptConnection($s);
+		$request = "GET / HTTP/1.1\r\nHost: ex\r\n\r\n";
+		$s = TStream::fromString($request);
+		try {
+			TWebSocketHandshake::acceptConnection($s);
+			self::fail('A request that is not an upgrade fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertInstanceOf(TIOException::class, $e, 'A handshake failure is caught by IO error handling.');
+			self::assertSame('websocket_handshake_not_upgrade', $e->getErrorCode());
+		}
+		$s->seek(strlen($request));
+		self::assertStringStartsWith('HTTP/1.1 400', $s->getContents(), 'The request is answered with 400 before the failure.');
 	}
 
 	public function testAcceptConnectionHonorsTheTimeoutOption()

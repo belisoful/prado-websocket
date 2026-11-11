@@ -52,6 +52,12 @@ interface IWebSocketExtension
 
 	/**
 	 * Transforms an outgoing message payload for the wire, reporting the reserved bits it sets.
+	 *
+	 * A connection can refuse the message after it is encoded, when the encoded frame does not fit
+	 * the send buffer (`websocket_send_buffer_overflow`); the peer then never receives it.
+	 * {@see TWebSocketConnection} restarts the stream of a {@see TPermessageDeflateExtension} in that
+	 * case.  With any other extension whose output depends on the messages before it, that refusal
+	 * ends the use of the connection.
 	 * @param string $payload The message payload at this stage of the pipeline.
 	 * @return array{0: string, 1: int} The transformed payload and the reserved bits it set.
 	 */

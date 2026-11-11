@@ -650,6 +650,105 @@ class TPermessageDeflateTest extends TestCase
 		self::assertSame('Hello', $rx->decodeMessage(hex2bin('f348cdc9c9070000'), IWebSocketExtension::RSV1));
 	}
 
+	public function testASecondBfinalBlockInOneMessageIsRefused()
+	{
+		// "\x03\x00" is a whole DEFLATE stream: one empty fixed-Huffman block with BFINAL set.
+		self::assertSame('', (new TPermessageDeflateExtension())->decodeMessage("\x03\x00\x00", IWebSocketExtension::RSV1), 'One empty BFINAL block and the empty block header is an empty message.');
+		$this->assertTruncated("\x03\x00\x03\x00\x00", 'A message ends its DEFLATE stream at most once.');
+		$this->assertTruncated(hex2bin('f348cdc9c90700f348cdc9c9070000'), 'Two BFINAL data blocks in one message are refused, not concatenated.');
+
+		// A megabyte of such streams inflates to nothing, so no size limit stops it; a new inflate context per stream costs about a second of CPU.
+		$this->assertTruncated(str_repeat("\x03\x00", 1 << 19) . "\x00", 'A frame of BFINAL blocks is refused at the second one.');
+
+		$bounded = new TPermessageDeflateExtension();
+		$bounded->setMaxOutputLength(64);
+		try {
+			$bounded->decodeMessage(str_repeat("\x03\x00", 4096) . "\x00", IWebSocketExtension::RSV1);   // fed a byte or two per step under a small budget
+			self::fail('The second BFINAL block is refused inside the chunked loop too.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_permessage_deflate_inflate_failed', $e->getErrorCode());
+			self::assertSame(TWebSocketCloseCode::InvalidFramePayload, $e->getCloseCode());
+		}
+	}
+
+	public function testARefusedSecondBfinalBlockLeavesNoStreamBehind()
+	{
+		$rx = new TPermessageDeflateExtension();
+		try {
+			$rx->decodeMessage("\x03\x00\x03\x00\x00", IWebSocketExtension::RSV1);
+			self::fail('A second BFINAL block is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_permessage_deflate_inflate_failed', $e->getErrorCode());
+		}
+		[$payload, $rsv] = (new TPermessageDeflateExtension())->encodeMessage(self::REPEATED);
+		self::assertSame(self::REPEATED, $rx->decodeMessage($payload, $rsv), 'The ended stream is dropped with the refusal: a new message inflates on a new one.');
+	}
+
+	public function testDataBehindABfinalBlockContinuesOnOneNewStream()
+	{
+		// The single restart a message is allowed: its BFINAL block, then a new stream that carries the rest.
+		[$rest] = (new TPermessageDeflateExtension())->encodeMessage(' World, ' . self::REPEATED);
+		$rx = new TPermessageDeflateExtension();
+		self::assertSame('Hello World, ' . self::REPEATED, $rx->decodeMessage(hex2bin('f348cdc9c90700') . $rest, IWebSocketExtension::RSV1));
+
+		[$next, $rsv] = (new TPermessageDeflateExtension())->encodeMessage(self::REPEATED);
+		$fresh = new TPermessageDeflateExtension();
+		self::assertSame('Hello', $fresh->decodeMessage(hex2bin('f348cdc9c9070000'), IWebSocketExtension::RSV1));
+		self::assertSame(self::REPEATED, $fresh->decodeMessage($next, $rsv), 'The stream the restart began carries on into the next message.');
+	}
+
+	public function testOutputLimitCountsBothStreamsOfAMessage()
+	{
+		[$rest] = (new TPermessageDeflateExtension())->encodeMessage(str_repeat('z', 200));
+		$rx = new TPermessageDeflateExtension();
+		$rx->setMaxOutputLength(100);
+		try {
+			$rx->decodeMessage(hex2bin('f348cdc9c90700') . $rest, IWebSocketExtension::RSV1);
+			self::fail('The output behind a BFINAL block counts toward the limit.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_message_too_big', $e->getErrorCode());
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode());
+		}
+	}
+
+	public function testBfinalBlockWithNoContextTakeoverResetsForTheNextMessage()
+	{
+		$rx = new TPermessageDeflateExtension(inflateNoContextTakeover: true);
+		self::assertSame('Hello', $rx->decodeMessage(hex2bin('f348cdc9c9070000'), IWebSocketExtension::RSV1));
+		self::assertSame('Hello', $rx->decodeMessage(hex2bin('f348cdc9c9070000'), IWebSocketExtension::RSV1), 'Each message is its own stream.');
+		[$payload, $rsv] = (new TPermessageDeflateExtension(deflateNoContextTakeover: true))->encodeMessage(self::REPEATED);
+		self::assertSame(self::REPEATED, $rx->decodeMessage($payload, $rsv));
+	}
+
+	// ---- A message that was encoded and not sent --------------------------------
+
+	public function testResetDeflateContextRestartsTheStreamForAPeerThatMissedAMessage()
+	{
+		$unsent = bin2hex(random_bytes(600));
+		$tx = new TPermessageDeflateExtension();
+		$rx = new TPermessageDeflateExtension();
+		[$payload, $rsv] = $tx->encodeMessage('shared history');
+		self::assertSame('shared history', $rx->decodeMessage($payload, $rsv));
+
+		$tx->encodeMessage($unsent);   // compressed into the sender's context, and never delivered
+		$tx->resetDeflateContext();
+		[$payload, $rsv] = $tx->encodeMessage($unsent);   // would compress to a reference into the unsent message
+		self::assertSame($unsent, $rx->decodeMessage($payload, $rsv), 'A restarted stream refers to no history, so the peer decodes it with the context it has.');
+		[$payload, $rsv] = $tx->encodeMessage('and on');
+		self::assertSame('and on', $rx->decodeMessage($payload, $rsv), 'Context takeover resumes from the restart.');
+
+		// Without the restart the same sequence refers to bytes the peer never saw.
+		$tx = new TPermessageDeflateExtension();
+		$rx = new TPermessageDeflateExtension();
+		$tx->encodeMessage($unsent);
+		[$payload, $rsv] = $tx->encodeMessage($unsent);
+		try {
+			self::assertNotSame($unsent, $rx->decodeMessage($payload, $rsv));
+		} catch (TWebSocketException $e) {
+			self::assertSame(TWebSocketCloseCode::InvalidFramePayload, $e->getCloseCode());
+		}
+	}
+
 	// ---- End-to-end handshake -------------------------------------------------
 
 	public function testHandshakeNegotiatesAndTheExtensionRoundTrips()
