@@ -71,6 +71,41 @@ class QueuedOutputBackplane extends TNullBackplane implements IWebSocketBuffered
 
 class TWebSocketServerClusterTest extends TestCase
 {
+	/**
+	 * Pumps a server until a condition holds or about two seconds pass, so a slow tick costs pumps
+	 * and a state that never comes fails the assertion that follows.
+	 * @param TWebSocketServer $server The server to pump.
+	 * @param callable $done Returns whether the awaited state is reached.
+	 * @param ?callable $between Runs after each pump, for a peer the test drives by hand.
+	 */
+	private function pumpUntil(TWebSocketServer $server, callable $done, ?callable $between = null): void
+	{
+		for ($i = 0; $i < 100 && !$done(); $i++) {
+			$server->serveOnce(0, 20000);
+			if ($between !== null) {
+				$between();
+			}
+		}
+	}
+
+	/**
+	 * Pumps a server and reads a raw client without blocking until the server closes the transport
+	 * or the pumps run out.
+	 * @param TWebSocketServer $server The server to pump between reads.
+	 * @param TSocketStream $client The client transport; it is switched to non-blocking.
+	 * @return string The bytes read before the end of stream.
+	 */
+	private function readUntilClosed(TWebSocketServer $server, TSocketStream $client): string
+	{
+		$client->setBlocking(false);
+		$bytes = $client->read(65536);
+		for ($i = 0; $i < 100 && !$client->eof(); $i++) {
+			$server->serveOnce(0, 20000);
+			$bytes .= $client->read(65536);
+		}
+		return $bytes;
+	}
+
 	public function testAClusterSourceWithQueuedOutputWakesTheLoopAndIsFlushed()
 	{
 		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
@@ -111,16 +146,16 @@ class TWebSocketServerClusterTest extends TestCase
 		$sink = new TBufferStream();
 		$dialerCluster->register(new TWebSocketConnection($sink, false));
 		$dialer->connectPeer('tcp://127.0.0.1:' . $server->getPort());
-		for ($i = 0; $i < 40; $i++) {
-			$server->serveOnce(0, 5000);   // accept, handshake, and the mutual challenge
-			$dialer->tick();
-		}
+		// Accept, handshake, and the mutual challenge: the server mirrors the dialer's client once each end has verified the other.
+		$this->pumpUntil($server, fn () => count($serverCluster->presence()) === 1, fn () => $dialer->tick());
 		self::assertSame(1, $serverMesh->getPeerCount(), 'The dialer is linked.');
+		self::assertCount(1, $serverCluster->presence(), 'The link is verified at both ends.');
 
 		$serverCluster->broadcast(str_repeat('x', 8 * 1024 * 1024));   // larger than the socket buffers
 		self::assertNotSame([], $serverMesh->getWriteSources(), 'The kernel does not take the message at once.');
-		for ($i = 0; $i < 20000 && $sink->getSize() === 0; $i++) {
-			$server->serveOnce(0);   // no further cluster traffic: only the loop drains the link
+		$deadline = hrtime(true) + 20_000_000_000;   // a time budget: an iteration count measures the machine, not the drain
+		while ($sink->getSize() === 0 && hrtime(true) < $deadline) {
+			$server->serveOnce(0, 2000);   // no further cluster traffic: only the loop, woken by writability, drains the link
 			$dialer->tick();
 		}
 		self::assertGreaterThan(8 * 1024 * 1024, $sink->getSize(), 'The whole message reaches the remote client.');
@@ -146,14 +181,12 @@ class TWebSocketServerClusterTest extends TestCase
 
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', TWebSocketHandshake::generateKey()));
-		for ($tick = 0; $tick < 5; $tick++) {
-			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
-		}
+		$this->pumpUntil($server, fn () => count($cluster->presence()) === 1);   // the accept, the request and the reply can take separate ticks
 		self::assertCount(1, $cluster->presence());
 		self::assertStringContainsString('101', $client->read(4096));
 
 		(new TWebSocketConnection($client, true))->close(1000);
-		$server->serveOnce(0, 300000);   // the unregister throws inside the backplane; the loop must survive it
+		$this->pumpUntil($server, fn () => $server->getConnectionCount() === 0);   // the unregister throws inside the backplane; the loop must survive it
 
 		self::assertSame(1, $backplane->drops, 'The backplane was asked to drop the presence.');
 		self::assertSame(1, $closed, 'The handler close ran.');
@@ -190,13 +223,13 @@ class TWebSocketServerClusterTest extends TestCase
 		$key = TWebSocketHandshake::generateKey();
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', $key));
 
-		$server->serveOnce(0, 300000);   // accept + handshake registers the connection
+		$this->pumpUntil($server, fn () => count($cluster->presence()) === 1);   // accept + handshake registers the connection
 		self::assertCount(1, $cluster->presence(), 'An accepted connection registers in the cluster.');
 		self::assertGreaterThanOrEqual(1, $backplane->ticks, 'The serve loop pumps the backplane each iteration.');
 
 		$clientWs = new TWebSocketConnection($client, true);
 		$clientWs->close(1000);          // a clean WebSocket Close frame ends the session
-		$server->serveOnce(0, 300000);   // reads the close, ends the session and unregisters
+		$this->pumpUntil($server, fn () => count($cluster->presence()) === 0);   // reads the close, ends the session and unregisters
 		self::assertCount(0, $cluster->presence(), 'A closed connection unregisters from the cluster.');
 
 		$client->close();
@@ -221,9 +254,7 @@ class TWebSocketServerClusterTest extends TestCase
 		$key = TWebSocketHandshake::generateKey();
 		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
-		for ($tick = 0; $tick < 5; $tick++) {
-			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
-		}
+		$this->pumpUntil($server, fn () => $mesh->getPeerCount() === 1);   // the accept, the request and the reply can take separate ticks
 
 		self::assertSame(1, $mesh->getPeerCount(), 'A /cluster upgrade joins the mesh as a peer.');
 		self::assertCount(0, $cluster->presence(), 'A peer is not registered as a client.');
@@ -245,9 +276,7 @@ class TWebSocketServerClusterTest extends TestCase
 		$key = TWebSocketHandshake::generateKey();
 		$proof = base64_encode(hash_hmac('sha256', 'handshake:' . $key, sha1('shh'), true));
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => $proof]));
-		for ($tick = 0; $tick < 5; $tick++) {
-			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
-		}
+		$this->pumpUntil($server, fn () => $mesh->getPeerCount() === 1);   // the accept, the request and the reply can take separate ticks
 
 		self::assertSame(1, $mesh->getPeerCount(), 'A peer proving the secret joins the mesh.');
 		$peer->close();
@@ -265,11 +294,13 @@ class TWebSocketServerClusterTest extends TestCase
 		$peer = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
 		$peer->write(TWebSocketHandshake::buildClientRequest('cluster', '/cluster', $key, ['X-Cluster-Auth' => 'forged']));
-		for ($tick = 0; $tick < 5; $tick++) {
-			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
-		}
+		$response = $this->readUntilClosed($server, $peer);
 
-		self::assertSame(0, $mesh->getPeerCount(), 'A peer that cannot prove the secret is refused.');
+		self::assertStringStartsWith('HTTP/1.1 403 ', $response, 'A peer that cannot prove the secret is answered with 403.');
+		self::assertStringNotContainsString('Sec-WebSocket-Accept', $response, 'The upgrade is not completed.');
+		self::assertTrue($peer->eof(), 'The server closes the refused transport.');
+		self::assertSame(0, $mesh->getPeerCount(), 'The mesh holds no link for it.');
+		self::assertSame(0, $server->getLoad(), 'The server holds no connection for it.');
 		$peer->close();
 		$server->close();
 	}
@@ -335,15 +366,13 @@ class TWebSocketServerClusterTest extends TestCase
 		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
 		$key = TWebSocketHandshake::generateKey();
 		$client->write(TWebSocketHandshake::buildClientRequest('ex', '/chat', $key));
-		for ($tick = 0; $tick < 5; $tick++) {
-			$server->serveOnce(0, 60000);   // the accept, the request and the reply can take separate ticks
-		}
+		$this->pumpUntil($server, fn () => count($cluster->presence()) === 1);   // the accept, the request and the reply can take separate ticks
 		self::assertCount(1, $cluster->presence());
 
 		// Close without reading the 101; the unread receive buffer turns the close into a reset, so
 		// the server's next read fails rather than reporting a clean end of stream.
 		$client->close();
-		$server->serveOnce(0, 300000);   // must end the session, not throw
+		$this->pumpUntil($server, fn () => count($cluster->presence()) === 0);   // must end the session, not throw
 		self::assertCount(0, $cluster->presence(), 'An abrupt disconnect ends the session and unregisters.');
 
 		$server->close();

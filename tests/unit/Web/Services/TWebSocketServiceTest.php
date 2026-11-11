@@ -74,6 +74,46 @@ class CannedHttpRequest extends THttpRequest
 
 class TWebSocketServiceTest extends TestCase
 {
+	/** @var ?TApplication The application registered before the test. */
+	private ?TApplication $priorApplication = null;
+
+	/** @var array<string, string> The path aliases registered before the test. */
+	private array $priorAliases = [];
+
+	/** @var ?string The base directory of an application the test created. */
+	private ?string $applicationDirectory = null;
+
+	/** @var ?string The base directory of the application a test created, kept for the test that checks its removal. */
+	private static ?string $createdDirectory = null;
+
+	protected function setUp(): void
+	{
+		$this->priorApplication = Prado::getApplication();
+		$this->priorAliases = (new \ReflectionProperty(Prado::class, '_aliases'))->getValue();
+	}
+
+	/**
+	 * Unregisters an application the test created, with the `Application` alias its constructor
+	 * set, and removes its directory, so the process-global application does not reach later tests.
+	 */
+	protected function tearDown(): void
+	{
+		if ($this->applicationDirectory === null) {
+			return;
+		}
+		(new \ReflectionProperty(Prado::class, '_application'))->setValue(null, $this->priorApplication);
+		(new \ReflectionProperty(Prado::class, '_aliases'))->setValue(null, $this->priorAliases);
+		$entries = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator($this->applicationDirectory, \FilesystemIterator::SKIP_DOTS),
+			\RecursiveIteratorIterator::CHILD_FIRST
+		);
+		foreach ($entries as $entry) {
+			$entry->isDir() ? rmdir($entry->getPathname()) : unlink($entry->getPathname());
+		}
+		rmdir($this->applicationDirectory);
+		$this->applicationDirectory = null;
+	}
+
 	/** @return array{0: TWebSocketConnection, 1: TWebSocketConnection, 2: TSocketStream, 3: TSocketStream} */
 	private function pair(): array
 	{
@@ -220,6 +260,7 @@ class TWebSocketServiceTest extends TestCase
 			$base = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'wsapp_' . uniqid('', true);
 			mkdir($base);
 			mkdir($base . DIRECTORY_SEPARATOR . 'runtime');
+			$this->applicationDirectory = self::$createdDirectory = $base;   // tearDown() unregisters the application and removes the directory
 			$application = new TApplication($base, false);
 		}
 		$request = new CannedHttpRequest();
@@ -241,6 +282,20 @@ class TWebSocketServiceTest extends TestCase
 		} catch (THttpException $e) {
 			self::assertSame(501, $e->getStatusCode(), 'Header names are matched case-insensitively.');
 		}
+	}
+
+	/**
+	 * @depends testRunReadsTheApplicationRequest
+	 */
+	public function testAnApplicationTheTestCreatedIsUnregisteredAndItsDirectoryRemoved()
+	{
+		if (self::$createdDirectory === null) {
+			self::assertNotNull(Prado::getApplication(), 'An application registered before these tests was used, and is kept.');
+			return;
+		}
+		self::assertNull(Prado::getApplication(), 'The application a test registers does not outlive it.');
+		self::assertNull(Prado::getPathOfAlias('Application'), 'Its Application alias is removed with it.');
+		self::assertDirectoryDoesNotExist(self::$createdDirectory, 'Its wsapp_* directory is removed.');
 	}
 
 	public function testProtocolErrorRaisesErrorAndCloses()
