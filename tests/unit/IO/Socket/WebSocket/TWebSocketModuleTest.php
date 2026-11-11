@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\TConfigurationException;
 use Prado\Exceptions\TInvalidDataTypeException;
+use Prado\Exceptions\TInvalidDataValueException;
 use Prado\IO\Async\TAsync;
 use Prado\IO\Async\TRevoltEventLoop;
 use Prado\IO\Socket\TSocketReactor;
@@ -21,8 +22,10 @@ use Prado\IO\Socket\WebSocket\TWebSocketHandler;
 use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\Socket\WebSocket\TWebSocketMessage;
 use Prado\IO\Socket\WebSocket\TWebSocketModule;
+use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
 use Prado\IO\Socket\WebSocket\TWebSocketServer;
 use Prado\IO\Socket\WebSocket\TWebSocketServerAction;
+use Prado\IO\Stream\TBufferStream;
 
 /** Exposes the server factory and lets a test pre-register timers on the reactor the loop runs. */
 class ProbeWebSocketModule extends TWebSocketModule
@@ -42,6 +45,18 @@ class ProbeWebSocketModule extends TWebSocketModule
 			$reactor->delay($delay, $callback);
 		}
 		return $reactor;
+	}
+}
+
+/** Receives a module event through a static method, as a configuration attribute names one. */
+class ModuleEventLog
+{
+	/** @var array<int, array{0: mixed, 1: string}> The sender and payload of each message. */
+	public static array $messages = [];
+
+	public static function onMessage(mixed $sender, mixed $param): void
+	{
+		self::$messages[] = [$sender, (string) $param];
 	}
 }
 
@@ -328,5 +343,132 @@ class TWebSocketModuleTest extends TestCase
 		$module = new TWebSocketModule();
 		$action->setSocketServerModule($module);
 		self::assertSame($module, $action->getSocketServerModule());
+	}
+
+	/**
+	 * @return array<string, array{0: string, 1: mixed, 2: string}> The property, a value it refuses, and the error code.
+	 */
+	public static function invalidNumericProperties(): array
+	{
+		$cases = [];
+		$values = ['a word' => 'abc', 'a unit suffix' => '10M', 'hexadecimal' => '0x10', 'a boolean word' => 'true', 'a boolean' => true, 'a negative string' => '-5', 'a negative' => -1, 'NAN' => 'NAN', 'infinity' => INF, 'an array' => [5]];
+		foreach (['MaxMessageSize', 'MaxSendBufferBytes', 'MaxConnections'] as $property) {
+			foreach ($values + ['a fraction' => '1.5', 'past the integer range' => '9223372036854775808'] as $name => $value) {
+				$cases["$property: $name"] = [$property, $value, 'websocket_module_count_invalid'];
+			}
+		}
+		foreach (['HandshakeTimeout', 'IdleTimeout', 'CloseTimeout', 'ShutdownTimeout'] as $property) {
+			foreach ($values as $name => $value) {
+				$cases["$property: $name"] = [$property, $value, 'websocket_module_seconds_invalid'];
+			}
+		}
+		return $cases;
+	}
+
+	/**
+	 * @dataProvider invalidNumericProperties
+	 * @param string $property
+	 * @param mixed $value
+	 * @param string $code
+	 */
+	public function testANumericPropertyThatIsNotANonNegativeNumberIsRefused(string $property, mixed $value, string $code)
+	{
+		$module = new TWebSocketModule();
+		$module->{'set' . $property}(7);
+		try {
+			$module->{'set' . $property}($value);
+			self::fail("$property accepted " . var_export($value, true) . ' as ' . var_export($module->{'get' . $property}(), true) . '; a limit must not fail open.');
+		} catch (TConfigurationException $e) {
+			self::assertSame($code, $e->getErrorCode());
+			self::assertStringContainsString($property, $e->getMessage(), 'The message names the property.');
+		}
+		self::assertEquals(7, $module->{'get' . $property}(), 'A refused value leaves the property as it was.');
+	}
+
+	public function testNumericPropertiesAcceptNumbersAndNumericStrings()
+	{
+		$module = new TWebSocketModule();
+		foreach (['MaxMessageSize', 'MaxSendBufferBytes', 'MaxConnections'] as $property) {
+			foreach ([[0, 0], ['0', 0], [65536, 65536], [' 65536 ', 65536], ['1e3', 1000], [2048.0, 2048]] as [$value, $expected]) {
+				self::assertSame($module, $module->{'set' . $property}($value));
+				self::assertSame($expected, $module->{'get' . $property}(), "$property takes " . var_export($value, true));
+			}
+			foreach ([null, '', '  '] as $unset) {
+				$module->{'set' . $property}(5);
+				$module->{'set' . $property}($unset);
+				self::assertNull($module->{'get' . $property}(), "$property is unset by " . var_export($unset, true));
+			}
+		}
+		foreach (['HandshakeTimeout', 'IdleTimeout', 'CloseTimeout', 'ShutdownTimeout'] as $property) {
+			foreach ([[0, 0.0], ['0', 0.0], [30, 30.0], ['2.5', 2.5], [' 2.5 ', 2.5], ['1e1', 10.0], [0.25, 0.25]] as [$value, $expected]) {
+				self::assertSame($module, $module->{'set' . $property}($value));
+				self::assertSame($expected, $module->{'get' . $property}(), "$property takes " . var_export($value, true));
+			}
+			foreach ([null, '', '  '] as $unset) {
+				$module->{'set' . $property}(5);
+				$module->{'set' . $property}($unset);
+				self::assertNull($module->{'get' . $property}(), "$property is unset by " . var_export($unset, true));
+			}
+		}
+	}
+
+	public function testListPropertiesKeepEveryItemAsATrimmedString()
+	{
+		$module = new TWebSocketModule();
+		self::assertSame($module, $module->setSubprotocols('v1, 2'));
+		self::assertSame(['v1', '2'], $module->getSubprotocols(), 'An item that looks like a number stays a string.');
+		self::assertSame('2', TWebSocketHandshake::negotiateSubprotocol(['sec-websocket-protocol' => '2'], $module->getSubprotocols()), 'So the subprotocol "2" negotiates.');
+
+		self::assertSame($module, $module->setOrigins('https://app.example, null, true'));
+		self::assertSame(['https://app.example', 'null', 'true'], $module->getOrigins(), 'The opaque origin "null" stays the string a browser sends.');
+		self::assertTrue(TWebSocketHandshake::isOriginAllowed(['origin' => 'null'], $module->getOrigins()));
+
+		self::assertSame($module, $module->setAllowedHosts(' app.example:8443 ,, [::1]:8080 ,'));
+		self::assertSame(['app.example:8443', '[::1]:8080'], $module->getAllowedHosts(), 'Items are trimmed and empty items dropped.');
+
+		$module->setSubprotocols([' chat ', '', 3, null, 'superchat']);
+		self::assertSame(['chat', '3', 'superchat'], $module->getSubprotocols(), 'An array is normalized the same way.');
+		$module->setSubprotocols(new \ArrayIterator(['chat', ' superchat ']));
+		self::assertSame(['chat', 'superchat'], $module->getSubprotocols(), 'A traversable is read as a list.');
+		$module->setSubprotocols('(chat, superchat)');
+		self::assertSame(['chat', 'superchat'], $module->getSubprotocols(), 'A parenthesized list is still a list.');
+		$module->setSubprotocols(new \stdClass());
+		self::assertSame([], $module->getSubprotocols(), 'A value with no text form offers nothing.');
+		foreach (['', '  ', null, []] as $empty) {
+			$module->setOrigins($empty);
+			self::assertSame([], $module->getOrigins(), 'An empty value allows any origin.');
+		}
+
+		$module = new ProbeWebSocketModule();
+		$module->setEndpoint('tcp://127.0.0.1:0');
+		$module->setSubprotocols('v1, 2');
+		$module->setOrigins('https://app.example, null');
+		$server = $module->createServerPublic();
+		try {
+			self::assertSame(['v1', '2'], $server->getSubprotocols());
+			self::assertSame(['https://app.example', 'null'], $server->getOrigins());
+		} finally {
+			$server->close();
+		}
+	}
+
+	public function testAnEventAttributeNamingAStaticMethodReceivesTheModuleEvent()
+	{
+		// What a configuration attribute OnMessage="…" does: TComponent attaches the value as a handler.
+		ModuleEventLog::$messages = [];
+		$module = new TWebSocketModule();
+		$module->setSubProperty('OnMessage', ModuleEventLog::class . '::onMessage');
+		$connection = new TWebSocketConnection(new TBufferStream(), false);
+
+		$module->getHandler()->onMessage($connection, 'hello', TWebSocketOpcode::Text);
+
+		self::assertSame([[$connection, 'hello']], ModuleEventLog::$messages, 'The static method receives the connection and the message.');
+	}
+
+	public function testAnEventAttributeThatIsNotACallableIsRefused()
+	{
+		$module = new TWebSocketModule();
+		$this->expectException(TInvalidDataValueException::class);
+		$module->setSubProperty('OnMessage', 'Application.Chat.onMessage');   // a PRADO namespace path is not a callable
 	}
 }

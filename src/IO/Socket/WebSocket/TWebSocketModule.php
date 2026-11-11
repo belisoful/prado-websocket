@@ -32,7 +32,7 @@ use Prado\Xml\TXmlElement;
  * TWebSocketModule class.
  *
  * The WebSocket server module of the extension: a {@see TSocketServerModule} whose server is a
- * {@see TWebSocketServer}.  `php prado-cli.php websocket/serve` ({@see TWebSocketServerAction})
+ * {@see TWebSocketServer}.  `vendor/bin/prado-cli websocket/serve` ({@see TWebSocketServerAction})
  * binds the configured {@see getEndpoint() Endpoint}, configures the server from the module's
  * properties, and serves until SIGTERM/SIGINT.  A web SAPI cannot host a socket server, so the
  * server runs in its own CLI process.
@@ -40,8 +40,9 @@ use Prado\Xml\TXmlElement;
  * The module configures the server it creates ({@see configureServer()}):
  *  - the {@see getHandlerClass() HandlerClass} handler the connections dispatch through (a
  *    {@see TWebSocketHandler} by default, whose events the module re-raises as {@see onOpen},
- *    {@see onMessage}, {@see onClose} and {@see onError}, so a configuration attribute such as
- *    `OnMessage="Application.Chat.onMessage"` receives them).  The request events of a
+ *    {@see onMessage}, {@see onClose} and {@see onError}, so a configuration attribute that names a
+ *    static method, such as `OnMessage="Application\Chat\ChatLog::onMessage"`, receives them; an event attribute
+ *    takes a PHP callable).  The request events of a
  *    {@see PubSub\TWebSocketPubSubHandler} ({@see onSubscribe}, {@see onPublish}, {@see onSend},
  *    {@see onCall}) are re-raised the same way, and an {@see IWebSocketClusterAware} handler is
  *    given the module's cluster;
@@ -51,7 +52,9 @@ use Prado\Xml\TXmlElement;
  *    {@see setHandshakeTimeout() HandshakeTimeout},
  *    {@see setIdleTimeout() IdleTimeout}, {@see setCloseTimeout() CloseTimeout},
  *    {@see setShutdownTimeout() ShutdownTimeout} and
- *    {@see setMaxConnections() MaxConnections} (unset ones keep the server's defaults);
+ *    {@see setMaxConnections() MaxConnections} (unset ones keep the server's defaults; a value
+ *    that is not a number of zero or more is refused with a {@see TConfigurationException}, so a
+ *    mistyped limit never disables itself);
  *  - the {@see getCluster() cluster coordinator}, which makes the server one node of a cluster over
  *    the configured {@see Cluster\IWebSocketBackplane backplane} (a `<backplane>` child element, or
  *    the `backplane` key of an array configuration); without one the module runs a single node on a
@@ -74,7 +77,8 @@ use Prado\Xml\TXmlElement;
  * <modules>
  *     <module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule"
  *         Address="0.0.0.0" Port="8080" HandlerClass="Application\Chat\ChatHandler"
- *         Subprotocols="chat" IdleTimeout="60" PermessageDeflate="true" NodeId="edge-1">
+ *         Subprotocols="chat" IdleTimeout="60" PermessageDeflate="true" NodeId="edge-1"
+ *         OnMessage="Application\Chat\ChatLog::onMessage">
  *         <backplane class="Prado\IO\Socket\WebSocket\Cluster\TRedisBackplane" Host="127.0.0.1" Port="6379" />
  *     </module>
  * </modules>
@@ -302,6 +306,7 @@ class TWebSocketModule extends TSocketServerModule
 	 * Builds the reactor the server runs on from {@see getEventLoopClass() EventLoopClass}.
 	 * Subclasses override this to register other sources or timers before serving.
 	 * @return TSocketReactor The reactor.
+	 * @since 1.2.0
 	 */
 	protected function createReactor(): TSocketReactor
 	{
@@ -464,9 +469,11 @@ class TWebSocketModule extends TSocketServerModule
 	}
 
 	/**
-	 * Raised when a connection fails with a protocol error.  The sender is the {@see TWebSocketConnection}.
+	 * Raised when a connection fails: on a protocol error, or on an exception a handler threw while
+	 * a message was dispatched.  The sender is the {@see TWebSocketConnection}.
 	 * @param mixed $sender The connection.
-	 * @param mixed $param The {@see \Throwable}.
+	 * @param mixed $param The {@see \Throwable}: a {@see TWebSocketException} for a protocol error,
+	 *   otherwise the handler's exception.
 	 */
 	public function onError(mixed $sender, mixed $param = null): void
 	{
@@ -531,13 +538,14 @@ class TWebSocketModule extends TSocketServerModule
 	}
 
 	/**
-	 * Sets the subprotocols offered in preference order.
+	 * Sets the subprotocols offered in preference order.  Each item is trimmed and kept as a string,
+	 * and an empty item is dropped: `"v1, 2"` offers `v1` and `2`.
 	 * @param array|string $value The subprotocols, or a comma-separated list.
 	 * @return static The current module.
 	 */
 	public function setSubprotocols($value): static
 	{
-		$this->_subprotocols = TPropertyValue::ensureArray($value);
+		$this->_subprotocols = self::ensureStringList($value);
 		return $this;
 	}
 
@@ -551,13 +559,15 @@ class TWebSocketModule extends TSocketServerModule
 	}
 
 	/**
-	 * Sets the origins allowed to upgrade.
+	 * Sets the origins allowed to upgrade.  Each item is trimmed and kept as a string, and an empty
+	 * item is dropped.  The item `null` therefore allows the opaque origin, which a browser sends as
+	 * `Origin: null`.
 	 * @param array|string $value The origins, or a comma-separated list; empty for any.
 	 * @return static The current module.
 	 */
 	public function setOrigins($value): static
 	{
-		$this->_origins = TPropertyValue::ensureArray($value);
+		$this->_origins = self::ensureStringList($value);
 		return $this;
 	}
 
@@ -571,14 +581,113 @@ class TWebSocketModule extends TSocketServerModule
 	}
 
 	/**
-	 * Sets the Host authorities allowed to upgrade.
+	 * Sets the Host authorities allowed to upgrade.  Each item is trimmed and kept as a string, and
+	 * an empty item is dropped.
 	 * @param array|string $value The hosts, or a comma-separated list; empty for any.
 	 * @return static The current module.
 	 */
 	public function setAllowedHosts($value): static
 	{
-		$this->_allowedHosts = TPropertyValue::ensureArray($value);
+		$this->_allowedHosts = self::ensureStringList($value);
 		return $this;
+	}
+
+	/**
+	 * Converts a list property to its items.  A string is split on commas, after one enclosing pair
+	 * of parentheses is removed.  Every item is cast to a string and trimmed, and an empty item is
+	 * dropped, so no item takes the type its text resembles (an integer, a boolean, or null).
+	 * @param mixed $value The list, as an array, a traversable, or a comma-separated string.
+	 * @return string[] The items, in order.
+	 */
+	private static function ensureStringList(mixed $value): array
+	{
+		$text = static fn (mixed $item): string => is_scalar($item) || $item instanceof \Stringable ? trim((string) $item) : '';
+		if ($value instanceof \Traversable) {
+			$value = iterator_to_array($value, false);
+		}
+		if (!is_array($value)) {
+			$list = $text($value);
+			if (strlen($list) > 1 && $list[0] === '(' && $list[-1] === ')') {
+				$list = substr($list, 1, -1);
+			}
+			$value = explode(',', $list);
+		}
+		return array_values(array_filter(array_map($text, $value), static fn (string $item): bool => $item !== ''));
+	}
+
+	/**
+	 * Converts a size or count property to an integer.  Null and a blank string select the server
+	 * default.  Any other value must be a whole number of zero or more, as an integer, a float, or
+	 * a numeric string (`"65536"`, `"1e3"`).
+	 * @param string $property The property name, for the error message.
+	 * @param mixed $value The configured value.
+	 * @throws TConfigurationException When the value is not a whole number of zero or more
+	 *   (`"abc"`, `"10M"`, `"0x10"`, `"true"`, `"1.5"`, `-1`).
+	 * @return ?int The value, or null for the server default.
+	 */
+	private static function ensureCount(string $property, mixed $value): ?int
+	{
+		$number = self::ensureNumber($value);
+		if ($number === null) {
+			return null;
+		}
+		if ($number === false || floor($number) !== $number || $number >= (float) PHP_INT_MAX) {
+			throw new TConfigurationException('websocket_module_count_invalid', $property, self::describeValue($value));
+		}
+		return (int) $number;
+	}
+
+	/**
+	 * Converts a timeout property to seconds.  Null and a blank string select the server default.
+	 * Any other value must be a finite number of zero or more, as an integer, a float, or a numeric
+	 * string (`"2.5"`).
+	 * @param string $property The property name, for the error message.
+	 * @param mixed $value The configured value.
+	 * @throws TConfigurationException When the value is not a number of zero or more (`"abc"`,
+	 *   `"5s"`, `"true"`, `-1`).
+	 * @return ?float The seconds, or null for the server default.
+	 */
+	private static function ensureSeconds(string $property, mixed $value): ?float
+	{
+		$number = self::ensureNumber($value);
+		if ($number === false) {
+			throw new TConfigurationException('websocket_module_seconds_invalid', $property, self::describeValue($value));
+		}
+		return $number;
+	}
+
+	/**
+	 * Reads a numeric property value.
+	 * @param mixed $value The configured value.
+	 * @return null|false|float Null for an unset value (null, or a blank string), false for a
+	 *   value that is not a finite number of zero or more, otherwise the number.
+	 */
+	private static function ensureNumber(mixed $value): null|false|float
+	{
+		if (is_string($value)) {
+			$value = trim($value);
+		}
+		if ($value === null || $value === '') {
+			return null;
+		}
+		if ((!is_int($value) && !is_float($value) && !is_string($value)) || !is_numeric($value)) {
+			return false;
+		}
+		$number = (float) $value;
+		return is_finite($number) && $number >= 0 ? $number : false;
+	}
+
+	/**
+	 * Renders a rejected property value for an error message.
+	 * @param mixed $value The configured value.
+	 * @return string The value as text, or its type when it has no text form.
+	 */
+	private static function describeValue(mixed $value): string
+	{
+		if (is_bool($value)) {
+			return $value ? 'true' : 'false';
+		}
+		return is_scalar($value) ? (string) $value : get_debug_type($value);
 	}
 
 	/**
@@ -612,12 +721,13 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the maximum message size applied to the server ({@see TWebSocketServer::setMaxMessageSize()}).
-	 * @param null|int|string $value The size in bytes, 0 for unlimited, or null for the server default.
+	 * @param null|int|string $value The size in bytes, 0 for unlimited, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a whole number of zero or more (`websocket_module_count_invalid`).
 	 * @return static The current module.
 	 */
 	public function setMaxMessageSize($value): static
 	{
-		$this->_maxMessageSize = ($value === null || $value === '') ? null : TPropertyValue::ensureInteger($value);
+		$this->_maxMessageSize = self::ensureCount('MaxMessageSize', $value);
 		return $this;
 	}
 
@@ -633,12 +743,13 @@ class TWebSocketModule extends TSocketServerModule
 	/**
 	 * Sets the maximum queued outbound bytes per connection applied to the server
 	 * ({@see TWebSocketServer::setMaxSendBufferBytes()}).
-	 * @param null|int|string $value The size in bytes, 0 for unlimited, or null for the server default.
+	 * @param null|int|string $value The size in bytes, 0 for unlimited, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a whole number of zero or more (`websocket_module_count_invalid`).
 	 * @return static The current module.
 	 */
 	public function setMaxSendBufferBytes($value): static
 	{
-		$this->_maxSendBufferBytes = ($value === null || $value === '') ? null : TPropertyValue::ensureInteger($value);
+		$this->_maxSendBufferBytes = self::ensureCount('MaxSendBufferBytes', $value);
 		return $this;
 	}
 
@@ -653,12 +764,13 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the handshake timeout applied to the server ({@see TWebSocketServer::setHandshakeTimeout()}).
-	 * @param null|float|int|string $value The seconds, or null for the server default.
+	 * @param null|float|int|string $value The seconds, 0 for no bound, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a number of zero or more (`websocket_module_seconds_invalid`).
 	 * @return static The current module.
 	 */
 	public function setHandshakeTimeout($value): static
 	{
-		$this->_handshakeTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
+		$this->_handshakeTimeout = self::ensureSeconds('HandshakeTimeout', $value);
 		return $this;
 	}
 
@@ -673,12 +785,13 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the idle timeout applied to the server ({@see TWebSocketServer::setIdleTimeout()}).
-	 * @param null|float|int|string $value The seconds, 0 to disable, or null for the server default.
+	 * @param null|float|int|string $value The seconds, 0 to disable, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a number of zero or more (`websocket_module_seconds_invalid`).
 	 * @return static The current module.
 	 */
 	public function setIdleTimeout($value): static
 	{
-		$this->_idleTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
+		$this->_idleTimeout = self::ensureSeconds('IdleTimeout', $value);
 		return $this;
 	}
 
@@ -693,12 +806,13 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the close timeout applied to the server ({@see TWebSocketServer::setCloseTimeout()}).
-	 * @param null|float|int|string $value The seconds, or null for the server default.
+	 * @param null|float|int|string $value The seconds, 0 for no bound, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a number of zero or more (`websocket_module_seconds_invalid`).
 	 * @return static The current module.
 	 */
 	public function setCloseTimeout($value): static
 	{
-		$this->_closeTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
+		$this->_closeTimeout = self::ensureSeconds('CloseTimeout', $value);
 		return $this;
 	}
 
@@ -715,13 +829,14 @@ class TWebSocketModule extends TSocketServerModule
 	/**
 	 * Sets the shutdown timeout applied to the server ({@see TWebSocketServer::setShutdownTimeout()}):
 	 * the seconds a stopping server gives its live WebSockets to complete the 1001 close handshake.
-	 * @param null|float|int|string $value The seconds, or null for the server default.
+	 * @param null|float|int|string $value The seconds, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a number of zero or more (`websocket_module_seconds_invalid`).
 	 * @return static The current module.
 	 * @since 1.2.0
 	 */
 	public function setShutdownTimeout($value): static
 	{
-		$this->_shutdownTimeout = ($value === null || $value === '') ? null : TPropertyValue::ensureFloat($value);
+		$this->_shutdownTimeout = self::ensureSeconds('ShutdownTimeout', $value);
 		return $this;
 	}
 
@@ -736,12 +851,13 @@ class TWebSocketModule extends TSocketServerModule
 
 	/**
 	 * Sets the connection cap applied to the server ({@see TWebSocketServer::setMaxConnections()}).
-	 * @param null|int|string $value The cap, 0 for unlimited, or null for the server default.
+	 * @param null|int|string $value The cap, 0 for unlimited, or null or '' for the server default.
+	 * @throws TConfigurationException When the value is not a whole number of zero or more (`websocket_module_count_invalid`).
 	 * @return static The current module.
 	 */
 	public function setMaxConnections($value): static
 	{
-		$this->_maxConnections = ($value === null || $value === '') ? null : TPropertyValue::ensureInteger($value);
+		$this->_maxConnections = self::ensureCount('MaxConnections', $value);
 		return $this;
 	}
 

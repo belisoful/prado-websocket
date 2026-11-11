@@ -15,9 +15,10 @@ use Prado\IO\Socket\TSocketServerAction;
 /**
  * TWebSocketServerAction class.
  *
- * Runs a {@see TWebSocketModule} from the command line: `php prado-cli.php websocket/serve` binds
- * the module's endpoint and serves WebSocket connections until interrupted (CTRL-C / SIGTERM).  The
- * `--address` and `--port` options override the configured endpoint for the run.  The module
+ * Runs a {@see TWebSocketModule} from the command line: `vendor/bin/prado-cli websocket/serve`
+ * binds the module's endpoint and serves WebSocket connections until interrupted (CTRL-C / SIGTERM).
+ * The `--address=value` and `--port=value` options override the configured endpoint for the run,
+ * as in `vendor/bin/prado-cli websocket/serve --address=127.0.0.1 --port=9000`.  The module
  * registers the action itself ({@see \Prado\IO\Socket\TSocketServerModule::registerShellAction()})
  * when the {@see \Prado\IO\Socket\TSocketServerModule::PERM_SOCKET_SERVER} permission allows it.
  *
