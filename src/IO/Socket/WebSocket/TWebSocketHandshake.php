@@ -118,7 +118,11 @@ class TWebSocketHandshake
 	 * {@see upgradeError()} refuses such a request:
 	 *  - whitespace between a field name and its colon (§3.2.4).
 	 *  - an obs-fold continuation line, one that starts with a space or tab (§3.2.4).
+	 *  - a header line with no colon, or with nothing before it (§3.2).
 	 *  - a second `Host` field (§5.4).
+	 *
+	 * `statusCode` is the status of a response line whose status is exactly three digits (§3.1.2),
+	 * and null otherwise: `101abc` is no status code.
 	 * @param string $data The HTTP head (and optional body) text.
 	 * @return array{requestLine: string, method: ?string, target: ?string, protocol: string, statusCode: ?int, headers: array<string, string>, body: string, malformed: bool}
 	 *   The parsed message; header keys are lower-cased.
@@ -145,7 +149,7 @@ class TWebSocketHandshake
 		];
 		if (str_starts_with($first, 'HTTP/')) {
 			$result['protocol'] = $parts[0] ?? '';
-			$result['statusCode'] = isset($parts[1]) ? (int) $parts[1] : null;
+			$result['statusCode'] = (isset($parts[1]) && preg_match('/^\d{3}$/D', $parts[1]) === 1) ? (int) $parts[1] : null;
 		} else {
 			$result['method'] = $parts[0] ?? null;
 			$result['target'] = $parts[1] ?? null;
@@ -157,7 +161,11 @@ class TWebSocketHandshake
 				$result['malformed'] = true;   // obs-fold
 				continue;
 			}
-			if ($line === '' || !str_contains($line, ':')) {
+			if ($line === '') {
+				continue;
+			}
+			if (!str_contains($line, ':') || $line[0] === ':') {
+				$result['malformed'] = true;   // not a header field: no colon, or no name before it
 				continue;
 			}
 			[$name, $value] = explode(':', $line, 2);
@@ -206,7 +214,7 @@ class TWebSocketHandshake
 	 * Validates a parsed request as a WebSocket upgrade, returning the HTTP rejection to send when it
 	 * is not.  The result:
 	 *  - a {@see parseHttpMessage() malformed} head, or a request that is not an HTTP/1.1-or-higher
-	 *    `GET` → `400`.
+	 *    `GET` → `400`.  The method is case-sensitive (RFC 7230 §3.1.1): `get` is not `GET`.
 	 *  - a request that omits `Host`, or is not an `Upgrade: websocket` with a valid key → `400`.
 	 *  - a request with a `Transfer-Encoding`, or a `Content-Length` other than `0` → `400`: an upgrade
 	 *    has no body, and the bytes behind its head are WebSocket frames.
@@ -218,7 +226,7 @@ class TWebSocketHandshake
 	public static function upgradeError(array $request): ?string
 	{
 		$headers = $request['headers'];
-		if (!empty($request['malformed']) || strtoupper((string) ($request['method'] ?? '')) !== 'GET') {
+		if (!empty($request['malformed']) || ($request['method'] ?? null) !== 'GET') {
 			return self::buildRejection(400, 'Bad Request');
 		}
 		if (!self::isHttpVersionAtLeast11($request['protocol'] ?? '')) {
@@ -300,7 +308,9 @@ class TWebSocketHandshake
 	}
 
 	/**
-	 * Selects the subprotocol to use from the client's offer and the server's supported list.
+	 * Selects the subprotocol to use from the client's offer and the server's supported list.  The
+	 * offer is a comma-separated list of tokens; an empty element is skipped, and every other token
+	 * is compared as written, `0` included.
 	 * @param array<string, string> $requestHeaders The lower-cased request headers.
 	 * @param string[] $supported The subprotocols the server supports, in preference order.
 	 * @return ?string The selected subprotocol, or null when none match.
@@ -310,7 +320,10 @@ class TWebSocketHandshake
 		if ($supported === []) {
 			return null;
 		}
-		$offered = array_filter(array_map('trim', explode(',', $requestHeaders[strtolower(THttpHeaderName::SecWebSocketProtocol)] ?? '')));
+		$offered = array_filter(
+			array_map('trim', explode(',', $requestHeaders[strtolower(THttpHeaderName::SecWebSocketProtocol)] ?? '')),
+			static fn (string $token): bool => $token !== '',
+		);
 		foreach ($supported as $candidate) {
 			if (in_array($candidate, $offered, true)) {
 				return $candidate;
@@ -565,6 +578,7 @@ class TWebSocketHandshake
 	/**
 	 * Verifies a parsed server response against the key the client sent: a 101 whose `Upgrade` list
 	 * contains `websocket`, whose `Connection` list contains `Upgrade`, and whose accept value matches.
+	 * The status is the three-digit code {@see parseHttpMessage()} reads; `101abc` is refused.
 	 * @param array{statusCode: ?int, headers: array<string, string>} $response The parsed response.
 	 * @param string $sentKey The Sec-WebSocket-Key the client sent.
 	 * @return bool Whether the response is a valid 101 with the matching accept value.

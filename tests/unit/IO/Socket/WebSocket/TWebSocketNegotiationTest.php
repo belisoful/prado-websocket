@@ -114,6 +114,10 @@ class TWebSocketNegotiationTest extends TestCase
 			'obs-fold with a tab' => [$head . "X-Note: one\r\n\ttwo\r\n\r\n"],
 			'Transfer-Encoding' => [$head . "Transfer-Encoding: chunked\r\n\r\n"],
 			'Content-Length' => [$head . "Content-Length: 5\r\n\r\n"],
+			'a header line with no colon' => [$head . "garbage line\r\n\r\n"],
+			'a header line with no field name' => [$head . ": value\r\n\r\n"],
+			'a lower-case method' => ['get' . substr($head, 3) . "\r\n"],
+			'a mixed-case method' => ['Get' . substr($head, 3) . "\r\n"],
 		];
 	}
 
@@ -134,6 +138,27 @@ class TWebSocketNegotiationTest extends TestCase
 		$repeated = TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\nConnection: Upgrade\r\n\r\n");
 		self::assertFalse($repeated['malformed'], 'Another field may repeat.');
 		self::assertSame('keep-alive, Upgrade', $repeated['headers']['connection']);
+
+		$noColon = TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a\r\ngarbage line\r\nUpgrade: websocket\r\n\r\n");
+		self::assertTrue($noColon['malformed'], 'A header line with no colon is not a header field (RFC 7230 §3.2).');
+		self::assertSame(['host' => 'a', 'upgrade' => 'websocket'], $noColon['headers'], 'The fields around it are still read.');
+		$noName = TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a\r\n: orphan\r\n\r\n");
+		self::assertTrue($noName['malformed'], 'A line with nothing before its colon has no field name.');
+		self::assertSame(['host' => 'a'], $noName['headers']);
+		$colons = TWebSocketHandshake::parseHttpMessage("GET / HTTP/1.1\r\nHost: a:8080\r\nOrigin: https://a\r\nX-Empty:\r\n");
+		self::assertFalse($colons['malformed'], 'A colon inside a value, an empty value and a head with no blank line yet are well-formed.');
+		self::assertSame(['host' => 'a:8080', 'origin' => 'https://a', 'x-empty' => ''], $colons['headers']);
+	}
+
+	public function testTheRequestMethodIsCaseSensitive()
+	{
+		$headers = TWebSocketHandshake::parseHttpMessage($this->request())['headers'];
+		self::assertNull(TWebSocketHandshake::upgradeError(['method' => 'GET', 'protocol' => 'HTTP/1.1', 'headers' => $headers]));
+		foreach (['get', 'Get', 'gET', 'POST', '', null] as $method) {
+			$error = TWebSocketHandshake::upgradeError(['method' => $method, 'protocol' => 'HTTP/1.1', 'headers' => $headers]);
+			self::assertNotNull($error, 'Only the method GET, as written, upgrades (RFC 7230 §3.1.1): ' . var_export($method, true));
+			self::assertStringStartsWith('HTTP/1.1 400', $error);
+		}
 	}
 
 	public function testAZeroContentLengthIsAccepted()
@@ -247,6 +272,20 @@ class TWebSocketNegotiationTest extends TestCase
 		self::assertStringNotContainsString('Sec-WebSocket-Protocol:', $response);
 	}
 
+	public function testSubprotocolTokenZeroIsNegotiated()
+	{
+		self::assertSame('0', TWebSocketHandshake::negotiateSubprotocol(['sec-websocket-protocol' => '0, chat'], ['0']), 'The token "0" is a subprotocol like any other.');
+		self::assertSame('0', TWebSocketHandshake::negotiateSubprotocol(['sec-websocket-protocol' => 'chat,0'], ['v2', '0']));
+		[$result, $error, $response] = $this->accept($this->request(['Sec-WebSocket-Protocol' => '0']), ['subprotocols' => ['0']]);
+		self::assertNull($error);
+		self::assertSame('0', $result['subprotocol']);
+		self::assertStringContainsString("Sec-WebSocket-Protocol: 0\r\n", $response);
+
+		self::assertSame('chat', TWebSocketHandshake::negotiateSubprotocol(['sec-websocket-protocol' => ' , ,chat,'], ['chat']), 'Empty list elements are skipped.');
+		self::assertNull(TWebSocketHandshake::negotiateSubprotocol(['sec-websocket-protocol' => 'chat, ,'], ['']), 'An empty element is not an offer of the empty subprotocol.');
+		self::assertNull(TWebSocketHandshake::negotiateSubprotocol([], ['0']), 'No offer selects nothing.');
+	}
+
 	/** Inserts an extra header line before the blank line, so a field repeats. */
 	private function withExtraLine(string $request, string $line): string
 	{
@@ -347,9 +386,14 @@ class TWebSocketNegotiationTest extends TestCase
 			TWebSocketHandshake::parseUrl('http://example.com');
 			self::fail('A non-ws scheme is rejected.');
 		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_url_scheme_invalid', $e->getErrorCode());
 		}
-		$this->expectException(TWebSocketException::class);
-		TWebSocketHandshake::parseUrl('not a url');
+		try {
+			TWebSocketHandshake::parseUrl('not a url');
+			self::fail('A string with no host is rejected.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_url_invalid', $e->getErrorCode());
+		}
 	}
 
 	// ---- Extension negotiation -----------------------------------------------
@@ -388,6 +432,28 @@ class TWebSocketNegotiationTest extends TestCase
 		self::assertTrue(TWebSocketHandshake::verifyServerResponse($ok, $key));
 		self::assertFalse(TWebSocketHandshake::verifyServerResponse(['statusCode' => 101, 'headers' => ['connection' => 'Upgrade', 'sec-websocket-accept' => $accept]], $key), 'A response missing Upgrade is rejected.');
 		self::assertFalse(TWebSocketHandshake::verifyServerResponse(['statusCode' => 101, 'headers' => ['upgrade' => 'websocket', 'sec-websocket-accept' => $accept]], $key), 'A response missing Connection: Upgrade is rejected.');
+	}
+
+	public function testTheResponseStatusIsExactlyThreeDigits()
+	{
+		$key = TWebSocketHandshake::generateKey();
+		$headers = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " . TWebSocketHandshake::acceptKey($key) . "\r\n\r\n";
+		$statuses = [
+			'101 Switching Protocols' => 101,
+			'101' => 101,
+			'200 OK' => 200,
+			'101abc X' => null,
+			'1010 X' => null,
+			'10 X' => null,
+			' 101 X' => null,
+			'+101 X' => null,
+			"101\n X" => null,
+		];
+		foreach ($statuses as $status => $code) {
+			$response = TWebSocketHandshake::parseHttpMessage('HTTP/1.1 ' . $status . "\r\n" . $headers);
+			self::assertSame($code, $response['statusCode'], 'The status of "HTTP/1.1 ' . addcslashes((string) $status, "\n") . '"');
+			self::assertSame($code === 101, TWebSocketHandshake::verifyServerResponse($response, $key), 'Only a status line whose status is exactly 101 completes the handshake.');
+		}
 	}
 
 	public function testRepeatedExtensionKeepsEachOfferInOrder()
@@ -475,14 +541,24 @@ class TWebSocketNegotiationTest extends TestCase
 
 	public function testResolveExtensionsRejectsUnofferedExtension()
 	{
-		$this->expectException(TWebSocketException::class);
-		TWebSocketHandshake::resolveExtensions(['sec-websocket-extensions' => 'x-unknown'], [new KeyNegotiator()]);
+		try {
+			TWebSocketHandshake::resolveExtensions(['sec-websocket-extensions' => 'x-unknown'], [new KeyNegotiator()]);
+			self::fail('An extension the client did not offer fails the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_not_offered', $e->getErrorCode());
+			self::assertStringContainsString('x-unknown', $e->getMessage());
+		}
 	}
 
 	public function testResolveExtensionsRejectsUnacceptableParameters()
 	{
-		$this->expectException(TWebSocketException::class);
-		TWebSocketHandshake::resolveExtensions(['sec-websocket-extensions' => 'x-key'], [new KeyNegotiator()]);   // no key param -> fromResponse null
+		try {
+			TWebSocketHandshake::resolveExtensions(['sec-websocket-extensions' => 'x-key'], [new KeyNegotiator()]);   // no key param -> fromResponse null
+			self::fail('Parameters the negotiator refuses fail the handshake.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_unacceptable', $e->getErrorCode());
+			self::assertStringContainsString('x-key', $e->getMessage());
+		}
 	}
 
 	public function testAcceptConnectionNegotiatesExtensionEndToEnd()
