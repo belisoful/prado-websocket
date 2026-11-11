@@ -8,6 +8,8 @@ parameters:
         - tests/test_tools/phpstan-bootstrap.php
     paths:
         - src
+        - examples
+        - tests/autobahn
 
 services:
     -

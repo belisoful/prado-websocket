@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" bootstrap="./tests/test_tools/phpunit_bootstrap.php" colors="true" stopOnFailure="false" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.5/phpunit.xsd" cacheDirectory=".phpunit.cache">
+<!-- A run without a testsuite option runs the unit suite. Risky tests fail a run. PRADO's error
+     handler, which the bootstrap installs, raises a PHP warning, notice or deprecation as an
+     exception; failOnWarning, failOnNotice and failOnDeprecation fail the run should that handler
+     be absent. Skipped tests do not fail a run here, so the suite passes on a machine without
+     libnghttp2; CI adds the fail-on-skipped and fail-on-incomplete options. -->
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" bootstrap="./tests/test_tools/phpunit_bootstrap.php" colors="true" stopOnFailure="false" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.5/phpunit.xsd" cacheDirectory=".phpunit.cache" defaultTestSuite="unit" failOnRisky="true" failOnWarning="true" failOnNotice="true" failOnDeprecation="true">
   <testsuites>
 	<testsuite name="unit">
 	  <directory suffix="Test.php">./tests/unit</directory>
 	</testsuite>
+	<!-- Tests against real services (a Redis server); run with `composer integrationtest`. -->
+	<testsuite name="integration">
+	  <directory suffix="Test.php">./tests/integration</directory>
+	</testsuite>
   </testsuites>
-  <logging>
-	<testdoxHtml outputFile="./build/tests/index.html"/>
-  </logging>
   <!-- Coverage source. Inert until a run asks for coverage on the command line,
        as `composer coverage` does. Narrow a run with the coverage-filter option. -->
   <source>
