@@ -1,23 +1,39 @@
 name: Autobahn TestSuite
-on: [push, pull_request]
+on:
+  # A push to the default branch or of a tag.  A branch under review runs through its pull request,
+  # so a pull request from this repository runs once.  Any other branch runs on request
+  # (workflow_dispatch).
+  push:
+    branches: [main]
+    tags: ['**']
+  pull_request:
+  workflow_dispatch:
+  # Weekly, Monday 04:53 UTC: the build tracks PRADO master and prado-http2 main, so an upstream
+  # break shows without a push here.
+  schedule:
+    - cron: '53 4 * * 1'
 permissions:
   contents: read
 concurrency:
-  # A newer push to the same ref supersedes the run still in progress.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer run for the same event and ref supersedes the run still in progress.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 env:
   # The fuzzingclient image, pinned by tag and digest so a new upstream image cannot change the run.
   AUTOBAHN_IMAGE: crossbario/autobahn-testsuite:25.10.1@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
+  PHP_VERSION: '8.4'
 jobs:
   autobahn:
     name: Autobahn fuzzingclient (server compliance)
     # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 prado-http2 needs; 26.04 ships 1.68.0.
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    # Longer than the image pull and fuzzingclient step limits together, so a stalled step ends at
+    # its own limit and the report is still uploaded.
+    timeout-minutes: 40
 
     defaults:
       run:
+        shell: bash
         working-directory: prado-websocket
 
     steps:
@@ -40,11 +56,31 @@ jobs:
           ref: main
           path: prado-http2
 
+      - name: Configure apt retries and timeouts
+        run: sudo bash .github/scripts/configure-apt.sh
+
       - name: Setup PHP, with composer and extensions
         uses: shivammathur/setup-php@v2
+        timeout-minutes: 10
         with:
-          php-version: '8.4'
+          php-version: ${{ env.PHP_VERSION }}
+          # zlib: the echo server offers permessage-deflate, which cases 12.* and 13.* need.
           extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, sockets, spl, zlib
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      # The key of the unit and Playwright jobs' PHP 8.4 cache, so the three share it.
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php${{ env.PHP_VERSION }}-http2-main-composer-${{ hashFiles('prado-websocket/composer.json', 'prado/composer.json', 'prado-http2/composer.json') }}
+          restore-keys: ${{ runner.os }}-php${{ env.PHP_VERSION }}-http2-main-composer-
 
       # The same PRADO and prado-http2 revisions the unit and Playwright jobs build against.
       - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
@@ -53,9 +89,15 @@ jobs:
           composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.5.0"}}}'
 
       - name: Install Composer dependencies
+        timeout-minutes: 10
         run: composer install --no-progress --prefer-dist --optimize-autoloader
 
+      - name: Pull the Autobahn fuzzingclient image
+        timeout-minutes: 8
+        run: bash .github/scripts/retry.sh 3 140 docker pull "$AUTOBAHN_IMAGE"
+
       - name: Run the echo server and the Autobahn fuzzingclient
+        timeout-minutes: 20
         run: |
           mkdir -p tests/autobahn/reports
           php tests/autobahn/echo-server.php &
@@ -76,6 +118,8 @@ jobs:
             "$AUTOBAHN_IMAGE" \
             wstest -m fuzzingclient -s /config/fuzzingclient.json
 
+      # Fails unless every case is OK or has the outcome check-report.php allows for it, and prints
+      # the count of each outcome.
       - name: Check the Autobahn report
         run: |
           sudo chown -R "$USER" tests/autobahn/reports 2>/dev/null || true

@@ -6,6 +6,7 @@
 /.nvmrc                export-ignore
 /.php-cs-fixer.dist.php export-ignore
 /package.json          export-ignore
+/package-lock.json     export-ignore
 /phpstan.neon.dist     export-ignore
 /phpunit.xml           export-ignore
 /playwright.config.js  export-ignore

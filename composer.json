@@ -1,10 +1,14 @@
 {
 	"name": "belisoful/prado-websocket",
 	"type": "prado4-extension",
-	"description": "WebSocket server and client for the PRADO PHP framework: RFC 6455 over HTTP/1.1, with HTTP/2 (RFC 8441) via nghttp2.",
-	"keywords": [ "prado", "framework", "websocket", "rfc6455", "rfc8441", "http2", "nghttp2", "extension"],
+	"description": "WebSocket server and client for the PRADO PHP framework: RFC 6455 over HTTP/1.1, RFC 8441 over HTTP/2 via nghttp2, RFC 7692 permessage-deflate, multi-node clustering, and browser pub/sub.",
+	"keywords": [ "prado", "framework", "websocket", "rfc6455", "rfc8441", "rfc7692", "permessage-deflate", "http2", "nghttp2", "cluster", "pubsub", "extension"],
 	"homepage": "https://github.com/belisoful/prado-websocket",
 	"license": "BSD-3-Clause",
+	"support": {
+		"issues": "https://github.com/belisoful/prado-websocket/issues",
+		"source": "https://github.com/belisoful/prado-websocket"
+	},
 	"authors": [
 		{
 			"name": "Brad Anderson",
@@ -20,7 +24,8 @@
 	},
 	"autoload-dev": {
 		"psr-4": {
-			"Prado\\Test\\Unit\\": "tests/unit/"
+			"Prado\\Test\\Unit\\": "tests/unit/",
+			"Prado\\Test\\Integration\\": "tests/integration/"
 		}
 	},
 	"repositories": [
@@ -36,10 +41,10 @@
 	},
 	"suggest": {
 		"ext-openssl": "TLS with ALPN for wss:// and HTTP/2 over TLS (h2).",
-		"ext-sockets": "Faster socket primitives for the standalone server.",
 		"ext-zlib": "RFC 7692 permessage-deflate message compression (TPermessageDeflateExtension).",
 		"ext-redis": "Redis-backed cluster backplane (TRedisBackplane) for multi-host scaling.",
-		"lib-nghttp2": "The system libnghttp2 shared library, used by belisoful/prado-http2 for HTTP/2.",
+		"ext-posix": "Lets TFileBackplane verify that its spool directory is owned by the server's user; the owner check is skipped without it.",
+		"lib-nghttp2": "The system libnghttp2 shared library, 1.60.0 or later, used by belisoful/prado-http2 for HTTP/2.",
 		"ext-ffi": "Required by belisoful/prado-http2 to bind libnghttp2 for HTTP/2.",
 		"belisoful/prado-http2": "HTTP/2 (RFC 8441) WebSocket multiplexing (^1.5); without it the server serves HTTP/1.1 only."
 	},
@@ -50,7 +55,7 @@
 		"belisoful/prado-http2": "^1.5",
 		"phpunit/phpunit": "^10",
 		"friendsofphp/php-cs-fixer": "3.95.27",
-		"phpstan/phpstan": "2.3.3"
+		"phpstan/phpstan": "2.3.5"
 	},
 	"config": {
 		"platform": {
@@ -60,10 +65,13 @@
 	"scripts": {
 		"fix": [
 			"vendor/bin/php-cs-fixer fix src",
-			"vendor/bin/php-cs-fixer fix tests"
+			"vendor/bin/php-cs-fixer fix tests",
+			"vendor/bin/php-cs-fixer fix examples"
 		],
 		"stan": "vendor/bin/phpstan analyse --memory-limit=1G",
 		"unittest": "vendor/bin/phpunit --testsuite unit",
+		"integrationtest": "vendor/bin/phpunit --testsuite integration",
+		"testdox": "vendor/bin/phpunit --testsuite unit --testdox-html build/tests/index.html",
 		"coverage": [
 			"@putenv XDEBUG_MODE=coverage",
 			"vendor/bin/phpunit --testsuite unit --coverage-text"
