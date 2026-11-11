@@ -3,17 +3,18 @@
 ## Build, Lint, and Test Commands
 
 ### Running Tests
-- **All Unit Tests**: `vendor/bin/phpunit --testsuite unit` (or `composer unittest`) - runs all unit tests
+- **All Unit Tests**: `vendor/bin/phpunit --testsuite unit` (or `composer unittest`) - runs all unit tests; a run without `--testsuite` runs the unit suite
+- **Integration Tests**: `vendor/bin/phpunit --testsuite integration` (or `composer integrationtest`); needs ext-redis and a Redis server at `REDIS_HOST`:`REDIS_PORT` (default `127.0.0.1:6379`). The tests skip without them, and CI fails on a skip
 - **Test Filter**: `vendor/bin/phpunit --testsuite unit --filter <test function, class, or directory>`
 - **Coverage**: `composer coverage` (text) / `composer coverage-html` (HTML in `build/coverage`); phpunit.xml declares `src/` as the coverage source and the scripts set `XDEBUG_MODE`. Narrow a run with `--filter` and `--coverage-filter`.
   - **Path/branch coverage, fast**: a full-suite `--path-coverage` run takes about an hour. CI collects no coverage. To get a class's exact branch and path list, pass `--path-coverage` to a run filtered to the relevant test classes, which takes seconds: `composer coverage -- --filter 'TWebSocketFrameCodecTest|TWebSocketMessageTest' --coverage-filter src/IO/Socket/WebSocket/TWebSocketFrameCodec.php --path-coverage`. `--coverage-filter` adds to the `src/` source in phpunit.xml and does not replace it, so every class still gets a row. Read only the rows for the classes under test, and ignore the summary percentages.
 - **Playwright browser-client tests**: `composer functest` (Chromium) / `composer functionaltest` (all browsers); the static page server starts automatically and `tests/playwright/ws-helpers.js` spawns the PHP WebSocket server per spec
-- **Autobahn|TestSuite** (server compliance, needs Docker): see `.github/workflows/autobahn.yml`; `tests/autobahn/echo-server.php` is the testee and `tests/autobahn/check-report.php` gates the report
+- **Autobahn|TestSuite** (server compliance, needs Docker): see `.github/workflows/autobahn.yml`; `tests/autobahn/echo-server.php` is the testee and `tests/autobahn/check-report.php` gates the report: it passes only `OK` and the outcomes its `ALLOWED` list names per case, and expects 517 cases
 
 ### Linting and Code Analysis
-- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); level 4 with `treatPhpDocTypesAsCertain: false` (as PRADO), `phpVersion` range 8.2 – 8.5
+- **PHPStan Analysis**: `vendor/bin/phpstan analyse --memory-limit=1G` (or `composer stan`); it analyses `src`, `examples` and `tests/autobahn`; level 4 with `treatPhpDocTypesAsCertain: false` (as PRADO), `phpVersion` range 8.2 – 8.5
 - **PHP CS Fixer (Dry-run)**: `vendor/bin/php-cs-fixer fix --dry-run src/` and `vendor/bin/php-cs-fixer fix --dry-run tests/` (check)
-- **PHP CS Fixer (Fix)**: `vendor/bin/php-cs-fixer fix src/` and `vendor/bin/php-cs-fixer fix tests/` (or `composer fix`); the finder excludes `tests/`, so `src` and `tests` run as two invocations
+- **PHP CS Fixer (Fix)**: `vendor/bin/php-cs-fixer fix src/` and `vendor/bin/php-cs-fixer fix tests/` (or `composer fix`); the finder excludes `tests/`, so `src`, `tests` and `examples` run as three invocations
 
 ### Build Commands
 - **Install Dependencies**: `composer install` - installs all dependencies
@@ -82,7 +83,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - Throw appropriate PRADO exceptions (`TInvalidDataValueException`, `TInvalidOperationException`, etc.); protocol failures throw `TWebSocketException`
 - Return false or null for methods that are designed to fail gracefully
 - All methods should handle edge cases and validate input parameters
-- Extension Exceptions use error codes (keys) defined in `config/errorMessages.txt`; the message text is purely for user information display only. Every code thrown must exist in that file, and the file should carry no unused codes (`ErrorMessagesFileTest` checks both).
+- Extension Exceptions use error codes (keys) defined in `config/errorMessages.txt`; the message text is purely for user information display only. Every code thrown must exist in that file, and the file should carry no unused codes (`ErrorMessagesFileTest` checks both, and that each constructor passes one argument per placeholder; name the code as a string literal in the exception constructor, or the test does not see it).
 - Each message is an ICU MessageFormat pattern, as PRADO formats it with `MessageFormatter`. An apostrophe beside a brace quotes it: write a quoted placeholder as `''{0}''` (`'{0}'` renders the literal `{0}`) and a literal brace as `'{'`; an apostrophe elsewhere, as in "can't", is literal. A count that can be 1 uses `{0, plural, one{# item} other{# items}}`.
 - An exception whose message is written for the client or site visitor implements `Prado\Exceptions\IUserException`, as `TWebSocketPubSubException` does.
 
@@ -115,7 +116,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - UI Portlets are PHP classes with a ".tpl" TTemplate file with the same base name
 - Data components should support `TActiveRecord` pattern
 - All UI controls should have proper template support and state management
-- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to `TNativeClock`. Durations, deadlines and timeouts measured within one process use PRADO's `\Prado\Util\Clock\TMonotonicClockAwareTrait` (`$this->getMonotonicClock()->seconds()`), so a wall-clock change does not move them: `TWebSocketServer` measures its handshake, close and idle timeouts this way and shares the clock with the reactor it creates. Tests set `tests/unit/IO/Socket/WebSocket/TTestMonotonicClock.php` with `setMonotonicClock()`.
+- Time is read through PRADO's clock seam, never `time()`/`microtime()` directly: classes that need "now" use `\Prado\Util\Clock\TApplicationClockAwareTrait` and call `$this->getClock()->microtime()` / `->time()`; tests inject `\Prado\Util\Clock\TMockClock` with `setClock()`. A static helper with a deadline (`TWebSocketHandshake::readHandshake()`) takes an optional `IClock` or `TMonotonicClock` (the `clock` option of `acceptConnection()`/`openConnection()`), defaulting to a `TMonotonicClock`. Durations, deadlines and timeouts measured within one process use PRADO's `\Prado\Util\Clock\TMonotonicClockAwareTrait` (`$this->getMonotonicClock()->seconds()`), so a wall-clock change does not move them: `TWebSocketServer` measures its handshake, close and idle timeouts this way and shares the clock with the reactor it creates. Tests set `tests/unit/IO/Socket/WebSocket/TTestMonotonicClock.php` with `setMonotonicClock()`.
 - Logging goes through `Prado::log()` with `\Prado\Util\Log\TLogger` levels (the logger moved to `Prado\Util\Log` in PRADO 4.4).
 - The public API is published (v1.0.0 onward): prefer compatible changes, and document any breaking change under "Upgrading" in `CHANGELOG.md`
 - Record every user-visible change under `## [Unreleased]` in `CHANGELOG.md` (Keep a Changelog format) as it lands
@@ -123,11 +124,12 @@ Docblocks inform and describe; it is not persuasive writing.
 - A full check must be done for code to be ready for git commit.
 - The current version of this extension is **v1.1.0** (released 2026-09-22). It targets PRADO 4.4+ (the `pradosoft/prado` `master` branch, aliased `4.4.x-dev`). Release history and upgrade notes are in `CHANGELOG.md`.
 - This extension namespaces its classes under `Prado\IO\Socket\WebSocket\` (PSR-4 `Prado\` → `src/`); extensions do NOT update the framework's `classes.php`. Prado3 short class names are supplied via `config/classMap.json`, registered by Composer from `composer.json` `extra.prado.class-map`.
-- Error codes (keys) and their messages live in `config/errorMessages.txt`, registered by Composer from `composer.json` `extra.prado.error-messages` (not loaded by `TWebSocketModule`); the framework's `messages.txt` is not used.
-- HTTP/2 (RFC 8441) support comes from `belisoful/prado-http2` (`Prado\IO\Http2\`), which binds the system `libnghttp2` through FFI; it is a `require-dev` dependency and a runtime `suggest`. HTTP/2 tests skip when `libnghttp2` is absent.
+- Error codes (keys) and their messages live in `config/errorMessages.txt`, registered by PRADO's application from the package's `composer.json` `extra.prado.error-messages` (not loaded by `TWebSocketModule`); a script or test without a `TApplication` calls `TException::addMessageFile()` itself, as `tests/test_tools/phpunit_bootstrap.php` does; the framework's `messages.txt` is not used.
+- HTTP/2 (RFC 8441) support comes from `belisoful/prado-http2` (`Prado\IO\Http2\`), which binds the system `libnghttp2` through FFI; it is a `require-dev` dependency, a runtime `suggest`, and a `conflict` below 1.5.0. HTTP/2 tests skip when `libnghttp2` is absent; CI fails on a skip.
 
 ## Testing Guidelines
-- The testing platforms are "phpunit" (unit), "playwright" (browser clients), and the Autobahn|TestSuite (RFC 6455/7692 server compliance)
+- The testing platforms are "phpunit" (unit), "playwright" (browser clients), the Autobahn|TestSuite (RFC 6455/7692 server compliance), and the phpunit `integration` suite (real services)
+- Integration test classes use the `Prado\Test\Integration\` namespace (`autoload-dev` PSR-4 → `tests/integration/`) and read the service address from the environment. Do not add them to the `unit` testsuite
 - Unit test classes use the `Prado\Test\Unit\` namespace, autoloaded by Composer (`autoload-dev` PSR-4 → `tests/unit/`).
   - The namespace follows the directory: `tests/unit/IO/Socket/WebSocket/TWebSocketServerTest.php` → `Prado\Test\Unit\IO\Socket\WebSocket\TWebSocketServerTest`.
   - A class used by another file lives in its own file named after the class. Fixtures used only by one test file stay in that file.
@@ -148,17 +150,18 @@ Docblocks inform and describe; it is not persuasive writing.
 
 ## Development Environment
 - PHP 8.2 through 8.5 are supported and exercised in CI (`.github/workflows/prado-websocket.yml`)
-- PHP extensions: ctype, dom, intl, json, pcre, spl (required by PRADO); ffi, openssl (required for HTTP/2); sockets, zlib, redis (optional features)
+- PHP extensions: ctype, dom, intl, json, pcre, spl (required by PRADO); ffi (required for HTTP/2); openssl (TLS, and ALPN `h2`); zlib, redis, posix (optional features); sockets (one unit test only)
 - System library: libnghttp2 (HTTP/2, bound via FFI)
 - Composer for dependency management; Node (see `.nvmrc`) or bun for Playwright
-- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.3 and 3.95.27); update them together with PRADO
+- Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.5 and 3.95.27); update them together with PRADO
 - Presume that project dependencies are installed
-- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD; one unit-test leg (PHP 8.4, `prado-http2 release`) installs the Packagist `belisoful/prado-http2` release that `^1.5` resolves to instead
+- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD; one unit-test leg (PHP 8.4, `prado-http2 release`) installs the Packagist `belisoful/prado-http2` release that `^1.5` resolves to instead. CI fails on skipped, incomplete and risky tests and checks `TNgHttp2::isAvailable()`; an `integration` job runs against a Redis service; both workflows run weekly and on `workflow_dispatch`, and pushes run them only for `main` and tags
 - CI runs php-cs-fixer and phpstan from `vendor/bin`, the versions `composer.json` pins
 
 ## Directory Structure
 ```
 ./
+├── .github/                    # CI: workflows/ (unit, integration, Playwright; Autobahn) and scripts/ (apt and retry helpers)
 ├── agents/                     # The Coding Agents directory
 │   └── working/                # Temporary working, planning, and analysis files for Agents (see its INDEX.md)
 ├── config/
@@ -173,12 +176,17 @@ Docblocks inform and describe; it is not persuasive writing.
 │   └── Web/Services/           # TWebSocketService (PRADO service routing to the server)
 ├── tests/
 │   ├── autobahn/               # Autobahn|TestSuite echo server, fuzzingclient config, and report gate
+│   ├── integration/            # phpunit tests against real services (Redis); namespace Prado\Test\Integration
 │   ├── playwright/             # Browser-client specs, echo server, and static origin page
 │   ├── test_tools/             # phpunit and phpstan bootstraps
 │   └── unit/                   # phpunit tests; namespace Prado\Test\Unit (autoload-dev PSR-4)
 ├── AGENTS.md                   # This file
+├── CHANGELOG.md                # Release notes; every user-visible change goes under [Unreleased]
 ├── CLAUDE.md                   # Short memory file for the directory
 ├── composer.json               # Package configuration and scripts
+├── LICENSE
+├── phpunit.xml, phpstan.neon.dist, .php-cs-fixer.dist.php   # Tool configuration
+├── playwright.config.js, package.json                      # Browser-test configuration
 └── README.md                   # Documentation
 ```
 
