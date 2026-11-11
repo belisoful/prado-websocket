@@ -370,7 +370,7 @@ Tests cover the codec (round-trips, masking, fragmentation, control-frame rules)
 A Playwright suite drives a **real browser `WebSocket`** (Chromium, Firefox, and WebKit) against the standalone server, exercising the RFC 6455 handshake and framing end to end — the runtime coverage the PHP unit and Autobahn suites cannot give. The specs echo text, multibyte UTF-8, and binary, round-trip a 256 KiB message, check ordering, negotiate a subprotocol, and interoperate with permessage-deflate. The pub/sub specs drive `prado-pubsub.js` against `TWebSocketPubSubHandler`: channel delivery, calls, error codes, a fatal close, reconnection after a server restart, and heartbeat detection of a stalled server, faithful relay of `{}`, an undecodable request, and reconnection after a 1009. `pubsub-client.spec.js` tests the client's request ordering and subscription bookkeeping in Node against a scripted socket. The chat-example specs run both versions of [`examples/chat`](examples/chat) in two browser pages.
 
 ```sh
-npm install                                  # or: bun install
+npm ci                                       # or: bun install
 npx playwright install                       # download the browser builds (or: bunx playwright install)
 npx playwright test                          # all three engines  (or: bunx playwright test)
 npx playwright test --project=chromium       # one engine
