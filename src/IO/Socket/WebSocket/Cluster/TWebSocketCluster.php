@@ -136,9 +136,12 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 
 	/**
 	 * Registers a local connection, assigning it a cluster-unique client id and announcing its
-	 * presence to the cluster.
+	 * presence to the cluster.  When the backplane refuses the presence, such as metadata that cannot
+	 * be encoded for the other nodes, the connection is not registered and the exception reaches the
+	 * caller.
 	 * @param TWebSocketConnection $connection The connected client.
 	 * @param array<string, mixed> $meta The presence metadata to publish (the node id is added).
+	 * @throws \Prado\IO\Socket\WebSocket\TWebSocketException When the backplane cannot encode the metadata, such as a non-finite float.
 	 * @return string The assigned cluster client id.
 	 */
 	public function register(TWebSocketConnection $connection, array $meta = []): string
@@ -148,7 +151,12 @@ class TWebSocketCluster extends TComponent implements IWebSocketCluster
 		$this->_localIds[spl_object_id($connection)] = $clientId;
 		$meta['node'] = $this->_nodeId;
 		$this->_presence[$clientId] = $meta;
-		$this->_backplane->putPresence($clientId, $meta);
+		try {
+			$this->_backplane->putPresence($clientId, $meta);
+		} catch (\Throwable $e) {
+			unset($this->_clients[$clientId], $this->_localIds[spl_object_id($connection)], $this->_presence[$clientId]);   // never hold a client the cluster was not told of
+			throw $e;
+		}
 		return $clientId;
 	}
 
