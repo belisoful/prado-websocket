@@ -2295,7 +2295,11 @@ class TWebSocketServerTest extends TestCase
 		$failingWs->send('boom');
 		$socket->write($client->send());
 		$this->pumpHttp2Until($server, $socket, $client, function () use (&$failingCode, $failingWs, $failing) {
-			$failingWs->feed($failing->getContents());
+			try {
+				$failingWs->feed($failing->getContents());
+			} catch (TWebSocketException $e) {
+				// The server reset the stream after its Close frame, so the client's echo cannot be written.
+			}
 			return $failingCode !== null;
 		});
 		self::assertSame(TWebSocketCloseCode::InternalServerError, $failingCode, 'The failing stream is closed with 1011.');
