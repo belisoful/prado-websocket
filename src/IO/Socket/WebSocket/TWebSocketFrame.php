@@ -4,7 +4,7 @@
  * TWebSocketFrame class file.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado
+ * @link https://github.com/belisoful/prado-websocket
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 
