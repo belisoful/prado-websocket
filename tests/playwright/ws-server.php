@@ -20,6 +20,11 @@
  *   WS_ORIGINS      comma-separated origins allowed to upgrade (default any)
  *   WS_REFUSE_AFTER seconds the pub/sub `onOpen` handler waits on the event loop before it
  *                   refuses every client with 4401 (default: clients are admitted)
+ *   WS_TLS          "1" to listen with TLS (a self-signed certificate made at start) and offer
+ *                   ALPN `h2` and `http/1.1`, so a browser can reach the server over HTTP/2
+ *   WS_COMMANDS     "1" for the echo handler to obey three text messages instead of echoing them:
+ *                   `transport?` is answered `h2` or `h1`, `close:<code>` closes the connection
+ *                   with that code, and `fail` throws from the handler
  *
  * In pub/sub mode, clients may publish to `room:*` channels, and the `echo` call returns its
  * params while `kick` closes the caller with 4401.
@@ -46,7 +51,20 @@ require_once __DIR__ . '/../../vendor/autoload.php';
 $host = getenv('WS_HOST') ?: '127.0.0.1';
 $port = (int) (getenv('WS_PORT') ?: 8378);
 
-$server = TWebSocketServer::bind("tcp://{$host}:{$port}");
+if (getenv('WS_TLS') === '1') {
+	// A self-signed certificate for the loopback address; the browser context ignores certificate errors.
+	$key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
+	$csr = openssl_csr_new(['commonName' => $host], $key, ['digest_alg' => 'sha256']);
+	openssl_x509_export(openssl_csr_sign($csr, null, $key, 1, ['digest_alg' => 'sha256']), $certificatePem);
+	openssl_pkey_export($key, $keyPem);
+	$certificate = tempnam(sys_get_temp_dir(), 'wstls');
+	file_put_contents($certificate, $certificatePem . $keyPem);
+	register_shutdown_function(static fn () => @unlink($certificate));
+	$context = stream_context_create(['ssl' => ['local_cert' => $certificate, 'alpn_protocols' => 'h2,http/1.1']]);
+	$server = TWebSocketServer::bind("tls://{$host}:{$port}", STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $context);
+} else {
+	$server = TWebSocketServer::bind("tcp://{$host}:{$port}");
+}
 
 if (getenv('WS_PUBSUB') === '1') {
 	// The server and the handler share one cluster, so the handler sees the server's registrations.
@@ -80,7 +98,20 @@ if (getenv('WS_PUBSUB') === '1') {
 	$server->setSubprotocols([TWebSocketPubSubHandler::SUBPROTOCOL]);
 } else {
 	$handler = new TWebSocketHandler();
-	$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message): void {
+	$commands = getenv('WS_COMMANDS') === '1';
+	$handler->attachEventHandler('onMessage', function ($connection, TWebSocketMessage $message) use ($commands): void {
+		$text = $commands && $message->getIsText() ? $message->getPayload() : '';
+		if ($text === 'transport?') {
+			$connection->send($connection->getStream() instanceof \Prado\IO\Http2\TH2Stream ? 'h2' : 'h1');
+			return;
+		}
+		if (preg_match('/^close:(\d{4})\z/', $text, $match) === 1) {
+			$connection->close((int) $match[1], 'as asked');
+			return;
+		}
+		if ($text === 'fail') {
+			throw new \RuntimeException('The handler fails, as asked.');
+		}
 		// Echo the message back in the mode it arrived in; the event carries each message's own opcode.
 		if ($message->getIsBinary()) {
 			$connection->sendBinary($message->getPayload());
