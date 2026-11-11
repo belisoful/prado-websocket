@@ -6,7 +6,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 ## [Unreleased]
 
 ### Changed
-- Tests: the chat example spec gives a page 20 s to come online, and when one does not, the failure names the page's URL and state, its failed requests, and the WebSocket frames it sent and received. One Firefox run on CI had a second page stay offline for the 5 s the spec allowed.
+- Tests: in one Firefox run on CI the chat example spec clicked Join on a second page and nothing happened: the trace shows the click at the button's coordinates, no submit, no WebSocket, and the focus still in the Room field. The spec now repeats a click the page did not react to, once, and notes it in the report; it gives a page 20 s to come online; and a join that fails names the page's state, the validity of its fields, the click, submit and invalid events the document saw, its failed requests, and the WebSocket frames it sent and received.
 
 ## [1.2.0] - 2026-11-10
 

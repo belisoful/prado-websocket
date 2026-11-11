@@ -70,13 +70,13 @@ test.afterEach(async () => {
 const ONLINE_TIMEOUT = 20_000;
 
 /**
- * Records what a page does on the network, so a join that never comes online can say why: a
- * script that did not load, a form that was submitted without the page's handler, a WebSocket the
- * server never answered, or a join the server refused.
+ * Records what a page does, so a join that never comes online can say why: a click that never
+ * reached the form, a field the browser found invalid, a script that did not load, a WebSocket
+ * the server never answered, or a join the server refused.
  * @param {import('@playwright/test').Page} page
- * @returns {() => Promise<string>} Describes the page and what was recorded so far.
+ * @returns {Promise<() => Promise<string>>} Describes the page and what was recorded so far.
  */
-function watchPage(page) {
+async function watchPage(page) {
 	/** @type {string[]} */ const seen = [];
 	const started = Date.now();
 	const note = (/** @type {string} */ what) => seen.push(`+${Date.now() - started}ms ${what}`);
@@ -91,24 +91,57 @@ function watchPage(page) {
 	page.on('response', (response) => { if (response.status() >= 400) { note(`${response.status()} ${response.url()}`); } });
 	page.on('pageerror', (error) => note(`page error ${error.message}`));
 	page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) { note(`navigated to ${frame.url()}`); } });
+	// The clicks, submits and failed validations the document itself saw.
+	await page.addInitScript(() => {
+		window.__formEvents = [];
+		for (const type of ['click', 'submit', 'invalid']) {
+			document.addEventListener(type, (e) => {
+				const target = /** @type {Element} */ (e.target);
+				window.__formEvents.push(`${type} on ${target.tagName?.toLowerCase()}${target.id ? '#' + target.id : ''}`);
+			}, true);
+		}
+	});
 	return async () => {
-		const state = await page.evaluate(() => ({
-			status: document.getElementById('status')?.textContent,
-			joinError: document.getElementById('join-error')?.textContent,
-			joinFormHidden: document.getElementById('join')?.hidden,
-			client: typeof window.Prado?.WebSocket?.PubSub,
-		})).catch((e) => ({ unreadable: String(e) }));
-		return `Page ${page.url()} ${JSON.stringify(state)}; events: ${seen.join('; ') || 'none'}`;
+		const state = await page.evaluate(() => {
+			const field = (/** @type {string} */ id) => {
+				const input = /** @type {HTMLInputElement | null} */ (document.getElementById(id));
+				return input ? { value: input.value, valid: input.validity.valid, message: input.validationMessage } : null;
+			};
+			return {
+				status: document.getElementById('status')?.textContent,
+				joinError: document.getElementById('join-error')?.textContent,
+				joinFormHidden: document.getElementById('join')?.hidden,
+				client: typeof window.Prado?.WebSocket?.PubSub,
+				focus: document.activeElement ? document.activeElement.tagName.toLowerCase() + (document.activeElement.id ? '#' + document.activeElement.id : '') : null,
+				nick: field('nick'),
+				room: field('room'),
+				formEvents: window.__formEvents,
+			};
+		}).catch((e) => ({ unreadable: String(e) }));
+		return `Page ${page.url()} ${JSON.stringify(state)}; network: ${seen.join('; ') || 'none'}`;
 	};
 }
 
 /** Opens the chat page and joins a room. */
 async function joinAs(page, nick, room, url = PAGE) {
-	const describe = watchPage(page);
+	const describe = await watchPage(page);
 	await page.goto(url);
 	await page.fill('#nick', nick);
 	await page.fill('#room', room);
-	await page.click('#join button[type=submit]');
+	const join = page.locator('#join button[type=submit]');
+	await join.click();
+	// The page reacts to a join at once: the form is hidden and the status leaves "offline".  One
+	// Firefox run on CI clicked the button's coordinates and nothing happened: no submit, and the
+	// focus stayed in the Room field.  Such a click is repeated once, and the run notes it.
+	const reacted = () => page.evaluate(() => document.getElementById('join').hidden
+		|| document.getElementById('status').textContent !== 'offline'
+		|| document.getElementById('join-error').textContent !== '');
+	try {
+		await expect.poll(reacted, { timeout: 2000 }).toBe(true);
+	} catch {
+		test.info().annotations.push({ type: 'click without effect', description: `${nick}: ${await describe()}` });
+		await join.click();
+	}
 	try {
 		await expect(page.locator('#status')).toHaveText('online', { timeout: ONLINE_TIMEOUT });
 	} catch (e) {
