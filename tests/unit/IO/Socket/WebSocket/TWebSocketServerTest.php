@@ -3094,7 +3094,7 @@ class TWebSocketServerTest extends TestCase
 		$handler->attachEventHandler('onMessage', function ($conn) use (&$queued, &$pendingAfterWait) {
 			$conn->sendBinary(str_repeat('z', 4 * 1024 * 1024));   // far more than the socket takes at once
 			$queued = $conn->hasPendingOutbound();
-			for ($i = 0; $i < 40 && $conn->hasPendingOutbound(); $i++) {
+			for ($i = 0; $i < 400 && $conn->hasPendingOutbound(); $i++) {   // up to 20 s, for a slow or instrumented run; it ends once the queue is empty
 				TAsync::sleep(0.05);   // waits on the main fiber: only the housekeeping can arm the transport for writes meanwhile
 			}
 			$pendingAfterWait = $conn->hasPendingOutbound();
@@ -3109,6 +3109,11 @@ class TWebSocketServerTest extends TestCase
 		$this->pumpServerUntil($server, function () use (&$pendingAfterWait) {
 			return $pendingAfterWait !== null;
 		});
+		// What the server wrote last is still in the socket buffers when the handler returns, and the
+		// peer takes one chunk per tick: megabytes on Linux, so the wait is bounded by time.
+		for ($deadline = hrtime(true) + 20e9; $received <= 4 * 1024 * 1024 && hrtime(true) < $deadline;) {
+			$server->serveOnce(0, 20000);
+		}
 		$reactor->cancel($watch);
 
 		self::assertTrue($queued, 'Most of the message is queued when the wait starts.');
