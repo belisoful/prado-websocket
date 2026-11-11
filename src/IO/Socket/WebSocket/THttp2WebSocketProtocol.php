@@ -53,8 +53,10 @@ use Psr\Http\Message\StreamInterface;
  * Each stream fails on its own.  A protocol error or an exception from the handler raises the
  * handler's {@see IWebSocketHandler::onError()} and closes that stream's connection with the
  * error's close code (1011 for a handler exception), as the synchronous
- * {@see IWebSocketHandler::handleConnection()} loop does.  A throwing `onOpen` resets its stream
- * and raises the closes.  The other streams on the transport carry on.
+ * {@see IWebSocketHandler::handleConnection()} loop does.  After a handler exception the peer's
+ * Close is awaited, as after a close the application starts; after a protocol error the stream
+ * ends at once.  A throwing `onOpen` resets its stream and raises the closes.  The other streams
+ * on the transport carry on.
  *
  * A stream this side has finished with leaves the session without waiting for the peer.  A refused
  * request is answered on a HEADERS frame that ends the stream.  A closed or failed WebSocket's
@@ -697,8 +699,12 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 	/**
 	 * Fails one stream's connection on an error, as the synchronous
 	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
-	 * {@see IWebSocketHandler::onError()}, sends a Close with the error's close code (1011, Internal
-	 * Server Error, for an error that is not a {@see TWebSocketException}), and ends the stream with
+	 * {@see IWebSocketHandler::onError()} and sends a Close with the error's close code (1011,
+	 * Internal Server Error, for an error that is not a {@see TWebSocketException}).  After a
+	 * handler's exception the connection can still be read, so the stream is left closing and the
+	 * peer's Close ends it like the answer to a close the application started; the server ends it at
+	 * its CloseTimeout when the peer does not answer.  After a protocol error the connection reads
+	 * nothing more ({@see TWebSocketConnection::getIsFailed()}), so the stream ends at once, with
 	 * the handler and service closes.  A failing onError or Close write is logged.
 	 * @param TH2Stream $stream The stream.
 	 * @param TWebSocketConnection $connection The stream's connection.
@@ -718,6 +724,9 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			$connection->close($error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError);
 		} catch (\Throwable $e) {
 			// The stream can no longer carry the Close; it still ends below.
+		}
+		if ($connection->getIsClosing() && !$connection->getIsClosed() && !$connection->getIsFailed()) {
+			return;   // the Close is sent and the connection still reads: the peer's Close completes the handshake
 		}
 		$this->closeStream($stream);   // fire onClose and end the stream instead of leaking the entry
 	}

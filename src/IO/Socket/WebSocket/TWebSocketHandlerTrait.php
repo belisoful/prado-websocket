@@ -61,7 +61,10 @@ trait TWebSocketHandlerTrait
 
 	/**
 	 * Drives the message loop for a connection: opens, dispatches each message, and closes.
-	 * A protocol error raises {@see onError} and closes with the error's close code.
+	 * A protocol error raises {@see onError} and closes with the error's close code.  An exception
+	 * from a handler raises {@see onError} and closes with 1011 (or the close code of a
+	 * {@see TWebSocketException}); the connection still reads then, so the peer's Close is awaited
+	 * within {@see getCloseTimeout() CloseTimeout}, which makes the close a completed handshake.
 	 *
 	 * The loop reads a blocking stream.  A read that reaches the stream's read timeout (for an
 	 * accepted socket, `default_socket_timeout`) with no message keeps the connection alive: the
@@ -122,6 +125,14 @@ trait TWebSocketHandlerTrait
 				} catch (\Throwable $inner) {
 					// A close on a broken pipe cannot be written; onClose still runs below.
 					Prado::log('WebSocket Close could not be written after an error: ' . $inner->getMessage(), TLogger::NOTICE, static::class);
+				}
+			}
+			if ($connection->getIsClosing() && !$connection->getIsClosed() && !$connection->getIsFailed()) {
+				// A handler failed, not the protocol: the connection still reads, so the peer's Close is awaited within the close timeout.
+				try {
+					$connection->drainClose(TWebSocketCloseCode::Normal, '', $this->_closeTimeout > 0 ? $this->_closeTimeout : null);
+				} catch (\Throwable $inner) {
+					// The peer answered with something malformed, or is gone; the connection ends either way.
 				}
 			}
 		} finally {

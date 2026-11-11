@@ -839,6 +839,44 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$client->close();
 	}
 
+	public function testAHandlerFailureLeavesTheStreamClosingUntilThePeerAnswers()
+	{
+		$handler = new TWebSocketHandler();
+		$events = [];
+		$handler->attachEventHandler('onMessage', function () {
+			throw new \RuntimeException('handler bug');
+		});
+		$handler->attachEventHandler('onError', function () use (&$events) {
+			$events[] = 'error';
+		});
+		$handler->attachEventHandler('onClose', function () use (&$events) {
+			$events[] = 'close';
+		});
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$statuses = $closed = [];
+		$client = $this->client($protocol, [], $statuses, $closed);
+		$stream = $client->request($this->connectHeaders());
+		$this->exchange($protocol, $client);
+
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('boom'), random_bytes(4)));
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('after'), random_bytes(4)));
+		$this->exchange($protocol, $client);
+		self::assertSame(TWebSocketCloseCode::InternalServerError, $this->closeCodeOn($stream), 'The client reads the Close with 1011.');
+		self::assertSame(['error'], $events, 'onError is raised; the close waits for the peer, and the message behind the failing one is not dispatched.');
+		self::assertCount(1, $protocol->getConnections(), 'The connection stays, closing, for the peer\'s Close.');
+		self::assertSame([], $closed, 'The stream is neither ended nor reset yet.');
+
+		$stream->write(TWebSocketFrameCodec::encode(TWebSocketFrame::close(TWebSocketCloseCode::InternalServerError), random_bytes(4)));   // the peer answers
+		$this->exchange($protocol, $client);
+		self::assertSame(['error', 'close'], $events, 'The peer\'s Close completes the handshake and raises onClose.');
+		self::assertCount(0, $protocol->getConnections());
+		self::assertSame([$stream->getStreamId()], $closed, 'The stream is then ended.');
+		self::assertNull($protocol->getSession()->getStream($stream->getStreamId()));
+
+		$protocol->shutdown();
+		$client->close();
+	}
+
 	public function testAClientThatEndsItsStreamWithoutACloseFrameIsClosed()
 	{
 		$handler = new TWebSocketHandler();

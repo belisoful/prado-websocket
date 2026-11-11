@@ -2331,6 +2331,9 @@ class TWebSocketServer extends TSocketServer
 	 * {@see IWebSocketHandler::handleConnection()} loop does: raises the handler's
 	 * {@see IWebSocketHandler::onError()} and closes with the error's close code, or 1011 (Internal
 	 * Server Error) for an error that is not a {@see TWebSocketException}.  Only this session fails.
+	 * After a handler's exception the connection can still be read, so the peer's Close is awaited
+	 * like the answer to a close the application started; after a protocol error it cannot
+	 * ({@see TWebSocketConnection::getIsFailed()}), and the session ends once the Close is sent.
 	 * @param TSocketStream $transport The session transport.
 	 * @param TWebSocketConnection $connection The session connection.
 	 * @param \Throwable $error The protocol error, or the exception a handler threw.
@@ -2343,7 +2346,7 @@ class TWebSocketServer extends TSocketServer
 			$this->log('Handler onError failed: ' . $inner->getMessage());
 		}
 		$code = $error instanceof TWebSocketException ? $error->getCloseCode() : TWebSocketCloseCode::InternalServerError;
-		$this->failHttp1Session($transport, $connection, $code);
+		$this->failHttp1Session($transport, $connection, $code, !$connection->getIsFailed());
 	}
 
 	/**
@@ -2352,11 +2355,18 @@ class TWebSocketServer extends TSocketServer
 	 * behind a full send buffer the frame drains from the write set, bounded by
 	 * {@see getCloseTimeout() CloseTimeout}, so a peer under backpressure still receives the code
 	 * instead of a bare TCP close.
+	 *
+	 * With $awaitPeerClose the session is left closing instead: its input is still read (and
+	 * dispatched no further), the peer's Close ends it as a completed close handshake, and
+	 * {@see getCloseTimeout() CloseTimeout} ends it when the peer does not answer.  A browser then
+	 * reports the close as clean.
 	 * @param TSocketStream $transport The session transport.
 	 * @param TWebSocketConnection $connection The session connection.
 	 * @param int $code The {@see TWebSocketCloseCode} to send.
+	 * @param bool $awaitPeerClose Whether to wait for the peer's Close, within CloseTimeout.
+	 *   Default false.  Since 1.2.0.
 	 */
-	protected function failHttp1Session(TSocketStream $transport, TWebSocketConnection $connection, int $code): void
+	protected function failHttp1Session(TSocketStream $transport, TWebSocketConnection $connection, int $code, bool $awaitPeerClose = false): void
 	{
 		$id = spl_object_id($transport);
 		try {
@@ -2366,7 +2376,7 @@ class TWebSocketServer extends TSocketServer
 			$this->endHttp1Session($transport, $connection);
 			return;
 		}
-		if (isset($this->_sessions[$id])) {
+		if (isset($this->_sessions[$id]) && (!$awaitPeerClose || !$connection->getIsClosing() || $connection->getIsFailed())) {
 			$this->_sessions[$id]['discard'] = true;
 		}
 		$this->settleHttp1Session($transport, $connection);

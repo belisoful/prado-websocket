@@ -1576,10 +1576,11 @@ class TWebSocketConnectionTest extends TestCase
 		$a->close();
 		$b->close();
 
-		// An exception from the application: onError, then a Close with 1011.
+		// An exception from the application: onError, then a Close with 1011; the peer's Close is awaited.
 		[$client, $server, $a, $b] = $this->pair();
 		$client->send('boom');
 		$handler = new TWebSocketHandler();
+		$handler->setCloseTimeout(0.1);   // this peer never answers
 		$events = [];
 		$handler->attachEventHandler('onMessage', function () {
 			throw new \RuntimeException('handler bug');
@@ -1591,6 +1592,23 @@ class TWebSocketConnectionTest extends TestCase
 		self::assertSame(['handler bug'], $events);
 		$frames = self::serverFrames($a);
 		self::assertSame(TWebSocketCloseCode::InternalServerError, end($frames)->getCloseCode());
+		self::assertFalse($server->getIsFailed(), 'A handler failure leaves the connection readable.');
+		$a->close();
+		$b->close();
+
+		// The same, with a peer that answers: the loop reads its Close and the handshake completes.
+		[$client, $server, $a, $b] = $this->pair();
+		$client->send('boom');
+		$a->write(TWebSocketFrameCodec::encode(TWebSocketFrame::close(TWebSocketCloseCode::InternalServerError), random_bytes(4)));   // the peer's Close, behind the message
+		$handler = new TWebSocketHandler();
+		$handler->setCloseTimeout(30);
+		$handler->attachEventHandler('onMessage', function () {
+			throw new \RuntimeException('handler bug');
+		});
+		$started = hrtime(true);
+		$handler->handleConnection($server);
+		self::assertTrue($server->getIsClosed(), 'The peer\'s Close is read after the failure, so the close handshake completes.');
+		self::assertLessThan(10.0, (hrtime(true) - $started) / 1e9, 'The loop returns on the peer\'s Close, not at the close timeout.');
 		$a->close();
 		$b->close();
 
@@ -1598,6 +1616,7 @@ class TWebSocketConnectionTest extends TestCase
 		[$client, $server, $a, $b] = $this->pair();
 		$client->send('boom');
 		$handler = new TWebSocketHandler();
+		$handler->setCloseTimeout(0.1);   // this peer never answers
 		$errors = 0;
 		$handler->attachEventHandler('onMessage', function ($connection) {
 			$connection->close(TWebSocketCloseCode::PolicyViolation);

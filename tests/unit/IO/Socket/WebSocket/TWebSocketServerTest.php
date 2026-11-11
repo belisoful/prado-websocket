@@ -779,6 +779,52 @@ class TWebSocketServerTest extends TestCase
 		$server->close();
 	}
 
+	public function testAHandlerFailureOnAnHttp2StreamWhosePeerNeverAnswersIsResetAtTheCloseTimeout()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$handler = new TWebSocketHandler();
+		$errors = 0;
+		$closed = 0;
+		$handler->attachEventHandler('onMessage', function () {
+			throw new \RuntimeException('handler bug in onMessage');
+		});
+		$handler->attachEventHandler('onError', function () use (&$errors) {
+			$errors++;
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+		$clock = new TTestMonotonicClock(1000);
+		$server->setMonotonicClock($clock);
+		$server->setIdleTimeout(0);
+		$server->setCloseTimeout(5);
+		[$socket, $client, $streams] = $this->openHttp2($server, [], 1);
+		$streams[0]->write(TWebSocketFrameCodec::encode(TWebSocketFrame::text('boom'), random_bytes(4)));
+		$socket->setBlocking(true);
+		$socket->write($client->send());
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$errors) {
+			return $errors === 1;
+		});
+		for ($i = 0; $i < 3; $i++) {
+			$server->serveOnce(0, 10000);   // the housekeeping stamps the stream's close deadline
+		}
+		self::assertSame(1, $errors);
+		self::assertSame(0, $closed, 'The stream waits for the peer\'s Close until the deadline.');
+
+		$clock->advance(6);   // past the close deadline, and the client has not answered
+		$this->pumpServerUntil($server, function () use (&$closed) {
+			return $closed === 1;
+		});
+		self::assertSame(1, $closed, 'A failed stream whose peer never answers is ended at CloseTimeout.');
+		self::assertSame(1, $server->getLoad(), 'The transport stays; only the stream is gone.');
+		$socket->close();
+		$server->close();
+	}
+
 	public function testMaxSendBufferBytesBoundsAnHttp2Stream()
 	{
 		if (!TNgHttp2::isAvailable()) {
@@ -2244,8 +2290,71 @@ class TWebSocketServerTest extends TestCase
 		self::assertInstanceOf(\RuntimeException::class, $errors[0]);
 		self::assertSame('handler bug in onMessage', $errors[0]->getMessage());
 
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 10000);
+		}
+		self::assertSame(0, $closed, 'The session waits for the peer\'s Close, so the close handshake can complete.');
+		self::assertSame(1, $server->getConnectionCount());
+
+		$client->write(TWebSocketFrameCodec::encode(TWebSocketFrame::close(TWebSocketCloseCode::InternalServerError), random_bytes(4)));   // the peer answers
 		$this->pumpServerUntil($server, fn () => $closed > 0);
-		self::assertSame(1, $closed, 'The failed session ends through onClose once its Close is on the wire.');
+		self::assertSame(1, $closed, 'The peer\'s Close ends the session through onClose.');
+		self::assertSame(0, $server->getConnectionCount());
+		self::assertSame(['boom'], $messages, 'The message behind the failing one never reached the handler.');
+		$client->close();
+		$server->close();
+	}
+
+	public function testAHandlerFailureWhosePeerNeverAnswersEndsTheHttp1SessionAtTheCloseTimeout()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$clock = new TTestMonotonicClock(1000);
+		$server->setMonotonicClock($clock);
+		$server->setCloseTimeout(5);
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onMessage', function () {
+			throw new \RuntimeException('handler bug in onMessage');
+		});
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		$client = $this->upgradedClient($server);
+		(new TWebSocketConnection($client, true))->send('boom');
+		[, $code] = $this->readFramesUntilClose($server, $client);
+		self::assertSame(TWebSocketCloseCode::InternalServerError, $code);
+		for ($i = 0; $i < 5; $i++) {
+			$server->serveOnce(0, 10000);   // the housekeeping stamps the close deadline
+		}
+		self::assertSame(0, $closed, 'The session waits for the peer\'s Close.');
+
+		$clock->advance(6);   // past the close deadline, and the peer has said nothing
+		$this->pumpServerUntil($server, fn () => $closed > 0);
+		self::assertSame(1, $closed, 'A peer that never answers is ended at CloseTimeout.');
+		self::assertSame(0, $server->getConnectionCount());
+		$client->close();
+		$server->close();
+	}
+
+	public function testAProtocolErrorStillEndsTheHttp1SessionOnceItsCloseIsSent()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		$server->setCloseTimeout(60);   // so only the failure itself can end the session
+		$handler = new TWebSocketHandler();
+		$closed = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$server->setHandler($handler);
+
+		$client = $this->upgradedClient($server);
+		$client->write("\x83\x80\x00\x00\x00\x00");   // a masked frame with a reserved opcode
+		[, $code] = $this->readFramesUntilClose($server, $client);
+		self::assertSame(TWebSocketCloseCode::ProtocolError, $code);
+		$this->pumpServerUntil($server, fn () => $closed > 0);
+		self::assertSame(1, $closed, 'A connection that failed on the protocol reads nothing more, so nothing is awaited.');
 		self::assertSame(0, $server->getConnectionCount());
 		$client->close();
 		$server->close();
@@ -2295,15 +2404,17 @@ class TWebSocketServerTest extends TestCase
 		$failingWs->send('boom');
 		$socket->write($client->send());
 		$this->pumpHttp2Until($server, $socket, $client, function () use (&$failingCode, $failingWs, $failing) {
-			try {
-				$failingWs->feed($failing->getContents());
-			} catch (TWebSocketException $e) {
-				// The server reset the stream after its Close frame, so the client's echo cannot be written.
-			}
+			$failingWs->feed($failing->getContents());   // the client reads the Close and answers it
 			return $failingCode !== null;
 		});
 		self::assertSame(TWebSocketCloseCode::InternalServerError, $failingCode, 'The failing stream is closed with 1011.');
 		self::assertCount(1, $errors, 'onError is raised for the failing stream.');
+		self::assertSame(0, $closed, 'The stream waits for the peer\'s Close, so the close handshake can complete.');
+		$socket->setBlocking(true);
+		$socket->write($client->send());   // the client's Close
+		$this->pumpHttp2Until($server, $socket, $client, function () use (&$closed) {
+			return $closed === 1;
+		});
 		self::assertSame(1, $closed, 'Only the failing stream is closed.');
 		self::assertSame(2, $server->getLoad(), 'The transport and the other stream stay up.');
 		self::assertSame(1, $cluster->getLocalClientCount(), 'Only the failing stream leaves the cluster.');
