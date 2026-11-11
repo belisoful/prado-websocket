@@ -29,7 +29,9 @@ use Prado\TComponent;
  * `BFINAL` block (§7.2.3.4) is accepted and the next message begins a new stream.  A `BFINAL` block
  * must still be followed by the empty block header (`0x00`) that remains once the sender strips the
  * sync-flush trailer, as §7.2.1 produces and the §7.2.3.4 example shows; a message that ends at the
- * `BFINAL` block itself is refused with 1007, although zlib-based peers accept it.
+ * `BFINAL` block itself is refused with 1007, although zlib-based peers accept it.  A message ends
+ * its stream at most once: a second `BFINAL` block in one message is refused with 1007, which
+ * bounds the inflate contexts a message can cost to two.
  *
  * The context is reused across messages by default, so a message's DEFLATE dictionary carries the
  * history of the ones before it (context takeover).  {@see getDeflateNoContextTakeover()} and
@@ -193,6 +195,8 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 	 * output budget, so a decompression bomb is aborted once the output passes
 	 * {@see getMaxOutputLength() the limit} and materializes at most {@see MAX_INFLATE_RATIO} bytes
 	 * beyond it.  A `BFINAL` block ends the sender's stream; the bytes behind it begin a new one.
+	 * A message restarts the stream at most once (§7.2.3.4 ends a message on its one `BFINAL` block),
+	 * so a second `BFINAL` block is refused as invalid payload.
 	 *
 	 * The sync-flush trailer is then restored (§7.2.2), which completes the empty stored block a
 	 * conforming sender ends on, and a further empty stored block follows it.  A complete stream
@@ -212,6 +216,7 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 		$context = $this->inflateContext();
 		$length = strlen($payload);
 		$out = '';
+		$restarted = false;
 		for ($offset = 0; $offset < $length;) {
 			$step = substr($payload, $offset, $this->inflateChunkSize(strlen($out)));
 			$consumedBefore = inflate_get_read_len($context);
@@ -221,8 +226,13 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 					->setCloseCode(TWebSocketCloseCode::MessageTooBig);
 			}
 			if (inflate_get_status($context) === ZLIB_STREAM_END) {
-				$offset += max(1, inflate_get_read_len($context) - $consumedBefore);   // resume behind the BFINAL block on a new stream
 				$this->_inflate = null;
+				if ($restarted) {
+					throw (new TWebSocketException('websocket_permessage_deflate_inflate_failed'))
+						->setCloseCode(TWebSocketCloseCode::InvalidFramePayload);   // a second BFINAL block in one message
+				}
+				$restarted = true;
+				$offset += max(1, inflate_get_read_len($context) - $consumedBefore);   // resume behind the BFINAL block on a new stream
 				$context = $this->inflateContext();
 			} else {
 				$offset += strlen($step);
@@ -326,6 +336,18 @@ class TPermessageDeflateExtension extends TComponent implements IWebSocketExtens
 	public function getCompressionLevel(): int
 	{
 		return $this->_level;
+	}
+
+	/**
+	 * Restarts the send-side DEFLATE stream: the next {@see encodeMessage()} compresses with no
+	 * history.  A {@see TWebSocketConnection} calls this when a message it encoded was not sent,
+	 * since the peer's context then lacks the history this one holds.  A receiver decodes a
+	 * restarted stream whatever context takeover was negotiated, as it refers to no earlier data.
+	 * @since 1.2.0
+	 */
+	public function resetDeflateContext(): void
+	{
+		$this->_deflate = null;
 	}
 
 	/**
