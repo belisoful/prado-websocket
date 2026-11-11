@@ -22,14 +22,19 @@
  * Requests reject with a PubSubError whose `code` is the server's reply code, or one of the
  * client codes: timeout, disconnected, closed, queue_full.  A request larger than the server's
  * frame limit (the welcome's maxFrame) rejects with `limit`, and one JSON cannot serialize (a
- * BigInt or a cycle) with `bad_request`, without being sent.
+ * BigInt or a cycle) with `bad_request`, without being sent.  The error event reports an `error`
+ * frame that answers no request, with the server's code, and a frame that is not a JSON object,
+ * with `bad_frame`.
  *
  * The client reconnects with exponential backoff and full jitter, re-subscribes its channels,
  * holds requests made while offline (up to maxQueue), and pings at the server's heartbeat
- * interval, dropping a connection silent for twice that.  The client is open once the server's
- * welcome arrives: the open listeners run first, then the channels are re-subscribed and the held
- * requests sent, so a request an open listener makes (an authentication or join call) precedes
- * them.  It stops reconnecting after close() or a close code in fatalCloseCodes.  A refused
+ * interval, dropping a connection silent for twice that (close code 4000).  The client is open
+ * once the server's welcome arrives: the open listeners run first, then the channels are
+ * re-subscribed and the held requests sent, so a request an open listener makes (an
+ * authentication or join call) precedes them.  A channel whose subscribe is still held or in
+ * flight is not subscribed a second time.  A socket that opens and receives no welcome within
+ * welcomeTimeout is dropped (close code 4001) and the client reconnects.  It stops reconnecting
+ * after close(), also when a close listener calls it, or a close code in fatalCloseCodes.  A refused
  * handshake (a rejected origin) is reported by the browser as 1006 and retried with backoff.  A
  * server that does not select prado.pubsub.v1 is refused for good with the `subprotocol` code
  * where the browser opens the socket (Firefox, WebKit); Chromium fails that handshake itself, as
@@ -72,6 +77,8 @@
 		 * @param {number} [options.minDelay=500] The first backoff ceiling in ms.
 		 * @param {number} [options.maxDelay=30000] The backoff cap in ms.
 		 * @param {number} [options.requestTimeout=10000] The ms a sent request waits for its reply.
+		 * @param {number} [options.welcomeTimeout=10000] The ms an opened socket waits for the server's
+		 *   welcome before it is dropped and the client reconnects; 0 waits without limit.
 		 * @param {number} [options.maxQueue=256] The frames held while offline.
 		 * @param {number[]} [options.fatalCloseCodes] The close codes that end reconnection.
 		 * @param {Function} [options.WebSocket] The WebSocket constructor, for non-browser hosts.
@@ -83,6 +90,7 @@
 				minDelay: 500,
 				maxDelay: 30000,
 				requestTimeout: 10000,
+				welcomeTimeout: 10000,
 				maxQueue: 256,
 				fatalCloseCodes: [1002, 1003, 1008, 1010, 4401, 4403],
 				WebSocket: typeof WebSocket === 'function' ? WebSocket : null,
@@ -100,6 +108,7 @@
 			this._listeners = new Map();
 			this._reconnectTimer = null;
 			this._heartbeatTimer = null;
+			this._welcomeTimer = null;
 			this._lastSeen = 0;
 			this._maxFrame = 0;
 			this._encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
@@ -217,6 +226,13 @@
 					return;
 				}
 				this._lastSeen = Date.now();   // the client opens when the welcome arrives
+				if (this.options.welcomeTimeout > 0) {
+					this._welcomeTimer = setTimeout(() => {
+						if (ws === this._ws && this.state === 'connecting') {
+							this._drop(4001, 'welcome timeout');
+						}
+					}, this.options.welcomeTimeout);
+				}
 			};
 			ws.onmessage = (ev) => {
 				if (typeof ev.data === 'string') {
@@ -234,6 +250,7 @@
 			this._ws = null;
 			this.clientId = null;
 			clearInterval(this._heartbeatTimer);
+			clearTimeout(this._welcomeTimer);
 			const willReconnect = this.options.reconnect && !this._closedByUser && !this._fatal
 				&& !this.options.fatalCloseCodes.includes(code);
 			// A sent subscribe is requeued (it is idempotent); any other sent request may or may not
@@ -258,6 +275,9 @@
 			if (!willReconnect) {
 				this._finalize(this._fatal || new PubSubError('closed', 'the connection closed (' + code + ')'));
 				return;
+			}
+			if (this.state !== 'reconnecting') {
+				return;   // a close listener closed the client
 			}
 			const ceiling = Math.min(this.options.maxDelay, this.options.minDelay * 2 ** this._attempt++);
 			this._reconnectTimer = setTimeout(() => this._connect(), Math.random() * ceiling);
@@ -388,10 +408,19 @@
 			}
 		}
 
-		/** Re-subscribes the acked channels after a reconnect. */
+		/**
+		 * Re-subscribes the acked channels after a reconnect.  A channel whose earlier subscribe is
+		 * still pending (requeued when the connection dropped before its ack) keeps that one.
+		 */
 		_resubscribe() {
+			const subscribing = new Set();
+			for (const p of this._pending.values()) {
+				if (p.entry) {
+					subscribing.add(p.entry);
+				}
+			}
 			for (const [channel, entry] of this._channels) {
-				if (entry.acked) {
+				if (entry.acked && !subscribing.has(entry)) {
 					this._request({ type: 'subscribe', channel }, true, entry).catch((e) => {
 						if (this._channels.get(channel) === entry) {
 							this._channels.delete(channel);
@@ -424,8 +453,13 @@
 				this._emit('error', new PubSubError('bad_frame', 'the server sent an unparseable frame'));
 				return;
 			}
+			if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
+				this._emit('error', new PubSubError('bad_frame', 'the server sent a frame that is not a JSON object'));
+				return;
+			}
 			switch (msg.type) {
 				case 'welcome': {
+					clearTimeout(this._welcomeTimer);
 					this.state = 'open';
 					this.clientId = msg.clientId;
 					this._maxFrame = Number(msg.maxFrame) || 0;
