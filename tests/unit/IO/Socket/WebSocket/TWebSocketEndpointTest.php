@@ -269,7 +269,11 @@ class TWebSocketEndpointTest extends TestCase
 	public function testSetEndpointsRejectsANonEndpoint()
 	{
 		$server = new TWebSocketServer();
-		$this->expectException(TWebSocketException::class);
-		$server->setEndpoints([new \stdClass()]);
+		try {
+			$server->setEndpoints([new \stdClass()]);
+			self::fail('An entry that is not an endpoint is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_endpoint_invalid', $e->getErrorCode());
+		}
 	}
 }

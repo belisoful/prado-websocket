@@ -108,16 +108,62 @@ class TWebSocketFrameCodecTest extends TestCase
 		self::assertFalse($r->getRsv2());
 	}
 
+	/** Asserts a call throws a TWebSocketException, which is a TIOException, with the given error code. */
+	private function assertThrowsCode(string $code, callable $call, string $message): void
+	{
+		try {
+			$call();
+			self::fail($message);
+		} catch (TWebSocketException $e) {
+			self::assertInstanceOf(TIOException::class, $e, 'A protocol failure is caught by IO error handling.');
+			self::assertSame($code, $e->getErrorCode(), $message);
+		}
+	}
+
 	public function testControlFrameTooLongThrows()
 	{
-		self::expectException(TIOException::class);
-		TWebSocketFrameCodec::encode(TWebSocketFrame::ping(str_repeat('x', 126)));
+		$this->assertThrowsCode(
+			'websocket_control_frame_too_long',
+			fn () => TWebSocketFrameCodec::encode(TWebSocketFrame::ping(str_repeat('x', 126))),
+			'A control frame carries at most 125 payload bytes.',
+		);
+		self::assertSame(127, strlen(TWebSocketFrameCodec::encode(TWebSocketFrame::ping(str_repeat('x', 125)))), 'A 125-byte control payload is the longest allowed.');
 	}
 
 	public function testFragmentedControlFrameThrows()
 	{
-		self::expectException(TIOException::class);
-		TWebSocketFrameCodec::encode(new TWebSocketFrame(TWebSocketOpcode::Ping, 'x', false));
+		foreach ([TWebSocketOpcode::Ping, TWebSocketOpcode::Pong, TWebSocketOpcode::Close] as $opcode) {
+			$this->assertThrowsCode(
+				'websocket_control_frame_fragmented',
+				fn () => TWebSocketFrameCodec::encode(new TWebSocketFrame($opcode, 'x', false)),
+				"Control opcode $opcode is not encoded without FIN.",
+			);
+		}
+	}
+
+	public function testDecodeRejectsAFragmentedControlFrame()
+	{
+		// A control frame with FIN clear (RFC 6455 §5.5): Ping 0x09, Pong 0x0A, Close 0x08, each unmasked and masked.
+		foreach (["\x09\x01x", "\x0a\x00", "\x08\x02\x03\xe8", "\x09\x81\x01\x02\x03\x04y"] as $wire) {
+			$this->assertBothDecodersReject($wire, 'websocket_control_frame_fragmented', 'A control frame without FIN is refused on ' . bin2hex($wire) . '.');
+		}
+		$this->assertThrowsCode(
+			'websocket_control_frame_fragmented',
+			fn () => TWebSocketFrameCodec::tryDecode("\x09\x05"),
+			'The header alone refuses a fragmented control frame, before its payload arrives.',
+		);
+		$this->assertThrowsCode(
+			'websocket_control_frame_fragmented',
+			fn () => TWebSocketFrameCodec::tryDecode("\x09\x85", true),
+			'The same holds for a masked header whose key is still arriving.',
+		);
+
+		// FIN clear is what a data frame uses to fragment: those decode.
+		$fragment = TWebSocketFrameCodec::tryDecode("\x01\x01x");
+		self::assertFalse($fragment['frame']->getFin());
+		self::assertSame(TWebSocketOpcode::Text, $fragment['frame']->getOpcode());
+		self::assertFalse(TWebSocketFrameCodec::tryDecode("\x00\x01y")['frame']->getFin(), 'A continuation frame without FIN decodes.');
+		self::assertTrue(TWebSocketFrameCodec::tryDecode("\x89\x01x")['frame']->getFin(), 'A control frame with FIN decodes.');
 	}
 
 	public function testDecodeReturnsNullAtCleanEof()
@@ -128,8 +174,16 @@ class TWebSocketFrameCodecTest extends TestCase
 	public function testDecodeThrowsOnTruncatedFrame()
 	{
 		// FIN+Text, length 5, but no payload follows.
-		self::expectException(TIOException::class);
-		TWebSocketFrameCodec::decode(TStream::fromString("\x81\x05"));
+		$this->assertThrowsCode(
+			'websocket_frame_incomplete',
+			fn () => TWebSocketFrameCodec::decode(TStream::fromString("\x81\x05")),
+			'A frame cut short by the end of the stream is refused.',
+		);
+		$this->assertThrowsCode(
+			'websocket_frame_incomplete',
+			fn () => TWebSocketFrameCodec::decode(TStream::fromString("\x81")),
+			'A header cut short by the end of the stream is refused.',
+		);
 	}
 
 	public function testFragmentedMessageSequence()
@@ -169,9 +223,13 @@ class TWebSocketFrameCodecTest extends TestCase
 
 	public function testTryDecodeThrowsOnOversizedControl()
 	{
-		$this->expectException(TIOException::class);
 		// Close opcode (0x88) with a 126 extended length of 128 exceeds the 125-byte control limit.
-		TWebSocketFrameCodec::tryDecode("\x88\x7e\x00\x80" . str_repeat('x', 128));
+		$this->assertBothDecodersReject("\x88\x7e\x00\x80" . str_repeat('x', 128), 'websocket_control_frame_too_long', 'A control frame over 125 bytes is refused.');
+		$this->assertThrowsCode(
+			'websocket_control_frame_too_long',
+			fn () => TWebSocketFrameCodec::tryDecode("\x88\x7e\x00\x80"),
+			'The header alone refuses it, before the payload arrives.',
+		);
 	}
 
 	// ---- Length encoding ------------------------------------------------------
