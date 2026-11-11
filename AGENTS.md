@@ -153,7 +153,7 @@ Docblocks inform and describe; it is not persuasive writing.
 - Composer for dependency management; Node (see `.nvmrc`) or bun for Playwright
 - Required developer dependencies for code checking: phpunit/phpunit, phpstan/phpstan, friendsofphp/php-cs-fixer. `phpstan/phpstan` and `friendsofphp/php-cs-fixer` are pinned to the exact versions PRADO's `composer.json` pins (currently 2.3.3 and 3.95.27); update them together with PRADO
 - Presume that project dependencies are installed
-- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD; one unit-test leg (PHP 8.4, `prado-http2 release`) installs the Packagist `belisoful/prado-http2` release that `^1.3` resolves to instead
+- CI installs the sibling `pradosoft/prado` (`master`) and `belisoful/prado-http2` (`main`) checkouts as Composer path repositories, so the extension is always built against the framework's development HEAD; one unit-test leg (PHP 8.4, `prado-http2 release`) installs the Packagist `belisoful/prado-http2` release that `^1.5` resolves to instead
 - CI runs php-cs-fixer and phpstan from `vendor/bin`, the versions `composer.json` pins
 
 ## Directory Structure

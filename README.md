@@ -16,7 +16,7 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 |---|---|---|
 | PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5. PHP 8.2 is the minimum from 1.2.0 (unreleased); the released v1.1.0 runs on PHP 8.1 – 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
-| `belisoful/prado-http2` `^1.3` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only |
+| `belisoful/prado-http2` `^1.4` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only. Releases before 1.4.0 are refused (a Composer `conflict`): they put no limit on a received header block |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime by `prado-http2`. `prado-http2` needs 1.60.0 or later: Ubuntu 26.04 ships 1.68.0, Ubuntu 24.04 only 1.59.0 |
 | `ext-openssl` | suggested | TLS with ALPN — `wss://`, and `h2` for HTTP/2 over TLS |
@@ -323,6 +323,8 @@ The client reconnects with exponential backoff and jitter (`minDelay`, `maxDelay
 HTTP/2 is an optional capability, active only when the `prado-http2` package and `libnghttp2` are installed (see Requirements). When present, the server recognizes the HTTP/2 connection preface in a connection's first bytes and runs an HTTP/2 session; when absent, `isHttp2Available()` is false and HTTP/2 connections are declined.
 
 Over HTTP/2, each WebSocket is an Extended CONNECT (`:method` CONNECT, `:protocol` websocket) on its own stream, and RFC 6455 frames flow as that stream's DATA. The HTTP/2 framing, HPACK, and per-stream flow control are handled by `libnghttp2` through the `prado-http2` extension; `THttp2WebSocketProtocol` bridges each stream to a `TWebSocketConnection` via the non-blocking `feed()` path, so many WebSockets share one socket. The server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` and accepts a CONNECT with `:status` 200.
+
+A request's header list is limited to 64 KiB, counted as HTTP/2 does (name length + value length + 32 per field): `prado-http2` 1.4.0 resets the stream of a larger header block and the session carries on. The HTTP/1.1 upgrade head is limited to 16 KiB (`TWebSocketHandshake::MAX_HANDSHAKE_BYTES`).
 
 The HTTP/1.1 path never references `prado-http2`: the dependency is loaded lazily, only when an HTTP/2 connection is actually served, so HTTP/1.1-only deployments need neither the package nor `ext-ffi`/`libnghttp2`.
 

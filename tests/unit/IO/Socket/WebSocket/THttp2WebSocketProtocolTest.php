@@ -306,6 +306,51 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$protocol->getSession()->close();
 	}
 
+	/**
+	 * prado-http2 1.4.0 bounds a received header block (64 KiB by default); earlier releases decoded
+	 * an HPACK bomb in full.  The refused block resets only its stream.
+	 */
+	public function testAHeaderBlockOverTheLimitResetsItsStreamAndTheSessionCarriesOn()
+	{
+		$handler = new TWebSocketHandler();
+		$opened = 0;
+		$handler->attachEventHandler('onOpen', function () use (&$opened) {
+			$opened++;
+		});
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$limit = $protocol->getSession()->getMaxHeaderListSize();
+		self::assertSame(TH2Session::DEFAULT_MAX_HEADER_LIST_SIZE, $limit, 'The session keeps the prado-http2 default limit.');
+
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$statuses = [];
+		$reset = [];
+		$client->attachEventHandler('onResponse', function ($session, $s) use (&$statuses) {
+			$statuses[$s->getStreamId()] = $s->getHeader(':status');
+		});
+		$client->attachEventHandler('onClose', function ($session, $s) use (&$reset) {
+			$reset[] = $s->getStreamId();
+		});
+
+		$oversized = $client->request($this->connectHeaders(['cookie' => str_repeat('a', $limit)]));
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+		self::assertSame(0, $opened, 'A request over the header list limit opens no WebSocket.');
+		self::assertCount(0, $protocol->getConnections());
+		self::assertSame([$oversized->getStreamId()], $reset, 'Its stream is reset.');
+		self::assertSame([], $statuses, 'It gets no response.');
+		self::assertNull($protocol->getSession()->getStream($oversized->getStreamId()), 'The server keeps nothing of it.');
+
+		$next = $client->request($this->connectHeaders());
+		$protocol->receive($client->send());
+		$client->receive($protocol->send());
+		self::assertSame(1, $opened, 'The session carries on: the next stream opens.');
+		self::assertSame([$next->getStreamId() => '200'], $statuses);
+
+		$protocol->shutdown();
+		$client->close();
+	}
+
 	public function testWrongOrMissingVersionIsRejectedWith426()
 	{
 		foreach (['8', '13abc', null] as $version) {

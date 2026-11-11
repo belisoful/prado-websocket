@@ -21,7 +21,7 @@ jobs:
       matrix:
         php-versions: ['8.2', '8.3', '8.4', '8.5']
         # 'main' builds against the prado-http2 development HEAD; 'release' installs the Packagist
-        # release that the `^1.3` constraint resolves to, which is what users install.
+        # release that the `^1.5` constraint resolves to, which is what users install.
         http2: ['main']
         include:
           - php-versions: '8.4'
@@ -82,7 +82,7 @@ jobs:
 
       - name: Register the sibling HTTP/2 checkout as a Composer path repository
         if: matrix.http2 == 'main'
-        run: composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
+        run: composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.5.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
@@ -167,7 +167,7 @@ jobs:
       - name: Register the sibling PRADO 4.4 and HTTP/2 checkouts as Composer path repositories
         run: |
           composer config repositories.prado '{"type":"path","url":"../prado","options":{"symlink":true,"versions":{"pradosoft/prado":"4.4.0"}}}'
-          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.3.0"}}}'
+          composer config repositories.prado-http2 '{"type":"path","url":"../prado-http2","options":{"symlink":true,"versions":{"belisoful/prado-http2":"1.5.0"}}}'
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
