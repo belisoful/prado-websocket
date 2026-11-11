@@ -3,7 +3,7 @@
 	The chat example's PRADO configuration.
 
 	Web:        php -S 127.0.0.1:8089 -t examples/chat/app
-	WebSocket:  vendor/bin/prado-cli -d examples/chat/app/protected websocket/serve
+	WebSocket:  vendor/bin/prado-cli -d=examples/chat/app/protected websocket/serve
 -->
 <application id="prado-chat" Mode="Debug">
 	<!--

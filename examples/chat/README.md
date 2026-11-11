@@ -14,6 +14,7 @@ A multi-room chat built on the `prado.pubsub.v1` subprotocol: `TWebSocketPubSubH
 | Whispers between members of a room with `send()`, addressed by client id; `onSend` rewrites them | `ChatHandler::authorizeSend()`, `/w nick text` in the page |
 | An application call (`chat.join`) joining the room and returning members, history and a token | `ChatHandler::answerCall()`, `join()` |
 | Nicknames unique on the server, ignoring case; the join token takes a nickname back after a reconnect | `ChatHandler::join()` |
+| Nicknames of visible characters only: a space, a control character, a zero-width or bidirectional-control character is refused, so `bob` and `bob` plus a character no one sees are not two people | `ChatHandler::NICK_PATTERN` |
 | Bounded memory: at most 100 rooms keep state, the least recently used empty room makes way, and each keeps 50 messages | `ChatHandler::touchRoom()` |
 | Join and leave announcements; leaving on disconnect | `ChatHandler::join()`, `leave()`, `onClose()` |
 | Errors from the server shown to the user | a bad or taken nickname, an empty message |
@@ -55,6 +56,8 @@ php -S 127.0.0.1:8089 examples/chat/router.php
 
 Open <http://127.0.0.1:8089/> in two browser windows, pick nicknames, and chat. Click a name in the member list to whisper. To try reconnection, stop `server.php` and start it again. The page shows "reconnecting", then rejoins.
 
+In a project that installed the package with Composer, the example is at `vendor/belisoful/prado-websocket/examples/chat`. The same commands run it from there, with that path: `server.php` and `app/index.php` load the project's `vendor/autoload.php`.
+
 `CHAT_HOST` and `CHAT_PORT` change where `server.php` listens. The page connects to `ws://<page host>:8090/`; `?ws=ws://host:port/` in the page URL overrides that with a URL on the page's own host. A `?ws=` naming another host is ignored, so a crafted link cannot send a visitor's nickname and messages to another server.
 
 ## Run it: as a PRADO application
@@ -92,6 +95,6 @@ $this->getClientScript()->registerHeadScriptFile('prado-pubsub',
 
 - **TLS:** serve the page over HTTPS and the socket as `wss://`, either with `TWebSocketServer::bind('tls://…')` or behind a TLS-terminating proxy.
 - **Origins:** set `Origins` on the module, or call `setOrigins()` on the server, so only your pages can connect.
-- **Identity:** the nickname is whatever the browser sends first. `ChatHandler` keeps two people from holding the same one at once, but anyone may take a free nickname, and lookalike characters can imitate one. Authenticate in `onOpen` (for example, a session cookie or a short-lived token in the URL) and close with 4401 on failure, which stops the client from reconnecting.
+- **Identity:** the nickname is whatever the browser sends first. `ChatHandler` keeps two people from holding the same one at once and refuses invisible characters, but anyone may take a free nickname, and lookalike letters of another script can imitate one. Authenticate in `onOpen` (for example, a session cookie or a short-lived token in the URL) and close with 4401 on failure, which stops the client from reconnecting.
 - **Several nodes:** `ChatHandler` keeps rooms and history in process memory, so it runs as one node. To run several, configure a backplane and keep the members and history in shared storage, such as Redis.
 - **Rate limits:** nothing limits how fast a client posts. Add a per-client limit in `authorizePublish()`.

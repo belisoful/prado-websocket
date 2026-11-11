@@ -8,8 +8,9 @@ import { startWsServer } from './ws-helpers.js';
  * Real-browser tests of the prado.pubsub.v1 browser client (prado-pubsub.js) against
  * TWebSocketPubSubHandler on the standalone server: channel delivery between clients, calls,
  * authorization errors, a fatal close, reconnection with re-subscription after a server
- * restart, heartbeat detection of a stalled server, and backoff against a server without the
- * subprotocol.
+ * restart, heartbeat detection of a stalled server, backoff against a server without the
+ * subprotocol, a server that never sends the welcome, and a server whose onOpen handler refuses
+ * the client after a wait.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -19,6 +20,8 @@ const PUBSUB_PORT = 8380;
 const RESTART_PORT = 8381;
 const HEARTBEAT_PORT = 8382;
 const ECHO_PORT = 8383;
+const SILENT_PORT = 8387;
+const REFUSE_PORT = 8388;
 const url = (port) => `ws://127.0.0.1:${port}`;
 
 /** @type {ReturnType<typeof startWsServer>} */ let pubsub;
@@ -27,8 +30,7 @@ const url = (port) => `ws://127.0.0.1:${port}`;
 test.beforeAll(async () => {
 	pubsub = startWsServer({ port: PUBSUB_PORT, pubsub: true });
 	echo = startWsServer({ port: ECHO_PORT });
-	await pubsub.ready();
-	await echo.ready();
+	await Promise.all([pubsub.ready(), echo.ready()]);
 });
 
 test.afterAll(async () => {
@@ -122,8 +124,8 @@ test('settles a request the server cannot decode', async ({ page }) => {
 
 test('reconnects after the server refuses a message as too big', async ({ page }) => {
 	const server = startWsServer({ port: RESTART_PORT, pubsub: true, maxMessage: 1024, maxFrame: 0 });
-	await server.ready();
 	try {
+		await server.ready();
 		const res = await page.evaluate(async ({ url }) => {
 			const ps = new window.Prado.WebSocket.PubSub(url, { minDelay: 50, maxDelay: 100 });
 			const closes = [];
@@ -217,8 +219,8 @@ test('never opens against a server that does not negotiate the subprotocol', asy
 
 test('reconnects after a server restart and re-subscribes', async ({ page }) => {
 	let server = startWsServer({ port: RESTART_PORT, pubsub: true });
-	await server.ready();
 	try {
+		await server.ready();
 		const firstId = await page.evaluate(async ({ url }) => {
 			const ps = new window.Prado.WebSocket.PubSub(url, { minDelay: 100, maxDelay: 400 });
 			window.__ps = ps;
@@ -251,9 +253,11 @@ test('reconnects after a server restart and re-subscribes', async ({ page }) => 
 });
 
 test('drops a stalled connection on the heartbeat and recovers', async ({ page }) => {
-	const server = startWsServer({ port: HEARTBEAT_PORT, pubsub: true, heartbeat: 0.3 });
-	await server.ready();
+	// A one-second heartbeat: the client drops a connection silent for two seconds, so a server
+	// that answers a ping up to a second late (a loaded machine) is not taken for a stalled one.
+	const server = startWsServer({ port: HEARTBEAT_PORT, pubsub: true, heartbeat: 1 });
 	try {
+		await server.ready();
 		await page.evaluate(async ({ url }) => {
 			const ps = new window.Prado.WebSocket.PubSub(url, { minDelay: 100, maxDelay: 400 });
 			window.__hb = ps;
@@ -264,11 +268,12 @@ test('drops a stalled connection on the heartbeat and recovers', async ({ page }
 			await ps.call('echo', null);
 		}, { url: url(HEARTBEAT_PORT) });
 
-		await page.waitForTimeout(1000);   // several heartbeats answered: the connection stays up
+		await page.waitForTimeout(2500);   // two heartbeats answered: the connection stays up
 		expect(await page.evaluate(() => window.__hbCloses.length)).toBe(0);
+		expect(await page.evaluate(() => window.__hb.state)).toBe('open');
 
 		server.child.kill('SIGSTOP');   // the server stops answering without closing the socket
-		await page.waitForFunction(() => window.__hbCloses.length === 1, null, { timeout: 5_000 });
+		await page.waitForFunction(() => window.__hbCloses.length === 1, null, { timeout: 10_000 });
 		const close = await page.evaluate(() => window.__hbCloses[0]);
 		expect(close.code).toBe(4000);
 		expect(close.willReconnect).toBe(true);
@@ -278,6 +283,73 @@ test('drops a stalled connection on the heartbeat and recovers', async ({ page }
 		await page.evaluate(() => window.__hb.close());
 	} finally {
 		server.child.kill('SIGCONT');
+		await server.stop();
+	}
+});
+
+test('drops a connection the server never welcomes, and retries', async ({ page }) => {
+	// An echo server that selects the subprotocol: the socket opens, and no welcome follows.
+	const server = startWsServer({ port: SILENT_PORT, subprotocols: 'prado.pubsub.v1' });
+	try {
+		await server.ready();
+		const res = await page.evaluate(async ({ url }) => {
+			const ps = new window.Prado.WebSocket.PubSub(url, { welcomeTimeout: 300, minDelay: 50, maxDelay: 100 });
+			const closes = [];
+			let opened = false;
+			ps.on('open', () => { opened = true; });
+			const second = new Promise((r) => ps.on('close', (e) => {
+				closes.push(e);
+				if (closes.length === 2) {
+					r();
+				}
+			}));
+			const pending = ps.call('echo', 1).then(() => 'resolved', (e) => e.code);
+			await second;
+			const state = ps.state;
+			ps.close();
+			return { opened, closes, state, pending: await pending };
+		}, { url: url(SILENT_PORT) });
+		expect(res.opened).toBe(false);
+		expect(res.closes).toEqual([
+			{ code: 4001, reason: 'welcome timeout', willReconnect: true },
+			{ code: 4001, reason: 'welcome timeout', willReconnect: true },
+		]);
+		expect(res.state).toBe('reconnecting');
+		expect(res.pending).toBe('closed');
+	} finally {
+		await server.stop();
+	}
+});
+
+test('serves nothing to a client its onOpen handler refuses after a wait', async ({ page }) => {
+	// The handler waits 0.4 s on the event loop (an asynchronous lookup), then closes with 4401.
+	const server = startWsServer({ port: REFUSE_PORT, pubsub: true, refuseAfter: 0.4 });
+	try {
+		await server.ready();
+		// A plain WebSocket: it sends requests as soon as the socket opens, which the client does not.
+		const raw = await page.evaluate(({ url }) => new Promise((resolve) => {
+			const ws = new WebSocket(url, 'prado.pubsub.v1');
+			const received = [];
+			ws.onopen = () => {
+				ws.send(JSON.stringify({ id: '1', type: 'subscribe', channel: 'room:secret' }));
+				ws.send(JSON.stringify({ id: '2', type: 'call', method: 'echo', params: 'sensitive' }));
+			};
+			ws.onmessage = (ev) => received.push(ev.data);
+			ws.onclose = (c) => resolve({ received, code: c.code, reason: c.reason });
+		}), { url: url(REFUSE_PORT) });
+		expect(raw).toEqual({ received: [], code: 4401, reason: 'unauthorized' });
+
+		const client = await page.evaluate(async ({ url }) => {
+			const ps = new window.Prado.WebSocket.PubSub(url, { minDelay: 50 });
+			let opened = false;
+			ps.on('open', () => { opened = true; });
+			const closed = new Promise((r) => ps.on('close', r));
+			const pending = ps.call('echo', 1).then(() => 'resolved', (e) => e.code);
+			const event = await closed;
+			return { opened, event, state: ps.state, pending: await pending };
+		}, { url: url(REFUSE_PORT) });
+		expect(client).toEqual({ opened: false, event: { code: 4401, reason: 'unauthorized', willReconnect: false }, state: 'closed', pending: 'closed' });
+	} finally {
 		await server.stop();
 	}
 });

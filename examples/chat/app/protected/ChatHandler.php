@@ -36,6 +36,9 @@ use Prado\IO\Socket\WebSocket\TWebSocketConnection;
  *
  * Joins and leaves are published to the room as `{kind: 'join'|'leave', id, nick}`.
  *
+ * A nickname is 1 to {@see MAX_NICK} visible characters ({@see NICK_PATTERN}): a space, a control
+ * character, or an invisible one (a zero-width space or joiner, a bidirectional control) is
+ * refused, so two nicknames that render alike are not told apart by a character no one sees.
  * A nickname is unique on the server, ignoring case, while its holder is in a room.  The join
  * that takes a nickname returns a token; a later join that presents it takes the nickname over
  * from its holder, which is the same page's previous connection after a reconnect the server
@@ -60,13 +63,21 @@ class ChatHandler extends TWebSocketPubSubHandler
 	public const MAX_ROOMS = 100;
 
 	/** The pattern of a room name. */
-	public const ROOM_PATTERN = '/^[a-z0-9_-]{1,32}$/';
+	public const ROOM_PATTERN = '/^[a-z0-9_-]{1,32}\z/';
 
 	/** The maximum message length in characters. */
 	public const MAX_TEXT = 500;
 
 	/** The maximum nickname length in characters. */
 	public const MAX_NICK = 24;
+
+	/**
+	 * The pattern of a nickname: 1 to {@see MAX_NICK} characters, none of them a separator (`\p{Z}`),
+	 * a control, format, private-use or unassigned character (`\p{C}`: line breaks, zero-width and
+	 * bidirectional controls), or another character that renders as nothing (fillers, variation
+	 * selectors, the blank Braille pattern).
+	 */
+	public const NICK_PATTERN = '/^[^\p{Z}\p{C}\x{034F}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180B}-\x{180F}\x{2800}\x{3164}\x{FE00}-\x{FE0F}\x{FFA0}\x{E0100}-\x{E01EF}]{1,' . self::MAX_NICK . '}\z/u';
 
 	/** @var array<string, array<string, string>> Room name → member client id → nickname. */
 	private array $_rooms = [];
@@ -177,8 +188,8 @@ class ChatHandler extends TWebSocketPubSubHandler
 				throw new TWebSocketPubSubException('A room name is 1 to 32 characters: a-z, 0-9, _ and -.');
 			}
 			$nick = trim(is_string($params['nick'] ?? null) ? $params['nick'] : '');
-			if (!preg_match('/^\S{1,' . self::MAX_NICK . '}$/u', $nick)) {
-				throw new TWebSocketPubSubException('A nickname is 1 to ' . self::MAX_NICK . ' characters, without spaces.');
+			if (!preg_match(self::NICK_PATTERN, $nick)) {
+				throw new TWebSocketPubSubException('A nickname is 1 to ' . self::MAX_NICK . ' characters, without spaces or invisible characters.');
 			}
 			$token = $this->join($connection, $clientId, $room, $nick, is_string($params['token'] ?? null) ? $params['token'] : null);
 			$param->setResult([

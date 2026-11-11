@@ -14,12 +14,20 @@ import { defineConfig, devices } from '@playwright/test';
  * browser opens `ws://` from a real HTTP origin; the WebSocket servers
  * themselves are spawned per-spec by ./tests/playwright/ws-helpers.js.
  *
- * Run (Node not required; this repo drives Playwright with bun):
- *   bun run playwright                      # or: bunx playwright test
- *   bunx playwright test --project=chromium
- *   HEADLESS=false bunx playwright test     # watch it run
+ * Run with Node and npx, as the composer scripts (`composer functest`,
+ * `composer functionaltest`) and CI do:
+ *   npx playwright install --with-deps      # once: the browsers and their system packages
+ *   npx playwright test                     # every browser
+ *   npx playwright test --project=chromium
+ *   HEADLESS=false npx playwright test      # watch it run
+ * bun runs the same commands (`bunx playwright test`, `bun run playwright`); CI does not use it.
+ *
+ * The servers listen on fixed ports (8377 to 8393), so one run at a time per machine.
  */
 const PAGE_PORT = 8377;
+
+/** Specs that drive no browser page: they run once, in the chromium project. */
+const NODE_ONLY = ['**/pubsub-client.spec.js', '**/harness.spec.js'];
 
 export default defineConfig({
 	testDir: './tests/playwright',
@@ -52,8 +60,8 @@ export default defineConfig({
 
 	projects: [
 		{ name: 'chromium', use: { ...devices['Desktop Chrome'] } },
-		{ name: 'firefox', use: { ...devices['Desktop Firefox'] } },
-		{ name: 'webkit', use: { ...devices['Desktop Safari'] } },
+		{ name: 'firefox', testIgnore: NODE_ONLY, use: { ...devices['Desktop Firefox'] } },
+		{ name: 'webkit', testIgnore: NODE_ONLY, use: { ...devices['Desktop Safari'] } },
 	],
 
 	outputDir: 'build/playwright-results',

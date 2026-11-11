@@ -10,6 +10,8 @@ import { expect, test } from '@playwright/test';
  * request ordering, reconnection and subscription bookkeeping a live server cannot stage on
  * demand.  The client is loaded with CommonJS require(), as a Node host using the package loads
  * it; this repository's own package.json declares "type": "module".
+ *
+ * No browser is involved, so playwright.config.js runs this file in the chromium project only.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +49,11 @@ class ScriptedSocket {
 
 	receive(frame) {
 		this.onmessage({ data: JSON.stringify(frame) });
+	}
+
+	/** The server sends a text frame as is. */
+	receiveText(text) {
+		this.onmessage({ data: text });
 	}
 
 	welcome(extra = {}) {
@@ -238,5 +245,182 @@ test('reports a timed-out re-subscribe and unsubscribes it', async () => {
 	await until(() => errors.length === 1);
 	expect(errors).toEqual(['timeout']);
 	expect(socket().frames().map((f) => f.type)).toEqual(['subscribe', 'unsubscribe']);
+	ps.close();
+});
+
+test('rejects with queue_full once the offline queue holds maxQueue requests', async () => {
+	const { ps, socket } = connect({ maxQueue: 2 });
+	const code = (p) => p.then(() => 'resolved', (e) => e.code);
+	const held = [ps.call('a'), ps.call('b')];
+	held.forEach((p) => p.catch(() => {}));
+	expect(await code(ps.call('c'))).toBe('queue_full');
+	expect(await code(ps.subscribe('room:1', () => {}))).toBe('queue_full');
+	expect(ps._channels.has('room:1')).toBe(false, 'A refused subscribe leaves no channel behind.');
+
+	socket().open();
+	socket().welcome();
+	expect(socket().frames().map((f) => f.method)).toEqual(['a', 'b'], 'The held requests go out; the refused ones do not.');
+	const third = ps.call('d');   // open: sent, not queued
+	ackAll(socket());
+	await Promise.all([...held, third]);
+	ps.close();
+});
+
+test('rejects a payload JSON cannot serialize with bad_request, sent or held', async () => {
+	const { ps, socket } = connect();
+	const code = (p) => p.then(() => 'resolved', (e) => e.code);
+	const cycle = {};
+	cycle.self = cycle;
+	const heldBad = code(ps.publish('room:1', cycle));
+	const heldGood = ps.call('after');
+	socket().open();
+	socket().welcome();
+	expect(await heldBad).toBe('bad_request');
+	expect(socket().frames().map((f) => f.type + ':' + f.method)).toEqual(['call:after'], 'The rest of the queue is sent.');
+
+	expect(await code(ps.publish('room:1', { n: 10n }))).toBe('bad_request');
+	expect(await code(ps.call('m', cycle))).toBe('bad_request');
+	expect(socket().sent).toHaveLength(1);
+	expect(ps._pending.size).toBe(1, 'Only the request that was sent awaits a reply.');
+	ackAll(socket());
+	await heldGood;
+	ps.close();
+});
+
+test('reports a frame that is not a JSON object as bad_frame and keeps working', async () => {
+	const { ps, socket } = connect();
+	const errors = [];
+	ps.on('error', (e) => errors.push(e.code));
+	socket().open();
+	socket().welcome();
+	for (const text of ['{', '', 'null', '123', '"welcome"', 'true', '[]', '[{"type":"ack","id":"1"}]']) {
+		expect(() => socket().receiveText(text)).not.toThrow();
+	}
+	expect(errors).toEqual(Array(8).fill('bad_frame'));
+	expect(ps.state).toBe('open');
+
+	socket().receiveText('{}');   // an object of no known type is ignored
+	socket().receiveText('{"type":"later-version"}');
+	expect(errors).toHaveLength(8);
+	const result = ps.call('echo', 1);
+	socket().receive({ type: 'ack', id: socket().frames()[0].id, data: 'ok' });
+	expect(await result).toBe('ok');
+	ps.close();
+});
+
+test('reports an error frame that answers no request on the error event', async () => {
+	const { ps, socket, PubSub } = connect();
+	const errors = [];
+	ps.on('error', (e) => errors.push(e));
+	socket().open();
+	socket().welcome();
+	const pending = ps.call('slow').then(() => 'resolved', (e) => e.code);
+	socket().receive({ type: 'error', code: 'limit', message: 'slow down' });
+	socket().receive({ type: 'error', id: 'no-such-request', code: 'bad_request', message: 'what?' });
+	socket().receive({ type: 'ack', id: 'no-such-request' });   // a stray ack is ignored
+	expect(errors.map((e) => [e instanceof PubSub.PubSubError, e.code, e.message])).toEqual([
+		[true, 'limit', 'slow down'],
+		[true, 'bad_request', 'what?'],
+	]);
+	expect(ps._pending.size).toBe(1, 'The request in flight is not settled by them.');
+	socket().receive({ type: 'error', id: socket().frames()[0].id, code: 'forbidden', message: 'no' });
+	expect(await pending).toBe('forbidden');
+	expect(errors).toHaveLength(2, 'An error that answers a request rejects it and is not also an event.');
+	ps.close();
+});
+
+test('stays closed when a close listener closes the client', async () => {
+	const { ps, socket } = connect();
+	socket().open();
+	socket().welcome();
+	const subscribed = ps.subscribe('room:1', () => {});
+	ackAll(socket());
+	await subscribed;
+	const closes = [];
+	ps.on('close', (e) => {
+		closes.push(e);
+		ps.close();   // give up on the first drop
+	});
+	socket().drop();
+	expect(ps.state).toBe('closed');
+	await sleep(30);   // past the 1 ms reconnect delay
+	expect(ScriptedSocket.all).toHaveLength(1, 'No new socket is opened.');
+	expect(ps.state).toBe('closed');
+	expect(closes).toEqual([{ code: 1006, reason: '', willReconnect: true }]);
+	expect(await ps.publish('room:1', 1).then(() => 'resolved', (e) => e.code)).toBe('closed');
+});
+
+test('re-subscribes each channel once across reconnects that drop before the ack', async () => {
+	const { ps, socket } = connect();
+	const errors = [];
+	ps.on('error', (e) => errors.push(e.code));
+	socket().open();
+	socket().welcome();
+	const first = [ps.subscribe('room:a', () => {}), ps.subscribe('room:b', () => {})];
+	ackAll(socket());
+	await Promise.all(first);
+
+	for (let flap = 2; flap <= 6; flap++) {
+		socket().drop();   // before the re-subscribes are acked
+		await until(() => ScriptedSocket.all.length === flap);
+		socket().open();
+		socket().welcome();
+		expect(socket().frames().map((f) => f.type + ':' + f.channel)).toEqual(['subscribe:room:a', 'subscribe:room:b'], `Reconnect ${flap - 1} sends one subscribe per channel.`);
+		expect(ps._pending.size).toBe(2);
+		expect(ps._queue).toEqual([]);
+	}
+	ackAll(socket());
+	await sleep(5);
+	expect(ps._pending.size).toBe(0);
+	expect([...ps._channels.keys()]).toEqual(['room:a', 'room:b']);
+	expect(errors).toEqual([]);
+
+	// A channel acked on this connection is re-subscribed on the next one.
+	socket().drop();
+	await until(() => ScriptedSocket.all.length === 7);
+	socket().open();
+	socket().welcome();
+	expect(socket().frames().map((f) => f.type + ':' + f.channel)).toEqual(['subscribe:room:a', 'subscribe:room:b']);
+	ps.close();
+});
+
+test('drops a socket that opens without a welcome and reconnects', async () => {
+	const { ps, socket } = connect({ welcomeTimeout: 20 });
+	const closes = [];
+	ps.on('close', (e) => closes.push(e));
+	const held = ps.call('held');
+	const silent = socket();
+	silent.open();   // the welcome never arrives
+	expect(ps.state).toBe('connecting');
+	await until(() => ScriptedSocket.all.length === 2);
+	expect(silent.closedWith).toBe(4001);
+	expect(silent.sent).toEqual([], 'Nothing is sent on a socket that was not welcomed.');
+	expect(closes).toEqual([{ code: 4001, reason: 'welcome timeout', willReconnect: true }]);
+
+	socket().open();
+	socket().welcome();
+	expect(ps.state).toBe('open');
+	expect(socket().frames().map((f) => f.method)).toEqual(['held'], 'The held request goes out on the welcomed socket.');
+	ackAll(socket());
+	await held;
+	await sleep(40);   // past welcomeTimeout: a welcomed socket is kept
+	expect(ScriptedSocket.all).toHaveLength(2);
+	expect(ps.state).toBe('open');
+	ps.close();
+});
+
+test('waits for the welcome without limit when welcomeTimeout is 0', async () => {
+	const { ps, socket } = connect({ welcomeTimeout: 0 });
+	socket().open();
+	await sleep(40);
+	expect(ScriptedSocket.all).toHaveLength(1);
+	expect(ps.state).toBe('connecting');
+	expect(socket().closedWith).toBeNull();
+	ps.close();
+});
+
+test('defaults welcomeTimeout to ten seconds', () => {
+	const { ps } = connect();
+	expect(ps.options.welcomeTimeout).toBe(10000);
 	ps.close();
 });

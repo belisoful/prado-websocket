@@ -22,6 +22,31 @@ class TWebSocketPubSubEventParameterTest extends TestCase
 		self::assertNull($param->getMethod());
 		self::assertNull($param->getResult());
 		self::assertFalse($param->getHandled());
+		self::assertNull($param->getDataJson());
+	}
+
+	public function testDataJsonIsKeptApartFromTheData()
+	{
+		$param = new TWebSocketPubSubEventParameter('n-1', []);
+		self::assertSame($param, $param->setDataJson('{}'));
+		self::assertSame('{}', $param->getDataJson());
+		$param->setData(['stamped' => true]);
+		self::assertSame('{}', $param->getDataJson(), 'The text is what the client sent, whatever replaces the Data.');
+		self::assertNull($param->setDataJson(null)->getDataJson());
+	}
+
+	public function testDataJsonFromAFunctionIsWrittenOnceWhenFirstRead()
+	{
+		$calls = 0;
+		$param = (new TWebSocketPubSubEventParameter('n-1'))->setDataJson(function () use (&$calls) {
+			$calls++;
+			return '[1]';
+		});
+		self::assertSame(0, $calls, 'Nothing is written until the text is read.');
+		self::assertSame('[1]', $param->getDataJson());
+		self::assertSame('[1]', $param->getDataJson());
+		self::assertSame(1, $calls);
+		self::assertNull($param->setDataJson(fn () => null)->getDataJson());
 	}
 
 	public function testDataIsTheEventParameter()
@@ -71,5 +96,9 @@ class TWebSocketPubSubEventParameterTest extends TestCase
 		self::assertSame('limit', $e->getReplyCode());
 		self::assertSame('websocket_pubsub_channel_invalid', $e->getErrorCode());
 		self::assertStringContainsString('channel', $e->getMessage(), 'The message comes from errorMessages.txt.');
+
+		// The class docblock's sample: the message takes the request type and its target.
+		$sample = (new TWebSocketPubSubException('websocket_pubsub_forbidden', 'call', 'chat.history'))->setReplyCode(TWebSocketPubSubException::FORBIDDEN);
+		self::assertSame("The pub/sub call request for 'chat.history' was denied.", $sample->getMessage());
 	}
 }

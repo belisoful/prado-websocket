@@ -4,6 +4,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket\PubSub;
 
 use PHPUnit\Framework\TestCase;
 use Prado\Exceptions\IUserException;
+use Prado\IO\Async\TAsync;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\Cluster\IWebSocketClusterAware;
 use Prado\IO\Socket\WebSocket\Cluster\TNullBackplane;
@@ -18,7 +19,9 @@ use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
 use Prado\IO\Socket\WebSocket\TWebSocketFrameCodec;
 use Prado\IO\Socket\WebSocket\TWebSocketHandler;
+use Prado\IO\Socket\WebSocket\TWebSocketHandshake;
 use Prado\IO\Socket\WebSocket\TWebSocketOpcode;
+use Prado\IO\Socket\WebSocket\TWebSocketServer;
 use Prado\IO\Stream\TBufferStream;
 
 /** Records the envelopes a cluster hands its backplane. */
@@ -45,6 +48,11 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		$this->cluster = new TWebSocketCluster('nodeA', $this->backplane);
 		$this->handler = new TWebSocketPubSubHandler();
 		$this->handler->setCluster($this->cluster);
+	}
+
+	protected function tearDown(): void
+	{
+		TAsync::setLoop(null);
 	}
 
 	/**
@@ -249,6 +257,160 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame(4401, $frames[0]->getCloseCode());
 	}
 
+	public function testARequestThatArrivesWhileOnOpenRunsIsNotServed()
+	{
+		[$connection, $stream] = $this->makeConnection();
+		$events = [];
+		// The handler waits (an asynchronous lookup) and the driver dispatches what the peer sent meanwhile.
+		$this->handler->attachEventHandler('onOpen', function (TWebSocketConnection $sender) use (&$events) {
+			$events[] = 'lookup';
+			$this->request($sender, ['id' => '1', 'type' => 'subscribe', 'channel' => 'secret']);
+			$this->request($sender, ['id' => '2', 'type' => 'call', 'method' => 'admin.dump']);
+			$this->request($sender, ['type' => 'ping']);
+			$events[] = 'refused';
+			$sender->close(4401, 'unauthorized');
+		});
+		$this->handler->attachEventHandler('onSubscribe', function () use (&$events) {
+			$events[] = 'onSubscribe';
+		});
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) use (&$events) {
+			$events[] = 'onCall';
+			$param->setResult(['rows' => 'sensitive']);
+		});
+		$this->handler->onOpen($connection);
+
+		self::assertSame(['lookup', 'refused'], $events, 'No request runs before the onOpen handlers have admitted the client.');
+		$frames = $this->frames($stream);
+		self::assertCount(1, $frames, 'The refused client receives the Close and nothing else.');
+		self::assertSame(4401, $frames[0]->getCloseCode());
+		self::assertSame([], $this->cluster->getChannelSubscribers('secret'));
+
+		$this->request($connection, ['id' => '3', 'type' => 'call', 'method' => 'admin.dump']);
+		self::assertSame(['lookup', 'refused'], $events, 'Nor does one run afterwards.');
+		self::assertSame([], $this->frames($stream));
+	}
+
+	public function testTheWelcomeIsTheFirstFrameOfAClientAdmittedAfterAWait()
+	{
+		[$connection, $stream] = $this->makeConnection();
+		$seen = null;
+		$this->handler->attachEventHandler('onOpen', function (TWebSocketConnection $sender) use (&$seen) {
+			$seen = $this->handler->getClientId($sender);
+			$this->request($sender, ['id' => 'early', 'type' => 'ping']);
+			$this->request($sender, ['id' => 'early', 'type' => 'subscribe', 'channel' => 'news']);
+		});
+		$this->handler->onOpen($connection);
+
+		self::assertNotNull($seen, 'The client has its id while onOpen runs.');
+		$replies = $this->replies($stream);
+		self::assertCount(1, $replies, 'A request that arrives before the welcome is ignored.');
+		self::assertSame('welcome', $replies[0]['type']);
+		self::assertSame($seen, $replies[0]['clientId']);
+		self::assertSame([], $this->handler->getSubscriptions($connection));
+
+		$this->request($connection, ['id' => 'late', 'type' => 'ping']);
+		self::assertSame([['type' => 'ack', 'id' => 'late']], $this->replies($stream), 'An admitted client is served.');
+	}
+
+	public function testAConnectionThatClosesWhileOnOpenRunsIsNotAdmitted()
+	{
+		[$connection, $stream] = $this->makeConnection();
+		$closed = 0;
+		$this->handler->attachEventHandler('onOpen', function (TWebSocketConnection $sender) {
+			$this->handler->onClose($sender);   // the peer left while the handler waited
+		});
+		$this->handler->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$this->handler->onOpen($connection);
+
+		self::assertSame(1, $closed);
+		self::assertSame([], $this->frames($stream), 'No welcome is written to a connection that is gone.');
+		self::assertNull($this->handler->getClientId($connection), 'The client is not brought back.');
+		self::assertNull($this->cluster->getClientId($connection));
+		$this->request($connection, ['id' => 'x', 'type' => 'ping']);
+		self::assertSame([], $this->frames($stream));
+	}
+
+	public function testAPeerThatClosesWhileOnOpenRunsGetsNoWelcome()
+	{
+		[$a, $b] = TSocketStream::pair();
+		$clientWs = new TWebSocketConnection($a, true);
+		$serverWs = new TWebSocketConnection($b, false);
+		$serverWs->setSubprotocol(TWebSocketPubSubHandler::SUBPROTOCOL);
+		$this->handler->attachEventHandler('onOpen', function (TWebSocketConnection $sender) use ($clientWs) {
+			$clientWs->close(1001);
+			$sender->receiveFrame();   // the driver reads the peer's Close, which the connection echoes
+		});
+		$calls = 0;
+		$this->handler->attachEventHandler('onCall', function () use (&$calls) {
+			$calls++;
+		});
+		$this->handler->onOpen($serverWs);
+
+		self::assertTrue($serverWs->getIsClosed());
+		$b->setBlocking(false);
+		$a->setBlocking(false);
+		$reply = $clientWs->receiveFrame();
+		self::assertNotNull($reply);
+		self::assertSame(TWebSocketOpcode::Close, $reply->getOpcode(), 'The Close echo is the only frame; no welcome precedes or follows it.');
+		$this->request($serverWs, ['id' => 'x', 'type' => 'call', 'method' => 'late']);
+		self::assertSame(0, $calls, 'A connection that closed before it was admitted runs no request.');
+		self::assertNull($clientWs->receiveFrame());
+		$a->close();
+		$b->close();
+	}
+
+	public function testTheServerServesNoRequestWhileOnOpenWaitsOnTheEventLoop()
+	{
+		$server = TWebSocketServer::bind('tcp://127.0.0.1:0');
+		TAsync::setLoop($server->getReactor());   // as serve() does
+		$server->setCluster($this->cluster);
+		$server->setSubprotocols([TWebSocketPubSubHandler::SUBPROTOCOL]);
+		$events = [];
+		$client = null;
+		$this->handler->attachEventHandler('onOpen', function (TWebSocketConnection $sender) use (&$events, &$client) {
+			$events[] = 'lookup';
+			// What the unauthenticated peer sends while the lookup is pending.
+			$peer = new TWebSocketConnection($client, true);
+			$peer->send('{"id":"1","type":"subscribe","channel":"secret"}');
+			$peer->send('{"id":"2","type":"call","method":"admin.dump"}');
+			TAsync::sleep(0.1);   // a wait on the main fiber: the reactor ticks from inside this handler
+			$events[] = 'refused';
+			$sender->close(4401, 'unauthorized');
+		});
+		$this->handler->attachEventHandler('onSubscribe', function () use (&$events) {
+			$events[] = 'onSubscribe';
+		});
+		$this->handler->attachEventHandler('onCall', function ($sender, TWebSocketPubSubEventParameter $param) use (&$events) {
+			$events[] = 'onCall';
+			$param->setResult(['rows' => 'sensitive']);
+		});
+		$server->setHandler($this->handler);
+
+		$client = TSocketStream::connect('tcp://127.0.0.1:' . $server->getPort(), 1.0);
+		$client->write(TWebSocketHandshake::buildClientRequest('example.test', '/', TWebSocketHandshake::generateKey(), ['Sec-WebSocket-Protocol' => TWebSocketPubSubHandler::SUBPROTOCOL]));
+		$client->setBlocking(false);
+		$received = '';
+		for ($i = 0; $i < 200 && !str_contains($received, 'unauthorized'); $i++) {
+			$server->serveOnce(0, 20000);
+			$received .= (string) $client->read(65536);
+		}
+		for ($i = 0; $i < 5; $i++) {   // anything that would follow the Close
+			$server->serveOnce(0, 20000);
+			$received .= (string) $client->read(65536);
+		}
+
+		self::assertSame(['lookup', 'refused'], $events, 'The requests the peer sent during the lookup run no handler.');
+		self::assertStringContainsString('unauthorized', $received);
+		self::assertStringNotContainsString('"ack"', $received, 'The refused client is acked nothing.');
+		self::assertStringNotContainsString('sensitive', $received);
+		self::assertStringNotContainsString('welcome', $received);
+		self::assertSame([], $this->cluster->getChannelSubscribers('secret'));
+		$client->close();
+		$server->close();
+	}
+
 	public function testOnOpenHandlerCanSubscribeTheClient()
 	{
 		[$connection, $stream] = $this->makeConnection();
@@ -341,11 +503,24 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame([['type' => 'ack', 'id' => 'p1']], $this->replies($stream), 'A request with an id gets exactly one ack.');
 	}
 
-	public function testAnIntegerIdOutsideTheIntegerRangeIsEchoedAsAString()
+	public function testAnIntegerIdOutsideTheIntegerRangeIsRefused()
 	{
 		[$connection, $stream] = $this->openClient();
-		$this->request($connection, '{"type":"ping","id":123456789012345678901234567890}');
-		self::assertSame([['type' => 'ack', 'id' => '123456789012345678901234567890']], $this->replies($stream));
+		$this->request($connection, '{"type":"ping","id":9223372036854775807}');
+		self::assertSame([['type' => 'ack', 'id' => PHP_INT_MAX]], $this->replies($stream), 'The largest 64-bit integer is an id, echoed as the integer.');
+
+		foreach (['9223372036854775808', '123456789012345678901234567890', '-9223372036854775809'] as $id) {
+			$this->request($connection, '{"type":"ping","id":' . $id . '}');
+			$replies = $this->replies($stream);
+			self::assertCount(1, $replies);
+			self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $replies[0]['code'], 'An integer past 64 bits is not an id.');
+			self::assertArrayNotHasKey('id', $replies[0], 'It is echoed neither as a number nor as a string.');
+		}
+
+		$this->request($connection, '{"type":"publish","data":"\\ud800","id":123456789012345678901234567890}');
+		$replies = $this->replies($stream);
+		self::assertSame(TWebSocketPubSubException::BAD_REQUEST, $replies[0]['code']);
+		self::assertArrayNotHasKey('id', $replies[0], 'The scan of an undecodable frame refuses the same id.');
 	}
 
 	public function testAStringIdIsLimitedInBytes()
@@ -452,6 +627,9 @@ class TWebSocketPubSubHandlerTest extends TestCase
 			'too long' => [str_repeat('a', 129)],
 			'not a string' => [42],
 			'unicode' => ['räum'],
+			'trailing newline' => ["room:42\n"],
+			'longest, with a trailing newline' => [str_repeat('c', 128) . "\n"],
+			'only a newline' => ["\n"],
 		];
 	}
 
@@ -582,35 +760,131 @@ class TWebSocketPubSubHandlerTest extends TestCase
 		self::assertSame([['type' => 'message', 'channel' => 'room', 'from' => $clientId, 'data' => 'QUIET']], $this->replies($stream));
 	}
 
+	/** @return array<string, array{0: string, 1?: string}> The `data` a client sends, and its canonical text when that differs. */
 	public static function relayedData(): array
 	{
 		return [
 			'empty object' => ['{}'],
 			'object with list keys' => ['{"0":"x","1":"y"}'],
 			'big integer' => ['123456789012345678901234567890'],
-			'nested, with whitespace' => ['{ "a" : [ 1.0, -0, {} ], "b\\u0041": "\\u00e9\\"/" }'],
+			'integers at and past the 64-bit range' => ['[9223372036854775807,9223372036854775808,-9223372036854775808,-9223372036854775809]'],
 			'string' => ['"a,b}c"'],
 			'empty list' => ['[]'],
+			'literals' => ['[true,false,null]'],
+			'nested empties' => ['{"a":{},"b":[],"c":[[],{}],"":0}'],
+			'member order' => ['{"z":1,"a":2,"10":3,"9":4}'],
+			'a name that starts with NUL' => ['{"\\u0000a":1}'],
+			'nested, with whitespace' => ['{ "a" : [ 1.0, -0, {} ], "b\\u0041": "\\u00e9\\"/" }', '{"a":[1.0,0,{}],"bA":"é\\"/"}'],
+			'whitespace of every kind' => [" {\t\"a\"\r\n:\n[ 1 ,\t2 ] , \"b\" : { } } ", '{"a":[1,2],"b":{}}'],
+			'padding' => ['{"text":"ok"' . str_repeat(' ', 60000) . '}', '{"text":"ok"}'],
+			'duplicate members' => ['{"text":"' . str_repeat('A', 60000) . '","n":1,"text":"ok"}', '{"text":"ok","n":1}'],
+			'duplicate members, one escaped' => ['{"a":1,"\\u0061":[2],"b":{"c":1,"c":2}}', '{"a":[2],"b":{"c":2}}'],
+			'number spellings' => ['[1.50,1e2,1E+2,-0.0,0.1,1E-7,10.0]', '[1.5,100.0,100.0,-0.0,0.1,1.0e-7,10.0]'],
+			'a padded fraction' => ['1.' . str_repeat('0', 60000), '1.0'],
+			'string escapes' => ['"\\u0041\\/\\n\\ud83c\\udf0d\\u00e9\\u2028"', '"A/\\n🌍é\\u2028"'],
 		];
 	}
 
 	/** @dataProvider relayedData */
-	public function testAPublishRelaysTheDataAsTheClientSentIt(string $data)
+	public function testAPublishRelaysTheDataInCanonicalJson(string $data, ?string $canonical = null)
 	{
+		$canonical ??= $data;
 		$this->handler->setAllowClientPublish(true);
 		[$alice, $aliceOut, $aliceId] = $this->openClient();
 		[$bob, $bobOut] = $this->openClient();
 		$this->request($bob, ['type' => 'subscribe', 'channel' => 'room']);
 		$this->frames($bobOut);
+		$seen = $seenJson = null;
+		$this->handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) use (&$seen, &$seenJson) {
+			$seen = $param->getData();
+			$seenJson = $param->getDataJson();
+		});
 		$this->request($alice, '{"type":"publish","channel":"room","data": ' . $data . ' ,"id":"p"}');
 		$frames = $this->frames($bobOut);
 		self::assertCount(1, $frames);
-		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $data . '}', $frames[0]->getPayload());
+		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $canonical . '}', $frames[0]->getPayload());
 		self::assertSame([['type' => 'ack', 'id' => 'p']], $this->replies($aliceOut));
-		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $data . '}', $this->backplane->published[0]->getPayload(), 'Other nodes get the same frame.');
+		self::assertSame('{"type":"message","channel":"room","from":"' . $aliceId . '","data":' . $canonical . '}', $this->backplane->published[0]->getPayload(), 'Other nodes get the same frame.');
+		self::assertSame($seen, json_decode($canonical, true), 'The relay decodes to the Data the handlers saw.');
+		self::assertSame($canonical, $seenJson, 'The handlers are given the text that is relayed.');
 	}
 
-	public function testTheEventSeesArraysAndBigIntegersAsStrings()
+	public function testAHandlerTellsAnObjectFromAListByTheDataJson()
+	{
+		// The receivers need a list of tags; the decoded Data shows {"0":"a","1":"b"} as one.
+		$strict = function ($sender, TWebSocketPubSubEventParameter $param) {
+			$sent = json_decode((string) $param->getDataJson());
+			$param->setAllowed(array_is_list($param->getData()) && is_array($sent));
+		};
+		$this->handler->attachEventHandler('onPublish', $strict);
+		$this->handler->attachEventHandler('onSend', $strict);
+		[$alice, $aliceOut, $aliceId] = $this->openClient();
+		$this->handler->subscribe($alice, 'room');
+
+		foreach (['"type":"publish","channel":"room"', '"type":"send","to":"' . $aliceId . '"'] as $request) {
+			$this->request($alice, '{"id":1,' . $request . ',"data":{"0":"a","1":"b"}}');
+			self::assertSame(TWebSocketPubSubException::FORBIDDEN, $this->replies($aliceOut)[0]['code'], 'An object with list keys is told from a list.');
+			$this->request($alice, '{"id":2,' . $request . ',"data":["a","b"]}');
+			$frames = $this->frames($aliceOut);
+			self::assertStringEndsWith('"data":["a","b"]}', $frames[0]->getPayload());
+		}
+	}
+
+	public function testADeniedPublishIsNotWrittenInCanonicalJson()
+	{
+		// A subclass that counts the frames it encodes for relay.
+		$handler = new class () extends TWebSocketPubSubHandler {
+			public int $relays = 0;
+
+			protected function encodeRelay(TWebSocketPubSubEventParameter $param, mixed $data, string $message, ?string $channel, string $from): string
+			{
+				$this->relays++;
+				return parent::encodeRelay($param, $data, $message, $channel, $from);
+			}
+		};
+		$handler->setCluster($this->cluster);
+		$read = false;
+		$handler->attachEventHandler('onPublish', function ($sender, TWebSocketPubSubEventParameter $param) use (&$read) {
+			$param->setAllowed($param->getChannel() === 'open');
+			$text = (new \ReflectionProperty(TWebSocketPubSubEventParameter::class, '_dataJson'))->getValue($param);
+			$read = $read || is_string($text);
+		});
+		[$connection, $stream] = $this->makeConnection();
+		$handler->onOpen($connection);
+		$this->frames($stream);
+
+		$handler->onMessage($connection, '{"id":1,"type":"publish","channel":"closed","data":{ "a" : 1 }}', TWebSocketOpcode::Text);
+		self::assertSame(TWebSocketPubSubException::FORBIDDEN, $this->replies($stream)[0]['code']);
+		self::assertFalse($read, 'A handler that does not read the DataJson does not cause it to be written.');
+		self::assertSame(0, $handler->relays);
+
+		$handler->onMessage($connection, '{"id":2,"type":"publish","channel":"open","data":{ "a" : 1 }}', TWebSocketOpcode::Text);
+		self::assertSame('ack', $this->replies($stream)[0]['type']);
+		self::assertSame(1, $handler->relays);
+		self::assertSame('{"type":"message","channel":"open","from":"' . $handler->getClientId($connection) . '","data":{"a":1}}', $this->backplane->published[0]->getPayload());
+	}
+
+	public function testOnlyAPublishOrSendWithDataCarriesADataJson()
+	{
+		$this->handler->setAllowClientPublish(true);
+		[$connection, , $clientId] = $this->openClient();
+		$seen = [];
+		foreach (['onSubscribe', 'onPublish', 'onSend', 'onCall'] as $event) {
+			$this->handler->attachEventHandler($event, function ($sender, TWebSocketPubSubEventParameter $param) use (&$seen, $event) {
+				$seen[$event][] = $param->getDataJson();
+				$param->setAllowed(true);
+				$param->setResult(null);
+			});
+		}
+		$this->request($connection, '{"type":"subscribe","channel":"room"}');
+		$this->request($connection, '{"type":"publish","channel":"room"}');
+		$this->request($connection, '{"type":"publish","channel":"room","data": null }');
+		$this->request($connection, '{"type":"send","to":"' . $clientId . '","data":[ 1 ]}');
+		$this->request($connection, '{"type":"call","method":"m","params":{"a":1}}');
+		self::assertSame(['onSubscribe' => [null], 'onPublish' => [null, 'null'], 'onSend' => ['[1]'], 'onCall' => [null]], $seen);
+	}
+
+	public function testTheEventSeesArraysAndBigIntegersAsFloats()
 	{
 		$this->handler->setAllowClientPublish(true);
 		[$connection] = $this->openClient();
@@ -619,7 +893,49 @@ class TWebSocketPubSubHandlerTest extends TestCase
 			$seen = $param->getData();
 		});
 		$this->request($connection, '{"type":"publish","channel":"room","data":{"o":{},"n":123456789012345678901234567890,"i":7}}');
-		self::assertSame(['o' => [], 'n' => '123456789012345678901234567890', 'i' => 7], $seen);
+		self::assertSame(['o' => [], 'n' => 1.2345678901234568e29, 'i' => 7], $seen, 'A number stays a number: json_decode() gives an integer it cannot hold as a float.');
+	}
+
+	/** @return array<string, array{0: string, 1: ?string}> The `data` sent past a `{text: string of at most 20 bytes}` check, and what the receiver gets. */
+	public static function validatedData(): array
+	{
+		return [
+			'honest' => ['{"text":"ok"}', '{"text":"ok"}'],
+			'too long' => ['{"text":"' . str_repeat('A', 21) . '"}', null],
+			'a 20-digit number where a string is required' => ['{"text":12345678901234567890}', null],
+			'a duplicate member hiding 60,000 bytes' => ['{"text":"' . str_repeat('A', 60000) . '","text":"ok"}', '{"text":"ok"}'],
+			'60,000 spaces of padding' => ['{"text":"ok"' . str_repeat(' ', 60000) . '}', '{"text":"ok"}'],
+			'escapes six times the length checked' => ['{"text":"' . str_repeat('\\u0041', 20) . '"}', '{"text":"' . str_repeat('A', 20) . '"}'],
+		];
+	}
+
+	/** @dataProvider validatedData */
+	public function testAReceiverGetsOnlyWhatAValidatingHandlerSaw(string $data, ?string $relayed)
+	{
+		// The handler inspects the Data and allows it unchanged.
+		$validate = function ($sender, TWebSocketPubSubEventParameter $param) {
+			$data = $param->getData();
+			$param->setAllowed(is_array($data) && array_keys($data) === ['text'] && is_string($data['text']) && strlen($data['text']) <= 20);
+		};
+		$this->handler->attachEventHandler('onPublish', $validate);
+		$this->handler->attachEventHandler('onSend', $validate);
+		[$alice, $aliceOut, $aliceId] = $this->openClient();
+		[$bob, $bobOut, $bobId] = $this->openClient();
+		$this->handler->subscribe($bob, 'room');
+
+		foreach (['"type":"publish","channel":"room"' => ',"channel":"room"', '"type":"send","to":"' . $bobId . '"' => ''] as $request => $channel) {
+			$this->request($alice, '{"id":1,' . $request . ',"data":' . $data . '}');
+			$reply = $this->replies($aliceOut)[0];
+			$frames = $this->frames($bobOut);
+			if ($relayed === null) {
+				self::assertSame(TWebSocketPubSubException::FORBIDDEN, $reply['code']);
+				self::assertSame([], $frames);
+			} else {
+				self::assertSame('ack', $reply['type']);
+				self::assertCount(1, $frames);
+				self::assertSame('{"type":"message"' . $channel . ',"from":"' . $aliceId . '","data":' . $relayed . '}', $frames[0]->getPayload());
+			}
+		}
 	}
 
 	public function testOfDuplicateDataMembersTheDecodedOneIsRelayed()
