@@ -4,10 +4,10 @@ A PRADO 4 extension providing WebSockets: RFC 6455 over HTTP/1.1, RFC 8441 over 
 
 ## Version
 
-- **Current version: v1.1.0** (released 2026-09-22; v1.0.0 and v1.0.1 before it). Targets PRADO 4.4 (`pradosoft/prado` `master`, aliased `4.4.x-dev`). Release notes live in [CHANGELOG.md](CHANGELOG.md).
+- **Current version: v1.2.0** (released 2026-11-10; v1.0.0, v1.0.1 and v1.1.0 before it). Targets PRADO 4.4 (`pradosoft/prado` `master`, aliased `4.4.x-dev`). Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - Symbols released through v1.1.0 carry **no `@since` tags**. A public symbol added after v1.1.0 gets `@since` with the version it ships in.
-- Record every user-visible change under an `## [Unreleased]` heading in `CHANGELOG.md` as it lands.
-- Supported and CI-tested PHP: **8.2, 8.3, 8.4, 8.5** (PRADO 4.4 requires 8.2; 8.1 was dropped after v1.1.0).
+- Record every user-visible change under an `## [Unreleased]` heading in `CHANGELOG.md` as it lands (add the heading above the latest release when the first change after it lands).
+- Supported and CI-tested PHP: **8.2, 8.3, 8.4, 8.5** (PRADO 4.4 requires 8.2; 8.1 was dropped in v1.2.0).
 
 ## Key facts
 

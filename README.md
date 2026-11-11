@@ -14,7 +14,7 @@ The standalone `TWebSocketServer` owns its listening socket end to end, so it co
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5. PHP 8.2 is the minimum from 1.2.0 (unreleased); the released v1.1.0 runs on PHP 8.1 – 8.5 |
+| PHP 8.2 – 8.5 | required | The runtime; HTTP/1.1 WebSockets need only this and PRADO. CI runs every minor from 8.2 through 8.5. PHP 8.2 is the minimum from 1.2.0; v1.1.0 runs on PHP 8.1 – 8.5 |
 | PRADO Framework `^4.4` | required | `TSocketServer`, `TSocketStream`, the `TStream` IO layer, `TComponent`/`TService`/`TModule` |
 | `belisoful/prado-http2` `^1.5` | suggested | The HTTP/2 (RFC 8441) stack; without it the server serves HTTP/1.1 only. Releases before 1.5.0 are refused (a Composer `conflict`): 1.4.0 added the limit on a received header block, and 1.5.0 the stream limit and the stream reset this server relies on |
 | `ext-ffi` | suggested | Required by `prado-http2` to bind `libnghttp2` |
@@ -42,7 +42,7 @@ PRADO 4.4 is not yet released, so the extension depends on its development branc
 
 Release notes and upgrade steps between versions are in [CHANGELOG.md](CHANGELOG.md).
 
-This README documents the development branch, which will be 1.2.0. The v1.1.0 release on Packagist lacks everything [CHANGELOG.md](CHANGELOG.md) lists under Unreleased; the larger additions, browser pub/sub among them, are also marked **1.2.0 (unreleased)** here.
+This README documents v1.2.0. The larger additions since v1.1.0, browser pub/sub among them, are marked **Since 1.2.0**.
 
 ## What it provides
 
@@ -72,10 +72,10 @@ This README documents the development branch, which will be 1.2.0. The v1.1.0 re
 | `TFileBackplane` | Shared-directory backplane for one host or a shared filesystem (dev/small clusters); owner-only spool |
 | `TRedisBackplane` | Redis backplane (per-node inbox lists + a presence hash) for multi-host scaling (needs `ext-redis`) |
 | `TMeshBackplane` | Peer-to-peer gossip backplane over server-to-server WebSocket links; shared-secret authenticated |
-| `IWebSocketClusterAware` | A handler the module hands its cluster to. **1.2.0 (unreleased)** |
-| `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster. **1.2.0 (unreleased)** |
-| `TWebSocketPubSubEventParameter` / `TWebSocketPubSubException` | The pub/sub request event parameter, and the rejection carrying the reply code. **1.2.0 (unreleased)** |
-| `prado-pubsub.js` | The dependency-free browser client of `prado.pubsub.v1`. **1.2.0 (unreleased)** |
+| `IWebSocketClusterAware` | A handler the module hands its cluster to. **Since 1.2.0** |
+| `TWebSocketPubSubHandler` | Serves the `prado.pubsub.v1` subprotocol: browser subscribe/publish/send/call over JSON, routed through the cluster. **Since 1.2.0** |
+| `TWebSocketPubSubEventParameter` / `TWebSocketPubSubException` | The pub/sub request event parameter, and the rejection carrying the reply code. **Since 1.2.0** |
+| `prado-pubsub.js` | The dependency-free browser client of `prado.pubsub.v1`. **Since 1.2.0** |
 
 ## Architecture
 
@@ -277,7 +277,7 @@ Backplane choices:
 
 ## Pub/sub for browsers (`prado.pubsub.v1`)
 
-**1.2.0 (unreleased).** Pub/sub is on the development branch; the v1.1.0 release does not include it.
+**Since 1.2.0.**
 
 A browser needs no library to open a WebSocket, but the cluster's `subscribe()`/`publish()` are server-side calls. `TWebSocketPubSubHandler` defines a small JSON subprotocol over them, and `prado-pubsub.js` is its browser client.
 

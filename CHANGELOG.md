@@ -3,7 +3,9 @@
 All notable changes to `belisoful/prado-websocket` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.2.0] - 2026-11-10
+
+This release adds pub/sub for browsers (the `prado.pubsub.v1` subprotocol, a browser client and a chat example), runs on PRADO 4.4's event loop and monotonic clock, and lands two audits of hardening across the server, the protocol layer, HTTP/2 and the cluster backplanes. It raises two minimums, PHP 8.2 and `belisoful/prado-http2` 1.5 for HTTP/2, and changes some behavior; see [Upgrading from 1.1.0](#upgrading-from-110).
 
 ### Added
 - Pub/sub messaging for browsers: the `prado.pubsub.v1` subprotocol, served by `TWebSocketPubSubHandler` (`Prado\IO\Socket\WebSocket\PubSub\`). Clients `subscribe`, `unsubscribe`, `publish`, `send` (direct message), `call` (application RPC) and `ping` over JSON text frames, routed through the cluster. The handler raises `onSubscribe`, `onPublish`, `onSend` and `onCall` with a `TWebSocketPubSubEventParameter`; client publish and send are denied unless `AllowClientPublish`/`AllowClientSend` or an event handler allows them, and `setAllowed(false)` denies any of the four. `MaxSubscriptions` (default 64), `MaxFrameSize` (default 65536 bytes; a larger request is refused with `limit` before it is decoded, and the `welcome` announces it as `maxFrame`) and `Heartbeat` (default 25 s) configure it; `publish()`, `sendTo()`, `broadcast()`, `subscribe()` and `encodeMessage()` serve application code. A request is refused with a `TWebSocketPubSubException` reply code.
@@ -117,7 +119,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - CI runs php-cs-fixer and phpstan from `vendor/bin` at the pinned versions and adds a PHP 8.4 leg against the Packagist `belisoful/prado-http2` release. The Autobahn job builds the same prado-http2 revision as the unit jobs, pins its Docker image by digest, has a 40-minute timeout with step limits on the image pull and the fuzzingclient run, and loads ffi. Workflows have read-only permissions and cancel superseded runs.
 - `.gitattributes` keeps tests, CI and tool configs out of the Composer dist; `agents/` and `examples/` ship.
 - `.nvmrc` pins Node 24, as PRADO does.
-- README marks pub/sub and the PHP 8.2 minimum as 1.2.0 (unreleased), and its `tryDecode()` example uses the returned `frame` and `length`.
+- README marks what is new since 1.2.0, and its `tryDecode()` example uses the returned `frame` and `length`.
 - Runs on PRADO's event loop API (pradosoft/prado#1377). `TSocketReactor` is now an `IEventLoop`: `TWebSocketServer` schedules its handshake and close deadlines with `delay()`, its idle scan with `repeat()`, and cancels them with `cancel()`, so timer identifiers are strings. A deadline timer that fires before the server's clock reaches the deadline re-arms itself, and a server that moves to another reactor with `setReactor()` re-arms its pending handshake and close deadlines there.
 - `TWebSocketServer` measures its handshake, close and idle timeouts on a monotonic clock, as PRADO's timers now do (pradosoft/prado#1440), so a wall-clock step neither expires nor postpones them. The server uses `TMonotonicClockAwareTrait` (`getMonotonicClock()`, `setMonotonicClock()`) and shares the clock with the reactor it creates. Before, the timeouts read the server's wall clock.
 - `config/errorMessages.txt` entries are ICU MessageFormat patterns, as PRADO now formats them with `MessageFormatter` (pradosoft/prado#1437). A quoted placeholder is written `''{0}''`; the single-quoted `'{0}'` the file used rendered a literal `{0}` in every message that named a value. A unit test checks that each entry is a valid pattern that renders every argument, that the file defines exactly the codes `src/` throws, and that each message is a sentence.
@@ -142,7 +144,7 @@ All notable changes to `belisoful/prado-websocket` are recorded here. The format
 - composer.json: the `ext-sockets` suggestion is removed, as nothing in the extension uses it; `ext-posix` is suggested, for `TFileBackplane`'s owner check of its spool directory; `lib-nghttp2` names 1.60.0 as the minimum. The description and keywords name RFC 7692, clustering and pub/sub, and a `support` block links the issue tracker and the source.
 - `playwright.config.js` documents `npx` (what CI and the composer scripts run) and `bunx`; `playwright:install` passes `--with-deps`.
 
-### Upgrading
+### Upgrading from 1.1.0
 - Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
 - Requires PRADO 4.4 master with the event loop API (pradosoft/prado#1377, #1419). Code that schedules on `TWebSocketServer::getReactor()` uses `delay()`, `repeat()` and `cancel()` in place of `after()`/`scheduleAt()`, `every()` and `cancelTimer()`. Callbacks given to `register()` are called as `(string $callbackId, IResource $source)`.
 - Requires PRADO master with the monotonic clock (pradosoft/prado#1440). `TWebSocketServer::setClock()` no longer moves the server's timeouts; a test that advanced them through a `TMockClock` sets a `TMonotonicClock` subclass with `$server->setMonotonicClock($clock)` instead, before the reactor is created.
@@ -242,7 +244,7 @@ This release resyncs the extension with PRADO 4.4 development HEAD and lands a f
 ### Added
 - Initial release: RFC 6455 WebSockets over HTTP/1.1, RFC 8441 over HTTP/2 through `belisoful/prado-http2`, RFC 7692 permessage-deflate, a standalone `TWebSocketServer` that selects HTTP/1.1 or HTTP/2 per connection, a client connection, the `websocket` PRADO service, and a clustering layer (`TWebSocketModule`, `TWebSocketCluster`) with Null, File, Redis and Mesh backplanes.
 
-[Unreleased]: https://github.com/belisoful/prado-websocket/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/belisoful/prado-websocket/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/belisoful/prado-websocket/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/belisoful/prado-websocket/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/belisoful/prado-websocket/releases/tag/v1.0.0
