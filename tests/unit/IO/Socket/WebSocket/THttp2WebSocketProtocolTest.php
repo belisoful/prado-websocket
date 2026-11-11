@@ -423,24 +423,30 @@ class THttp2WebSocketProtocolTest extends TestCase
 		}
 	}
 
+	/** @var int The streams the server's session held when the last {@see attempt()} ended. */
+	private int $_heldAfterAttempt = 0;
+
 	/**
-	 * Asserts that a malformed request opened nothing and was refused either by nghttp2 itself (a
-	 * reset with no response, the adapter never asked) or by the adapter (a 400).  Which of the two
-	 * happens depends on the libnghttp2 release; the adapter's own check is asserted separately.
+	 * Asserts that a malformed request opened nothing and was refused either by nghttp2 itself (no
+	 * response, the adapter never asked, no stream left in the session) or by the adapter (a 400).
+	 * Which of the two happens, and how nghttp2 refuses, depends on the libnghttp2 release (1.68 and
+	 * 1.70 differ); the adapter's own check is asserted separately.  A failure message carries the
+	 * whole outcome.
 	 * @param array{status: ?string, reset: bool, invalid: int[], connections: int} $result What {@see attempt()} reported.
 	 * @param ProbeHttp2WebSocketProtocol $protocol The protocol that served the request.
 	 * @param string $message What was sent.
 	 */
-	private static function assertRefusedByTheLibraryOrTheAdapter(array $result, ProbeHttp2WebSocketProtocol $protocol, string $message): void
+	private function assertRefusedByTheLibraryOrTheAdapter(array $result, ProbeHttp2WebSocketProtocol $protocol, string $message): void
 	{
-		self::assertSame(0, $result['connections'], "$message opens no WebSocket.");
-		self::assertTrue($result['reset'], "$message has its stream ended.");
+		$outcome = ' Outcome: ' . json_encode($result + ['held' => $this->_heldAfterAttempt, 'rejections' => $protocol->rejections]) . ', libnghttp2 ' . TNgHttp2::version() . '.';
+		self::assertSame(0, $result['connections'], "$message opens no WebSocket." . $outcome);
+		self::assertSame(0, $this->_heldAfterAttempt, "$message leaves no stream in the server's session." . $outcome);
 		if ($result['status'] === null) {
-			self::assertNotSame([], $result['invalid'], "$message is refused by nghttp2 when the adapter does not answer it.");
-			self::assertSame([], $protocol->rejections, "$message is not also refused by the adapter.");
+			self::assertSame([], $protocol->rejections, "$message is refused by nghttp2, so the adapter is not asked." . $outcome);
 		} else {
-			self::assertSame('400', $result['status'], "$message is answered with 400.");
-			self::assertSame(['400'], $protocol->rejections);
+			self::assertSame('400', $result['status'], "$message is answered with 400." . $outcome);
+			self::assertTrue($result['reset'], "$message has its stream ended." . $outcome);
+			self::assertSame(['400'], $protocol->rejections, $outcome);
 		}
 	}
 
@@ -450,7 +456,8 @@ class THttp2WebSocketProtocolTest extends TestCase
 	 * @param array<string, string> $headers The request headers.
 	 * @return array{status: ?string, reset: bool, invalid: int[], connections: int} The response
 	 *   status the client read (null for none), whether the client saw the stream close, the nghttp2
-	 *   errors of the frames the server session refused, and the server's live connections.
+	 *   errors of the frames the server session refused, and the server's live connections.  The
+	 *   streams the server's session still holds are left in {@see $_heldAfterAttempt}.
 	 */
 	private function attempt(THttp2WebSocketProtocol $protocol, array $headers): array
 	{
@@ -471,7 +478,13 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$client->request($headers);
 		$protocol->receive($client->send());
 		$client->receive($protocol->send());
+		try {
+			$this->exchange($protocol, $client);   // whatever either side still has to say
+		} catch (\Throwable $e) {
+			// A session nghttp2 has ended refuses more input; what the client saw so far stands.
+		}
 		$result = ['status' => $status, 'reset' => $reset, 'invalid' => $invalid, 'connections' => count($protocol->getConnections())];
+		$this->_heldAfterAttempt = count((new \ReflectionMethod(TH2Session::class, 'getStreamsDirect'))->invoke($protocol->getSession()));
 		$protocol->shutdown();
 		$client->close();
 		return $result;
@@ -485,11 +498,11 @@ class THttp2WebSocketProtocolTest extends TestCase
 			unset($headers[$pseudo]);
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 			$result = $this->attempt($protocol, $headers);
-			self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT without $pseudo");
+			$this->assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT without $pseudo");
 
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 			$result = $this->attempt($protocol, [$pseudo => ''] + $this->connectHeaders());
-			self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT with an empty $pseudo");
+			$this->assertRefusedByTheLibraryOrTheAdapter($result, $protocol, "A CONNECT with an empty $pseudo");
 
 			// The adapter's own check (RFC 8441 §5) answers 400 when such a request does reach it: with the header absent...
 			$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
@@ -529,7 +542,7 @@ class THttp2WebSocketProtocolTest extends TestCase
 		// nghttp2 refuses `:protocol` on a method other than CONNECT itself; the adapter's check covers it all the same.
 		$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 		$result = $this->attempt($protocol, [':method' => 'POST'] + $this->connectHeaders());
-		self::assertRefusedByTheLibraryOrTheAdapter($result, $protocol, 'A POST with `:protocol`');
+		$this->assertRefusedByTheLibraryOrTheAdapter($result, $protocol, 'A POST with `:protocol`');
 		$protocol = new ProbeHttp2WebSocketProtocol(new TWebSocketHandler());
 		$protocol->recordOnly = true;
 		$protocol->accept(new TH2Stream($protocol->getSession(), 1, [':method' => 'POST'] + $this->connectHeaders()));
