@@ -8,6 +8,7 @@ use Prado\IO\Socket\WebSocket\Cluster\TFileBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Stream\TBufferStream;
 use Prado\Prado;
 use Prado\Test\Unit\IO\Socket\WebSocket\TTestMonotonicClock;
@@ -42,8 +43,9 @@ class TFileBackplaneTest extends TestCase
 		if (!is_dir($dir)) {
 			return;
 		}
-		foreach (glob($dir . DIRECTORY_SEPARATOR . '*') ?: [] as $path) {
-			is_dir($path) ? $this->removeTree($path) : @unlink($path);
+		foreach (array_diff(scandir($dir) ?: [], ['.', '..']) as $name) {   // listed, not matched: a test directory may hold pattern characters
+			$path = $dir . DIRECTORY_SEPARATOR . $name;
+			is_dir($path) && !is_link($path) ? $this->removeTree($path) : @unlink($path);
 		}
 		@rmdir($dir);
 	}
@@ -500,5 +502,166 @@ class TFileBackplaneTest extends TestCase
 		$node1->unregister($conn);
 		$node2->tick();
 		self::assertArrayNotHasKey($id, $node2->presence(), 'A departure propagates to the other node.');
+	}
+
+	public function testOpenRefusesASymlinkedLog()
+	{
+		mkdir($this->dir . DIRECTORY_SEPARATOR . TFileBackplane::PRESENCE_DIR, TFileBackplane::DIR_MODE, true);
+		chmod($this->dir, TFileBackplane::DIR_MODE);
+		$target = $this->dir . '_victim';
+		file_put_contents($target, "untouched\n");
+		$log = $this->dir . DIRECTORY_SEPARATOR . TFileBackplane::LOG_FILE;
+		symlink($target, $log);   // planted where the log goes
+		try {
+			$backplane = new TFileBackplane();
+			$backplane->setDirectory($this->dir);
+			$cluster = new TWebSocketCluster('n1', $backplane);
+			try {
+				$cluster->open();
+				self::fail('A log that is a symbolic link is refused.');
+			} catch (TConfigurationException $e) {
+				self::assertSame('websocket_backplane_path_unsafe', $e->getErrorCode());
+				self::assertStringContainsString($log, $e->getMessage());
+			}
+			self::assertSame("untouched\n", file_get_contents($target), 'Nothing is appended through the link.');
+		} finally {
+			@unlink($log);
+			@unlink($target);
+		}
+	}
+
+	public function testOpenRefusesASpoolOwnedByAnotherUser()
+	{
+		$backplane = new class () extends TFileBackplane {
+			public ?int $user = null;
+
+			protected function getProcessUserId(): ?int
+			{
+				return $this->user ?? parent::getProcessUserId();
+			}
+		};
+		$backplane->setDirectory($this->dir);
+		$cluster = new TWebSocketCluster('n1', $backplane);
+		$cluster->open();   // creates the spool, owned by this process
+		$cluster->close();
+		$owner = fileowner($this->dir);
+		self::assertIsInt($owner);
+
+		$backplane->user = $owner + 1;   // this process now runs as another user than the spool's owner
+		try {
+			$cluster->open();
+			self::fail('A spool another user owns is refused.');
+		} catch (TConfigurationException $e) {
+			self::assertSame('websocket_backplane_directory_insecure', $e->getErrorCode());
+		}
+		$backplane->user = $owner;
+		$cluster->open();
+		self::assertFileExists($this->presenceFile($cluster->register($this->makeConnection()[0])), 'The owner opens it.');
+	}
+
+	public function testPresenceIsNotWrittenThroughASymlink()
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		$cluster = new TWebSocketCluster('n1', $backplane);
+		$cluster->open();
+		$target = $this->dir . '_victim';
+		file_put_contents($target, 'untouched');
+		symlink($target, $this->presenceFile('planted'));   // planted where a client's presence file goes
+		try {
+			$backplane->putPresence('planted', ['node' => 'n1', 'user' => 'mallory']);
+			self::assertSame('untouched', file_get_contents($target), 'The metadata is not written through the link.');
+			self::assertTrue(is_link($this->presenceFile('planted')), 'The link is left as found.');
+			$log = (string) file_get_contents($this->dir . DIRECTORY_SEPARATOR . TFileBackplane::LOG_FILE);
+			self::assertStringNotContainsString('mallory', $log, 'Nor is the client announced.');
+		} finally {
+			@unlink($this->presenceFile('planted'));
+			@unlink($target);
+		}
+	}
+
+	/** @return array<string, array{0: string}> */
+	public static function patternDirectories(): array
+	{
+		return [
+			'a bracket expression' => ['ws[prod]'],
+			'braces' => ['ws{a,b}'],
+			'wildcards' => ['ws*?'],
+		];
+	}
+
+	/**
+	 * @dataProvider patternDirectories
+	 * @param string $name
+	 */
+	public function testASpoolPathIsNotReadAsAPattern(string $name)
+	{
+		$parent = $this->dir;
+		$this->dir .= DIRECTORY_SEPARATOR . $name;
+		$clock = new TMockClock();
+		$clock->setMicrotime(1000.0);
+		$n1 = $this->makeClockedNode('n1', $clock);
+		$clientId = $n1->register($this->makeConnection()[0]);
+		self::assertFileExists($this->presenceFile($clientId));
+
+		$n2 = $this->makeClockedNode('n2', $clock);   // a late joiner seeds from the presence files
+		self::assertArrayHasKey($clientId, $n2->presence(), 'The presence files are listed whatever characters the path holds.');
+
+		$this->advance($clock, 2 * 30 + 1);   // n1 crashed: its file goes stale
+		$n2->tick();
+		self::assertFileDoesNotExist($this->presenceFile($clientId), 'And a stale one is reaped.');
+		self::assertArrayNotHasKey($clientId, $n2->presence());
+		$this->dir = $parent;   // tearDown removes the whole tree
+	}
+
+	public function testAClientIdThatStartsWithADotIsSeeded()
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		new TWebSocketCluster('.hidden', $backplane);
+		$backplane->open();
+		$backplane->putPresence('.hidden-1', ['node' => '.hidden']);
+		$late = $this->makeNode('n2');
+		self::assertArrayHasKey('.hidden-1', $late->presence(), 'A presence file whose name starts with a dot is listed.');
+	}
+
+	public function testUnencodablePresenceMetadataIsRefusedAndLeavesNoFile()
+	{
+		$n1 = $this->makeNode('n1');
+		$n2 = $this->makeNode('n2');
+		$log = $this->dir . DIRECTORY_SEPARATOR . TFileBackplane::LOG_FILE;
+		$size = filesize($log);
+		try {
+			$n1->register($this->makeConnection()[0], ['score' => NAN]);
+			self::fail('Metadata that cannot be encoded is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_envelope_unencodable', $e->getErrorCode());
+		}
+		clearstatcache();
+		self::assertSame([], array_diff(scandir($this->dir . DIRECTORY_SEPARATOR . TFileBackplane::PRESENCE_DIR), ['.', '..']), 'No presence file is written.');
+		self::assertSame($size, filesize($log), 'Nothing is logged.');
+		self::assertSame(0, $n1->getLocalClientCount(), 'The client is not registered.');
+
+		$clientId = $n1->register($this->makeConnection()[0], ['name' => "caf\xe9"]);   // a byte that is not UTF-8
+		$n2->tick();
+		self::assertSame("caf\u{FFFD}", $n2->presence()[$clientId]['name'] ?? null);
+		self::assertSame("caf\u{FFFD}", json_decode((string) file_get_contents($this->presenceFile($clientId)), true)['name'] ?? null, 'The presence file holds what the envelope carries.');
+	}
+
+	public function testCloseClearsTheBacklog()
+	{
+		$backplane = new TFileBackplane();
+		$backplane->setDirectory($this->dir);
+		$backplane->setDrainLimit(1);
+		$n1 = new TWebSocketCluster('n1', $backplane);
+		$n1->open();
+		$n2 = $this->makeNode('n2');
+		$n2->broadcast('one');
+		$n2->broadcast('two');
+		$n2->broadcast('three');
+		$n1->tick();
+		self::assertTrue($backplane->getHasBacklog());
+		$n1->close();
+		self::assertFalse($backplane->getHasBacklog(), 'A closed backplane has nothing left to read.');
 	}
 }

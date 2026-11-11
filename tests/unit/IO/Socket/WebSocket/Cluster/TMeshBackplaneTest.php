@@ -76,6 +76,17 @@ class RecordingMesh extends TMeshBackplane
 
 class TMeshBackplaneTest extends TestCase
 {
+	/** @var TSocketStream[] The listeners a test dials, held so no other process takes their ports. */
+	private array $listeners = [];
+
+	protected function tearDown(): void
+	{
+		foreach ($this->listeners as $listener) {
+			$listener->close();
+		}
+		$this->listeners = [];
+	}
+
 	/** @return array{0: TMeshBackplane, 1: SpyCluster} A mesh node and its spy coordinator. */
 	private function makeNode(string $id): array
 	{
@@ -121,13 +132,15 @@ class TMeshBackplaneTest extends TestCase
 		return [$rawA, $rawB];
 	}
 
-	/** @return string A `tcp://` URI on a loopback port the OS chose and nothing listens on. */
-	private function closedPortUri(): string
+	/**
+	 * @return string A `tcp://` URI on a loopback port the OS chose, where a listener takes connections
+	 *   into its backlog and never answers.  A dial to it stays in flight until its deadline.  The
+	 *   listener is held until the test ends, so the port cannot pass to another process.
+	 */
+	private function unansweredUri(): string
 	{
-		$listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
-		$uri = 'tcp://127.0.0.1:' . $listener->getLocalAddress()->getPort();
-		$listener->close();
-		return $uri;
+		$this->listeners[] = $listener = TSocketStream::bind('tcp://127.0.0.1:0', STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+		return 'tcp://127.0.0.1:' . $listener->getLocalAddress()->getPort();
 	}
 
 	/** @return array{0: TWebSocketCluster, 1: TMeshBackplane} A coordinator on a mesh backplane. */
@@ -274,7 +287,7 @@ class TMeshBackplaneTest extends TestCase
 		$b->tick();
 
 		$types = array_map(fn ($e) => $e->getType(), $spyB->received);
-		self::assertSame([TWebSocketEnvelope::NODE_UP, TWebSocketEnvelope::PRESENCE_SET], $types, 'The announce precedes the presence, even when the node advertises no URI.');
+		self::assertSame([TWebSocketEnvelope::NODE_UP, TWebSocketEnvelope::PRESENCE_SET, TWebSocketEnvelope::NODE_UP], $types, 'The announce precedes the presence, even when the node advertises no URI, and another closes it.');
 		self::assertNotSame('', $spyB->received[0]->getMeta()['incarnation'] ?? '', 'The announce carries the incarnation.');
 	}
 
@@ -762,18 +775,16 @@ class TMeshBackplaneTest extends TestCase
 		$b->tick();
 
 		self::assertSame(0, $b->getPeerCount(), 'A peer that reflects the challenge is dropped.');
-		$answers = [];
-		try {
-			foreach ($attacker->feed($rawAtk->read(65536)) as $message) {
-				$envelope = TWebSocketEnvelope::decode($message);
-				if ($envelope !== null && $envelope->getType() === TWebSocketEnvelope::AUTH_RESPONSE) {
-					$answers[] = $envelope->getPayload();
-				}
-			}
-		} catch (\Throwable $e) {
-			// The link was closed under the attacker; only the frames before the close matter.
+		// B closed the link under the attacker.  What B sent is decoded by a connection over a buffer,
+		// which echoes B's Close into the buffer, so the decoding cannot fail for the closed socket.
+		$sent = $rawAtk->read(65536);
+		self::assertNotSame('', $sent, 'B sent its Close frame.');
+		$types = [];
+		foreach ((new TWebSocketConnection(new TBufferStream(), true))->feed($sent) as $message) {
+			$types[] = TWebSocketEnvelope::decode($message)?->getType();
 		}
-		self::assertSame([], $answers, 'B never signs a nonce it issued itself.');
+		self::assertNotContains(TWebSocketEnvelope::AUTH_RESPONSE, $types, 'B never signs a nonce it issued itself.');
+		self::assertSame([], $types, 'B sends the reflecting peer nothing but the Close.');
 	}
 
 	public function testAnswerClaimingTheIssuersOwnIdIsRefused()
@@ -862,7 +873,7 @@ class TMeshBackplaneTest extends TestCase
 		$rawA->setBlocking(false);
 		$rawB->setBlocking(false);
 		$a->addPeer(new TWebSocketConnection($rawA, false), $rawA);
-		$uriA = $this->closedPortUri();
+		$uriA = $this->unansweredUri();
 		$b->addPeer(new TWebSocketConnection($rawB, true), $rawB, $uriA);   // B dialed A at this URI
 		for ($round = 0; $round < 4; $round++) {
 			$a->tick();   // mutual verification, then A's first heartbeat proves it alive to B
@@ -888,7 +899,7 @@ class TMeshBackplaneTest extends TestCase
 		$clock->setSeconds(1000.0);
 		[$mesh] = $this->makeSecretNode('A', 'clustersecret');
 		$mesh->setMonotonicClock($clock);
-		$mesh->setPeers([$this->closedPortUri()]);   // nothing listens there
+		$mesh->setPeers([$this->unansweredUri()]);   // nothing answers there
 		$mesh->setTimeout(2);
 		$mesh->open();
 		self::assertSame(1, $mesh->getPendingCount(), 'The seed is dialed on open.');
@@ -909,14 +920,14 @@ class TMeshBackplaneTest extends TestCase
 	{
 		[$b, , $peer] = $this->verifiedPeer('A');
 		// A relays C's announce first: B must dial C, not bind C's URI to A's link.
-		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => $this->closedPortUri()]))->encode());
+		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'C', '', null, null, ['uri' => $this->unansweredUri()]))->encode());
 		$b->tick();
 		self::assertSame(1, $b->getPendingCount(), 'A distant node announced through the peer is dialed.');
 		// Then A announces itself: that binds to the link, so B never dials A's URI.
-		$uriA = $this->closedPortUri();
+		$uriA = $this->unansweredUri();
 		$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'A', '', null, null, ['uri' => $uriA]))->encode());
 		$b->tick();
-		$pending = $b->getPendingCount();   // the refused dial to C may already have failed; only the delta matters
+		$pending = $b->getPendingCount();   // only the delta matters
 		$b->connectPeer($uriA);
 		self::assertSame($pending, $b->getPendingCount(), 'The direct peer\'s own URI is bound to its link and not dialed.');
 		$b->close();
@@ -1089,8 +1100,16 @@ class TMeshBackplaneTest extends TestCase
 			return $types;
 		};
 		$b->tick();
-		$read();   // the join state and the first heartbeat
+		$read();   // the full presence the new link caused, and the first heartbeat
 		$request = fn (array $nodes) => $peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_SYNC, 'A', '', null, null, ['nodes' => $nodes]))->encode());
+
+		$request(['B']);
+		$b->tick();
+		self::assertNotContains(TWebSocketEnvelope::PRESENCE_SET, $read(), 'A request within the interval after the link\'s full presence waits.');
+		$clock->advance(TMeshBackplane::ANNOUNCE_INTERVAL);
+		$b->tick();
+		self::assertContains(TWebSocketEnvelope::PRESENCE_SET, $read(), 'It is answered once the interval passes.');
+		$clock->advance(TMeshBackplane::ANNOUNCE_INTERVAL);
 
 		$request(['C']);
 		$b->tick();
@@ -1100,8 +1119,7 @@ class TMeshBackplaneTest extends TestCase
 		$request(['B']);
 		$b->tick();
 		$answer = $read();
-		self::assertSame(1, count(array_keys($answer, TWebSocketEnvelope::NODE_UP, true)), 'Two requests in one tick get one announce.');
-		self::assertContains(TWebSocketEnvelope::PRESENCE_SET, $answer, 'The local clients are re-announced.');
+		self::assertSame([TWebSocketEnvelope::NODE_UP, TWebSocketEnvelope::PRESENCE_SET, TWebSocketEnvelope::NODE_UP], $answer, 'Two requests in one tick get one full presence: an announce, the local clients, and the closing announce.');
 
 		$request(['B']);
 		$b->tick();
@@ -1172,6 +1190,28 @@ class TMeshBackplaneTest extends TestCase
 
 		$this->expectException(\Prado\Exceptions\TInvalidDataValueException::class);
 		$mesh->setPeerPattern('#unclosed');
+	}
+
+	public function testOnlyStreamSocketUrisAreDialed()
+	{
+		[$b, , $peer] = $this->verifiedPeer('A');
+		$refused = ['udp://127.0.0.1:53', 'unix:///var/run/docker.sock', 'udg:///dev/log', 'file:///etc/passwd', 'http://127.0.0.1:80/'];
+		foreach ($refused as $i => $uri) {
+			$peer->send((new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, 'node-' . $i, '', null, null, ['uri' => $uri]))->encode());
+		}
+		$b->tick();
+		self::assertSame(0, $b->getPendingCount(), 'A gossiped URI that is not tcp, tls or ssl is not dialed.');
+		self::assertSame(0, $b->getResolvingCount(), 'Nor is its host looked up.');
+
+		foreach ($refused as $uri) {
+			$b->connectPeer($uri);   // ignored, not an error
+		}
+		self::assertSame(0, $b->getPendingCount());
+		self::assertSame(0, $b->getResolvingCount());
+
+		$b->connectPeer(str_replace('tcp://', 'TCP://', $this->unansweredUri()));
+		self::assertSame(1, $b->getPendingCount(), 'The scheme is matched without regard to case.');
+		$b->close();
 	}
 
 	public function testSslContextRoundTrips()

@@ -11,6 +11,7 @@
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\Prado;
 use Prado\TComponent;
 use Prado\TPropertyValue;
@@ -279,11 +280,23 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 		if ($perms !== false && ($perms & 0o077) !== 0) {
 			throw new TConfigurationException('websocket_backplane_directory_insecure', $path);   // group/other-accessible: another user could list, read, or plant cluster state
 		}
-		if (!function_exists('posix_geteuid')) {
+		$user = $this->getProcessUserId();
+		if ($user === null) {
 			Prado::log("File backplane cannot verify the owner of {$path}: the posix extension is not loaded", TLogger::NOTICE, static::class);
-		} elseif (@fileowner($path) !== posix_geteuid()) {
+		} elseif (@fileowner($path) !== $user) {
 			throw new TConfigurationException('websocket_backplane_directory_insecure', $path);   // owned by another user: not this process's trusted spool
 		}
+	}
+
+	/**
+	 * Returns the effective user id of this process, which must own the spool.  Isolated so a test can
+	 * take the other-owner path.
+	 * @return ?int The effective user id, or null without the posix extension.
+	 * @since 1.2.0
+	 */
+	protected function getProcessUserId(): ?int
+	{
+		return function_exists('posix_geteuid') ? posix_geteuid() : null;
 	}
 
 	/**
@@ -300,7 +313,7 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 		if ($real === false) {
 			return;
 		}
-		$euid = function_exists('posix_geteuid') ? posix_geteuid() : null;
+		$euid = $this->getProcessUserId();
 		for ($parent = dirname($real); ; $parent = dirname($parent)) {
 			clearstatcache(true, $parent);
 			$perms = @fileperms($parent);
@@ -323,6 +336,7 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 	public function close(): void
 	{
 		$this->_offset = 0;
+		$this->_backlog = false;   // a closed backplane has nothing left to read
 	}
 
 	/**
@@ -474,25 +488,30 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Records a client in the presence registry and announces it through the log.
+	 * Records a client in the presence registry and announces it through the log.  The envelope is
+	 * encoded before anything is written, so metadata that cannot be encoded is refused to the caller
+	 * and leaves no file behind.
 	 * @param string $clientId The cluster client id.
 	 * @param array<string, mixed> $meta The presence metadata (already carries the node id).
+	 * @throws TWebSocketException When the metadata cannot be encoded, such as a non-finite float.
 	 */
 	public function putPresence(string $clientId, array $meta): void
 	{
 		if ($this->_directory === null) {
 			return;
 		}
+		$node = $this->_cluster !== null ? $this->_cluster->getNodeId() : (string) ($meta['node'] ?? '');
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, $clientId, $meta);
+		$envelope->encode();
 		$path = $this->presencePath($clientId);
 		if (is_link($path)) {
 			return;   // never write metadata through a symlink; the secured spool should hold none
 		}
-		@file_put_contents($path, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+		@file_put_contents($path, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE));
 		@chmod($path, self::FILE_MODE);   // presence metadata is owner-only, not world-readable
 		@touch($path, $this->getClock()->time());   // freshness is measured on the backplane's clock
 		$this->_localClients[$clientId] = $meta;
-		$node = $this->_cluster !== null ? $this->_cluster->getNodeId() : (string) ($meta['node'] ?? '');
-		$this->append(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, $clientId, $meta));
+		$this->append($envelope);
 	}
 
 	/**
@@ -513,18 +532,19 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 	/**
 	 * Appends an encoded envelope to the log under an exclusive lock.
 	 * @param TWebSocketEnvelope $envelope The envelope to append.
+	 * @throws TWebSocketException When the envelope cannot be encoded.
 	 */
 	private function append(TWebSocketEnvelope $envelope): void
 	{
 		if ($this->_directory === null) {
 			return;
 		}
+		$data = $envelope->encode() . "\n";   // before the log is opened and locked: an envelope that cannot be encoded throws here
 		$fp = @fopen($this->logPath(), 'ab');
 		if ($fp === false) {
 			return;
 		}
 		flock($fp, LOCK_EX);
-		$data = $envelope->encode() . "\n";
 		$length = strlen($data);
 		for ($written = 0; $written < $length;) {
 			$wrote = fwrite($fp, substr($data, $written));
@@ -557,12 +577,21 @@ class TFileBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Returns the paths of the presence files in the registry.
-	 * @return string[] The presence file paths.
+	 * Returns the paths of the presence files in the registry.  The directory is listed by its literal
+	 * path, so a spool path may contain any character, such as `[`, and a file whose name starts with a
+	 * dot is included.
+	 * @return string[] The presence file paths, in name order.
 	 */
 	private function presenceFiles(): array
 	{
-		return glob($this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR . DIRECTORY_SEPARATOR . '*') ?: [];
+		$directory = $this->_directory . DIRECTORY_SEPARATOR . self::PRESENCE_DIR;
+		$files = [];
+		foreach (@scandir($directory) ?: [] as $name) {
+			if ($name !== '.' && $name !== '..') {
+				$files[] = $directory . DIRECTORY_SEPARATOR . $name;
+			}
+		}
+		return $files;
 	}
 
 	/**

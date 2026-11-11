@@ -8,9 +8,12 @@ use Prado\IO\Socket\WebSocket\Cluster\TRedisBackplane;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketCluster;
 use Prado\IO\Socket\WebSocket\Cluster\TWebSocketEnvelope;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Stream\TBufferStream;
+use Prado\Prado;
 use Prado\Test\Unit\IO\Socket\WebSocket\TTestMonotonicClock;
 use Prado\Util\Clock\TMockClock;
+use Prado\Util\Log\TLogger;
 
 /**
  * An in-memory stand-in for a Redis server, covering the commands the backplane issues.  Every
@@ -1047,5 +1050,136 @@ class TRedisBackplaneTest extends TestCase
 		self::assertSame(1, $this->redis->connects, 'A client send failure is not treated as a Redis fault.');
 		self::assertStringContainsString('second', (string) $sink, 'The envelope after the failing delivery still reaches the live client.');
 		self::assertArrayHasKey($this->prefix . 'node:n1', $this->redis->strings, 'The backplane stays connected and keeps heartbeating.');
+	}
+
+	public function testAFaultAfterABoundedDrainLeavesNoBacklog()
+	{
+		[$n1, $bp1] = $this->openNode('n1');
+		[$n2] = $this->openNode('n2');
+		$bp1->setDrainLimit(5);
+		for ($i = 0; $i < 20; $i++) {
+			$n2->broadcast('m' . $i);
+		}
+		$this->mono->advance(11);   // the heartbeat that follows the drain is due
+		$this->redis->after('lTrim', [], function (): void {
+			$this->redis->failing = true;   // Redis goes down right after the drain's transaction
+		});
+		$n1->tick();
+		self::assertSame(1, $this->redis->closes, 'The fault disconnects the backplane.');
+		self::assertFalse($bp1->getHasBacklog(), 'A backplane that cannot reach Redis reports no backlog, though its last drain stopped at the limit.');
+		for ($i = 0; $i < 3; $i++) {
+			$n1->tick();
+			self::assertFalse($n1->getHasBacklog(), 'Nor do the ticks of the outage.');
+		}
+
+		$this->redis->failing = false;
+		$this->mono->advance(TRedisBackplane::RECONNECT_INTERVAL);
+		$n1->tick();   // reconnects and drains again
+		self::assertTrue($bp1->getHasBacklog(), 'The backlog is reported again once it can be drained.');
+		$bp1->close();
+		self::assertFalse($bp1->getHasBacklog(), 'A closed backplane reports none.');
+	}
+
+	public function testANodeThatRejoinsAfterBeingReapedReplacesItsMirrorOfTheOtherNodes()
+	{
+		[$a] = $this->openNode('A');
+		[$b] = $this->openNode('B');
+		[$own] = $this->makeConnection();
+		$local = $a->register($own);
+		[$first] = $this->makeConnection();
+		[$second] = $this->makeConnection();
+		$gone = $b->register($first);
+		$stays = $b->register($second);
+		$a->tick();
+		self::assertSame([$local, $gone, $stays], array_keys($a->presence()));
+
+		unset($this->redis->strings[$this->prefix . 'node:A']);   // A stalls past the TTL
+		$this->mono->advance(31);
+		$b->tick();   // B reaps A, which deletes A's inbox
+		self::assertArrayNotHasKey('A', $this->redis->sets[$this->prefix . 'nodes']);
+		$b->unregister($gone);   // A has no inbox to queue the drop on
+		[$third] = $this->makeConnection();
+		$joined = $b->register($third);
+		self::assertArrayNotHasKey($this->prefix . 'inbox:A', array_filter($this->redis->lists), 'Nothing is queued for a reaped node.');
+
+		$this->mono->advance(14);
+		$a->tick();   // A resumes: its heartbeat finds it reaped, and it rejoins
+		self::assertArrayHasKey('A', $this->redis->sets[$this->prefix . 'nodes']);
+		$presence = array_keys($a->presence());
+		sort($presence);
+		$expected = [$local, $stays, $joined];
+		sort($expected);
+		self::assertSame($expected, $presence, 'The mirror holds what the presence hash holds: the client that left is gone, the one that joined is known.');
+		self::assertFalse($a->sendToClient($gone, 'x'), 'The departed client is unknown.');
+		self::assertTrue($a->hasLocalClient($local), 'A local client is never dropped.');
+	}
+
+	public function testAReconnectAfterAnOutagePastTheTtlReplacesTheMirrorOfTheOtherNodes()
+	{
+		[$a] = $this->openNode('A');
+		[$b] = $this->openNode('B');
+		[$c] = $this->openNode('C');
+		[$first] = $this->makeConnection();
+		[$second] = $this->makeConnection();
+		$gone = $b->register($first);
+		$ofC = $c->register($second);
+		$a->tick();
+		self::assertSame([$gone, $ofC], array_keys($a->presence()));
+
+		$this->redis->failing = true;
+		$a->publish('news', 'lost');   // A's connection drops
+		$this->redis->failing = false;
+		unset($this->redis->strings[$this->prefix . 'node:A'], $this->redis->strings[$this->prefix . 'node:C']);   // and C dies
+		$this->mono->advance(31);
+		$b->tick();   // B, the only node still heartbeating, reaps A and C
+		$b->unregister($gone);
+		self::assertSame([], $this->redis->hashes[$this->prefix . 'presence'] ?? []);
+
+		$a->tick();   // the reconnect is due: A opens again and rejoins
+		self::assertArrayHasKey('A', $this->redis->sets[$this->prefix . 'nodes']);
+		self::assertSame([], $a->presence(), 'A drops the client that left and the clients of the node reaped while it was away.');
+	}
+
+	public function testUnencodablePresenceMetadataIsRefusedToTheCallerAndIsNoRedisFault()
+	{
+		[$a] = $this->openNode('A');
+		$this->openNode('B');
+		[$connection] = $this->makeConnection();
+		try {
+			$a->register($connection, ['score' => NAN]);
+			self::fail('Metadata that cannot be encoded is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_envelope_unencodable', $e->getErrorCode());
+		}
+		self::assertSame(0, $a->getLocalClientCount(), 'The client is not registered.');
+		self::assertSame(0, $this->redis->closes, 'The backplane stays connected.');
+		self::assertSame([], $this->redis->hashes[$this->prefix . 'presence'] ?? [], 'Nothing is written to the presence hash.');
+		self::assertSame([], $this->inbox('B'), 'Nothing is announced.');
+
+		$id = $a->register($connection, ['score' => 1.5, 'name' => "caf\xe9"]);   // a byte that is not UTF-8
+		$stored = json_decode($this->redis->hashes[$this->prefix . 'presence'][$id], true);
+		self::assertSame(1.5, $stored['score'] ?? null);
+		self::assertSame("caf\u{FFFD}", $stored['name'] ?? null, 'Metadata that is not valid UTF-8 is stored with the bytes substituted, as an envelope carries it.');
+	}
+
+	public function testAReconnectSkipsAClientWhoseMetadataCannotBeEncoded()
+	{
+		Prado::getLogger()->deleteLogs(null, FakeRedisBackplane::class);
+		$backplane = new FakeRedisBackplane($this->redis);
+		$backplane->setMonotonicClock($this->mono);
+		$cluster = new class ('A', $backplane) extends TWebSocketCluster {
+			public function getLocalPresence(): array
+			{
+				return ['A-bad' => ['node' => 'A', 'score' => INF], 'A-good' => ['node' => 'A']];   // a coordinator that validated nothing
+			}
+		};
+		$this->openNode('B');
+		$cluster->open();   // the join announces the local clients, as a reconnect does
+
+		self::assertSame(['A-good'], array_keys($this->redis->hashes[$this->prefix . 'presence']), 'The other clients are announced.');
+		self::assertArrayHasKey('A', $this->redis->sets[$this->prefix . 'nodes'], 'The node joins all the same.');
+		$warnings = Prado::getLogger()->getLogs(TLogger::WARNING, FakeRedisBackplane::class);
+		self::assertCount(1, $warnings);
+		self::assertStringContainsString('A-bad', array_values($warnings)[0][0]);
 	}
 }

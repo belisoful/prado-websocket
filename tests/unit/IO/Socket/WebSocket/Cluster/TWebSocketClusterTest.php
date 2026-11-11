@@ -442,4 +442,36 @@ class TWebSocketClusterTest extends TestCase
 		$this->cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, 'nodeB', '', null, $idA));
 		self::assertArrayHasKey($idA, $this->cluster->presence(), 'A remote drop of a local client is ignored.');
 	}
+
+	public function testRegisterDoesNotKeepAClientTheBackplaneRefused()
+	{
+		$backplane = new class () extends SpyBackplane {
+			public bool $refuse = true;
+
+			public function putPresence(string $clientId, array $meta): void
+			{
+				if ($this->refuse) {
+					throw new \Prado\IO\Socket\WebSocket\TWebSocketException('websocket_envelope_unencodable', 'Inf and NaN cannot be JSON encoded');
+				}
+				parent::putPresence($clientId, $meta);
+			}
+		};
+		$cluster = new TWebSocketCluster('nodeA', $backplane);
+		[$connection] = $this->makeConnection();
+		try {
+			$cluster->register($connection, ['score' => NAN]);
+			self::fail('The backplane\'s refusal reaches the caller.');
+		} catch (\Prado\IO\Socket\WebSocket\TWebSocketException $e) {
+			self::assertSame('websocket_envelope_unencodable', $e->getErrorCode());
+		}
+		self::assertSame(0, $cluster->getLocalClientCount(), 'A client the cluster was not told of is not held.');
+		self::assertNull($cluster->getClientId($connection));
+		self::assertSame([], $cluster->presence());
+		self::assertSame([], $cluster->getLocalPresence(), 'So a backplane never re-announces it.');
+
+		$backplane->refuse = false;
+		$clientId = $cluster->register($connection, ['score' => 1]);
+		self::assertSame($clientId, $cluster->getClientId($connection), 'The connection can be registered once its metadata is fit.');
+		self::assertTrue($cluster->hasLocalClient($clientId));
+	}
 }

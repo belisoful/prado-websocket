@@ -11,6 +11,7 @@
 namespace Prado\IO\Socket\WebSocket\Cluster;
 
 use Prado\Exceptions\TConfigurationException;
+use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\TComponent;
 use Prado\Prado;
 use Prado\TPropertyValue;
@@ -57,7 +58,15 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  *  - {@see open()}, a reconnect, and a rejoin replace the node's presence: the node purges what it
  *    (or a previous incarnation of its id) left in Redis, sends a {@see TWebSocketEnvelope::NODE_DOWN}
  *    about itself, then re-declares its registry entry, channel interest, and current clients.  A
- *    client that left during an outage is dropped on every node, and one that joined is announced.
+ *    client of this node that left during an outage is dropped on every node, and one that joined is
+ *    announced.
+ *  - The same three replace this node's mirror of the other nodes' clients with the presence hash.
+ *    The presence changes queued for the node while it was away can be gone: a reap deletes its inbox,
+ *    and an inbox expires or is trimmed.  So a remote client that left meanwhile is dropped from the
+ *    mirror, and one that joined is added.
+ *  - Presence metadata is encoded before any Redis command.  Metadata that cannot be encoded, such as
+ *    a non-finite float, is refused to the caller of {@see putPresence()} and does not disconnect the
+ *    backplane.
  *
  * Intervals within the process (the heartbeat and prune throttles, the reconnect delay) are measured
  * on the {@see getMonotonicClock() MonotonicClock}; the node heartbeat expires on Redis's own clock.
@@ -107,8 +116,11 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	/** @var int The most envelopes one tick drains; 0 bounds a tick by {@see DRAIN_TIME} only. */
 	private int $_drainLimit = 10000;
 
-	/** @var bool Whether the last tick stopped with envelopes left in the inbox. */
+	/** @var bool Whether the last tick stopped with envelopes left in the inbox; false while disconnected. */
 	private bool $_backlog = false;
+
+	/** @var array<string, true> The other nodes whose clients this node delivered to the presence mirror, keyed by node id; their entries are replaced on a rejoin. */
+	private array $_mirrored = [];
 
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
@@ -202,6 +214,7 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	 */
 	public function close(): void
 	{
+		$this->_backlog = false;
 		if ($this->_redis === null) {
 			return;
 		}
@@ -223,10 +236,12 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Drains the inbox into the coordinator and runs registry housekeeping.
+	 * Drains the inbox into the coordinator and runs registry housekeeping.  Every tick starts without
+	 * a {@see getHasBacklog() backlog}, so a tick that cannot reach Redis reports none.
 	 */
 	public function tick(): void
 	{
+		$this->_backlog = false;
 		if ($this->_cluster === null) {
 			return;
 		}
@@ -236,7 +251,6 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 				return;
 			}
 		}
-		$this->_backlog = false;
 		$this->guard(function (): void {
 			$this->drain();
 			if ($this->heartbeat(false)) {
@@ -268,6 +282,7 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 			$lines = is_array($result) && is_array($result[0] ?? null) ? $result[0] : [];
 			foreach ($lines as $line) {
 				if (is_string($line) && ($envelope = TWebSocketEnvelope::decode($line)) !== null) {
+					$this->noteMirrored($envelope);
 					try {
 						$this->_cluster?->receiveEnvelope($envelope);
 					} catch (\Throwable $e) {
@@ -288,7 +303,8 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Indicates whether the last {@see tick()} stopped with envelopes left in the inbox.  Implements
+	 * Indicates whether the last {@see tick()} stopped with envelopes left in the inbox.  It is false
+	 * while the backplane is disconnected, when another tick could drain nothing.  Implements
 	 * {@see IWebSocketPolledBackplane}.
 	 * @return bool Whether the inbox holds envelopes the last tick did not drain.
 	 * @since 1.2.0
@@ -317,10 +333,12 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Marks the backplane disconnected and schedules the next reconnect attempt.
+	 * Marks the backplane disconnected and schedules the next reconnect attempt.  A disconnected
+	 * backplane reports no {@see getHasBacklog() backlog}: nothing can be drained until it reconnects.
 	 */
 	private function disconnect(): void
 	{
+		$this->_backlog = false;
 		if ($this->_redis !== null) {
 			try {
 				$this->_redis->close();
@@ -376,10 +394,11 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Replaces this node's presence across the cluster and re-seeds the local mirror.  The other nodes
-	 * receive a {@see TWebSocketEnvelope::NODE_DOWN} about this node, which drops every client they hold
-	 * for it, followed by the current local clients.  Each inbox is a FIFO list, so the drop reaches a
-	 * node before the re-announcement.
+	 * Replaces this node's presence across the cluster, and this node's mirror of the other nodes'
+	 * clients.  The other nodes receive a {@see TWebSocketEnvelope::NODE_DOWN} about this node, which
+	 * drops every client they hold for it, followed by the current local clients.  Each inbox is a FIFO
+	 * list, so the drop reaches a node before the re-announcement.  The mirror is then replaced with the
+	 * presence hash ({@see seedPresence()}).
 	 */
 	private function rejoin(): void
 	{
@@ -404,9 +423,28 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 			$this->_redis->sAdd($this->_prefix . 'nodech:' . $node, $channel);
 		}
 		foreach ($this->_cluster?->getLocalPresence() ?? [] as $clientId => $meta) {
-			$this->_redis->hSet($this->_prefix . 'presence', (string) $clientId, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, (string) $clientId, $meta));
+			$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $node, '', null, (string) $clientId, $meta);
+			try {
+				$envelope->encode();
+			} catch (TWebSocketException $e) {
+				// One client's metadata is not a Redis fault: the reconnect goes on without that client.
+				Prado::log("Redis backplane cannot announce client {$clientId}: " . $e->getMessage(), TLogger::WARNING, static::class);
+				continue;
+			}
+			$this->_redis->hSet($this->_prefix . 'presence', (string) $clientId, $this->encodeMeta($meta));
+			$this->deliver($this->peerNodes(), $envelope);
 		}
+	}
+
+	/**
+	 * Encodes presence metadata for the presence hash, as an envelope encodes it: bytes that are not
+	 * valid UTF-8 are substituted.
+	 * @param array<string, mixed> $meta The presence metadata.
+	 * @return string The JSON text.
+	 */
+	private function encodeMeta(array $meta): string
+	{
+		return (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
 	}
 
 	/**
@@ -477,15 +515,21 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Records a client in the presence hash and announces it to the other nodes.
+	 * Records a client in the presence hash and announces it to the other nodes.  The envelope is
+	 * encoded before any Redis command, so metadata that cannot be encoded is refused to the caller and
+	 * is not taken for a Redis fault.
 	 * @param string $clientId The cluster client id.
 	 * @param array<string, mixed> $meta The presence metadata (already carries the node id).
+	 * @throws TWebSocketException When the metadata cannot be encoded, such as a non-finite float.
 	 */
 	public function putPresence(string $clientId, array $meta): void
 	{
-		$this->guard(function () use ($clientId, $meta): void {
-			$this->_redis->hSet($this->_prefix . 'presence', $clientId, (string) json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-			$this->deliver($this->peerNodes(), new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta);
+		$envelope->encode();
+		$json = $this->encodeMeta($meta);
+		$this->guard(function () use ($clientId, $json, $envelope): void {
+			$this->_redis->hSet($this->_prefix . 'presence', $clientId, $json);
+			$this->deliver($this->peerNodes(), $envelope);
 		});
 	}
 
@@ -679,6 +723,7 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 			$this->queuePushes($tx, $peers, new TWebSocketEnvelope(TWebSocketEnvelope::NODE_DOWN, $this->nodeId(), '', null, null, ['node' => $node]));   // the dead node leaves the registry, so no other node's prune finds it
 			if (is_array($tx->exec())) {
 				Prado::log("Redis backplane reaped node {$node}: its heartbeat expired", TLogger::WARNING, static::class);
+				unset($this->_mirrored[$node]);
 				$this->_cluster?->dropNodePresence($node);
 				return;
 			}
@@ -725,7 +770,11 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 	}
 
 	/**
-	 * Seeds the presence mirror from the shared hash.
+	 * Replaces the other nodes' clients in the presence mirror with the shared hash.  The clients
+	 * mirrored for every other node are dropped and the hash is delivered in their place, in one call,
+	 * so the mirror never shows a state between the two.  A joining node holds none, and is seeded.  A
+	 * node that rejoins drops the remote clients that left while its inbox was reaped, expired or
+	 * unread.  A local client is never dropped.
 	 */
 	private function seedPresence(): void
 	{
@@ -736,11 +785,39 @@ class TRedisBackplane extends TComponent implements IWebSocketPolledBackplane
 		if (!is_array($all)) {
 			return;
 		}
+		$self = $this->nodeId();
+		foreach (array_keys($this->_mirrored) as $node) {
+			if ((string) $node !== $self) {
+				$this->_cluster->dropNodePresence((string) $node);
+			}
+		}
+		$this->_mirrored = [];
 		foreach ($all as $clientId => $json) {
 			$meta = json_decode((string) $json, true);
 			if (is_array($meta)) {
-				$this->_cluster->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, (string) ($meta['node'] ?? ''), '', null, (string) $clientId, $meta));
+				$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, (string) ($meta['node'] ?? ''), '', null, (string) $clientId, $meta);
+				$this->noteMirrored($envelope);
+				$this->_cluster->receiveEnvelope($envelope);
 			}
+		}
+	}
+
+	/**
+	 * Notes whose clients an envelope puts in the presence mirror, so a rejoin knows which nodes'
+	 * entries to replace.  A presence set names its node in the `node` metadata the coordinator adds; a
+	 * {@see TWebSocketEnvelope::NODE_DOWN} removes every client of the node it names.
+	 * @param TWebSocketEnvelope $envelope The envelope about to be delivered to the coordinator.
+	 */
+	private function noteMirrored(TWebSocketEnvelope $envelope): void
+	{
+		$node = $envelope->getMeta()['node'] ?? $envelope->getOriginNode();
+		if (!is_string($node) || $node === '') {
+			return;
+		}
+		if ($envelope->getType() === TWebSocketEnvelope::PRESENCE_SET) {
+			$this->_mirrored[$node] = true;
+		} elseif ($envelope->getType() === TWebSocketEnvelope::NODE_DOWN) {
+			unset($this->_mirrored[$node]);
 		}
 	}
 

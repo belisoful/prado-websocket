@@ -83,9 +83,12 @@ interface IWebSocketBackplane
 	public function unsubscribe(string $channel): void;
 
 	/**
-	 * Records a local client in the shared presence registry and announces it to the cluster.
+	 * Records a local client in the shared presence registry and announces it to the cluster.  A
+	 * driver that encodes the metadata does so before it changes anything, and throws when the
+	 * metadata cannot be encoded; the coordinator then does not register the client.
 	 * @param string $clientId The cluster client id.
 	 * @param array<string, mixed> $meta The presence metadata, already carrying the node id that the coordinator adds.
+	 * @throws \Prado\IO\Socket\WebSocket\TWebSocketException When the metadata cannot be encoded for the cluster, such as a non-finite float.
 	 */
 	public function putPresence(string $clientId, array $meta): void;
 

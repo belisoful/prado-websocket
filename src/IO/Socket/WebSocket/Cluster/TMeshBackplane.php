@@ -42,17 +42,33 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  *  - Channel interest needs no declaration (every node sees all traffic; the coordinator filters),
  *    so {@see subscribe()}/{@see unsubscribe()} are inert.
  *
- * Presence floods as presence envelopes, and a node sends its local presence to each peer as the
- * link is added, so a joining node converges.  Every node announce carries the sender's incarnation,
- * a value drawn once per backplane instance.  A node that hears a new incarnation for a node id drops
- * the clients it holds for that id before applying the new incarnation's presence, so a node that
- * restarts under a static node id leaves no phantom clients.
+ * Presence floods as presence envelopes.  When a link is verified, each end floods its full presence
+ * to every peer ({@see announcePresence()}): an opening announce, one presence envelope per local
+ * client, and a closing announce.  Each full presence has a generation number.  The announces carry
+ * it in their metadata, with `presence` set to `begin` or `end`, and every presence envelope of the
+ * node carries it as its payload.  A node that receives the closing announce drops the clients it
+ * holds for the sender that no envelope of that generation set.  So the full presence replaces what
+ * the node held, and a client that left while a link was down is forgotten.  A client that is still
+ * present is never removed in between.  A presence envelope of an older generation than the newest
+ * heard from its node is ignored.
+ *
+ * Every node announce also carries the sender's incarnation, a value drawn once per backplane
+ * instance.  A node that hears a new incarnation for a node id drops the clients it holds for that id
+ * before applying the new incarnation's presence, so a node that restarts under a static node id
+ * leaves no phantom clients.  A 1.1.0 node ignores the generation and the `presence` mark: it adds
+ * what a full presence carries and removes nothing, as it does among 1.1.0 nodes.
  *
  * The mesh self-assembles: it is seeded from the {@see setPeers() Peers} dialed on {@see open()},
  * then each node announces its {@see setAdvertise() Advertise} URI, which floods so other nodes dial
  * it (a lexical tie-break makes exactly one side of any pair initiate, and an established peer is
  * never dialed twice).  A {@see setPeerPattern() PeerPattern} limits which announced URIs a node
  * dials; seeds are always dialed.
+ *
+ * Two nodes keep one link.  A URI announced by a node this node is linked to is recorded as another
+ * name of that link and is not dialed, so a seed written with a hostname and advertised by its address
+ * is linked once.  When two verified links reach the same node, the node that dialed the surplus link
+ * closes it.  Of two links it dialed itself it keeps the older.  Of two links the nodes dialed at each
+ * other, the one dialed by the node with the lower node id remains.
  *
  * Dials do not block the serve loop.  The TCP connect is asynchronous; a `tls://` or `ssl://` peer is
  * connected over TCP first and its TLS handshake is then driven without blocking, with the
@@ -65,9 +81,30 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  * short child process ({@see startResolver()}) runs the system resolver (`/etc/hosts`, the search
  * domains, a container's service names) and writes the addresses to its stdout, which is one of
  * the {@see getSources() sources}; the dial then connects to the first address, keeping the
- * hostname as the TLS peer name.  The lookup runs under the dial {@see setTimeout() Timeout}, one per
- * host at a time, and its result is cached for {@see RESOLVE_TTL} seconds; a dial that fails drops
- * the cached address, so a peer that moved is looked up again.
+ * hostname as the TLS peer name.  The child returns the host's IPv4 addresses.  For a host without
+ * one it returns the address the system resolver picks for a datagram socket to the host, which
+ * covers an IPv6-only name in `/etc/hosts` or under a search domain, and then the host's `AAAA`
+ * records.  The lookup runs under the dial {@see setTimeout() Timeout}, one per host at a time and at
+ * most {@see MAX_RESOLVERS} at once, the rest waiting their turn.  When 256 hosts are waiting, a dial
+ * to a further host is put off until its URI is announced or re-dialed again.  A lookup's result is
+ * cached for {@see RESOLVE_TTL} seconds; a dial that fails drops the cached address, so a peer that
+ * moved is looked up again.
+ *
+ * A peer URI's host is one of:
+ *  - a DNS name, whose labels may contain underscores, as container and service names do;
+ *  - an IPv4 or IPv6 address, dialed without a lookup;
+ *  - an IPv6 address with a zone, such as `[fe80::1%eth0]`, dialed as written without a lookup.
+ *
+ * The child is the PHP CLI binary {@see getResolverBinary() ResolverBinary}: by default the running
+ * binary under the `cli` and `cli-server` SAPIs, else `php` in PHP's binary directory.  Under another
+ * SAPI, such as php-fpm, with no CLI binary there, a hostname cannot be looked up:
+ * {@see connectPeer()} refuses the dial and a warning is logged once.  Set ResolverBinary to a PHP
+ * CLI binary in that case.  Peers given by IP address are unaffected.
+ *
+ * A lookup past its timeout, and every lookup still running at {@see close()}, is killed, and
+ * close() waits up to {@see RESOLVER_REAP_TIME} seconds for the children to exit.  A child inherits
+ * the open sockets of this process, the listener included, since PHP cannot start a process without
+ * them.  It holds them until it exits, which the lookup's timeout and close() bound.
  *
  * A peer joins only by proving the shared {@see setSecret() Secret}: first an HMAC of its handshake
  * key ({@see authenticate()}), then a *mutual* fresh-nonce challenge after the upgrade
@@ -91,12 +128,16 @@ use Prado\Util\Clock\TMonotonicClockAwareTrait;
  * to it is dropped, which frees its URI so it is dialed again when it returns.  Seed peers that are
  * not linked are re-dialed once per TTL.
  *
- * Presence converges when a node is heard again.  A node that receives traffic from a node it holds no
- * liveness for (one it never heard, or one it declared down) floods a {@see TWebSocketEnvelope::NODE_SYNC}
- * naming it, once per tick for all such nodes.  The named node floods its announce and its local
- * clients' presence again, at most once per {@see ANNOUNCE_INTERVAL}.  So a node behind an
- * intermediary is re-learned after a transient silence, as a direct peer is from its join state.  A
- * 1.1.0 node relays the request and does not answer it.
+ * Presence converges when a link returns and when a node is heard again.  A link drops on a reset,
+ * on a full send buffer, or on a malformed frame, and the presence changes flooded while it was down
+ * did not cross it.  When a link is verified, each end floods its full presence and sends the peer a
+ * {@see TWebSocketEnvelope::NODE_SYNC} naming the nodes it has heard and holds no link to; the peer
+ * relays the request to the nodes behind it.  A node that receives traffic from a node it holds no
+ * liveness for (one it never heard, or one it declared down) floods such a request naming it, once
+ * per tick for all such nodes, unless what it heard opens that node's full presence.  A named node
+ * floods its full presence, at most once per {@see ANNOUNCE_INTERVAL}.  So the nodes on each side of
+ * a restored link replace what they hold for the nodes on the other side.  A 1.1.0 node relays the
+ * request and does not answer it.
  *
  * An accepted peer that has not proven the secret may send messages of at most
  * {@see UNVERIFIED_MESSAGE_SIZE} bytes, enough for the challenge exchange, so a link held open with a
@@ -145,28 +186,70 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	public const RESOLVE_TTL = 60.0;
 
-	/** The resolver child's program: the system resolver's IPv4 addresses, else the IPv6 ones, as JSON. */
+	/**
+	 * The most hostname lookups that run at once, each in its own child process; further lookups wait
+	 * their turn.
+	 * @since 1.2.0
+	 */
+	public const MAX_RESOLVERS = 8;
+
+	/**
+	 * The seconds {@see close()} waits for the resolver children it killed to exit.
+	 * @since 1.2.0
+	 */
+	public const RESOLVER_REAP_TIME = 1.0;
+
+	/** The most hostnames that wait for a lookup; a dial to a further host is put off until its URI is dialed again. */
+	private const RESOLVE_QUEUE_CAP = 256;
+
+	/**
+	 * The resolver child's program.  It writes a JSON list: the system resolver's IPv4 addresses, else
+	 * the address the system resolver connects a datagram socket to (which sends nothing), else the
+	 * host's `AAAA` records.
+	 */
 	private const RESOLVER_CODE = '$h = $argv[1] ?? \'\'; $a = @gethostbynamel($h) ?: [];'
+		. ' if ($a === [] && ($s = @stream_socket_client(\'udp://\' . $h . \':9\', $e, $m, 1)) && is_string($n = stream_socket_get_name($s, true))) { $a[] = trim(substr($n, 0, (int) strrpos($n, \':\')), \'[]\'); }'
 		. ' if ($a === [] && function_exists(\'dns_get_record\')) { foreach (@dns_get_record($h, DNS_AAAA) ?: [] as $r) { if (isset($r[\'ipv6\'])) { $a[] = $r[\'ipv6\']; } } }'
 		. ' echo json_encode(array_values(array_unique($a)));';
+
+	/** The pattern of a hostname the resolver is asked for: DNS labels, which may contain underscores, up to 253 characters. */
+	private const HOST_PATTERN = '/^(?=.{1,253}\.?$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?$/D';
+
+	/** The pattern of an IPv6 address with a zone: the address, `%`, and an interface name or index. */
+	private const SCOPED_ADDRESS_PATTERN = '/^([0-9A-Fa-f:.]+)%[A-Za-z0-9._-]{1,64}$/D';
+
+	/** The `presence` mark of the announce that opens a node's full presence. */
+	private const PRESENCE_BEGIN = 'begin';
+
+	/** The `presence` mark of the announce that closes a node's full presence. */
+	private const PRESENCE_END = 'end';
+
+	/** The signal that ends a resolver child.  It cannot be caught, so it never runs a handler in a child that has not yet started its program. */
+	private const SIGKILL = 9;
 
 	/** @var ?IWebSocketCluster The owning coordinator. */
 	private ?IWebSocketCluster $_cluster = null;
 
-	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, verified: bool, nonce: string, heldNonce: string, authDeadline: float, nodeId: string, limit: int}> The peer links, keyed by link object id; `nodeId` is the peer's node id once it has proven the secret, '' before; `heldNonce` is an accepted peer's challenge, answered once it is verified; `limit` is the link's message size limit to restore once it is verified. */
+	/** @var array<int, array{link: TWebSocketConnection, transport: TSocketStream, uri: string, aliases: array<string, true>, verified: bool, nonce: string, heldNonce: string, authDeadline: float, nodeId: string, limit: int}> The peer links, keyed by link object id; `aliases` are the further URIs known to reach the same node; `nodeId` is the peer's node id once it has proven the secret, '' before; `heldNonce` is an accepted peer's challenge, answered once it is verified; `limit` is the link's message size limit to restore once it is verified. */
 	private array $_peers = [];
 
 	/** @var array<int, array{transport: TSocketStream, uri: string, state: string, secure: bool, key: string, buffer: string, deadline: float}> In-flight async dials, keyed by transport object id; `state` is 'connecting', 'securing' (the TLS handshake), or 'handshaking' (the WebSocket upgrade). */
 	private array $_pending = [];
 
-	/** @var array<string, array{process: TProcess, buffer: string, deadline: float, spawned: int, uris: array<string, true>}> In-flight hostname lookups, keyed by host; `spawned` is the {@see \hrtime()} it started; `uris` are the dials waiting on it. */
+	/** @var array<string, array{process: ?TProcess, buffer: string, deadline: float, uris: array<string, true>}> The hostname lookups not yet answered, keyed by host in the order asked; `process` is null while the lookup waits for a turn under {@see MAX_RESOLVERS}; `uris` are the dials waiting on it. */
 	private array $_resolving = [];
 
 	/** @var array<string, array{address: string, expires: float}> Resolved hostnames, keyed by host. */
 	private array $_resolved = [];
 
-	/** @var TProcess[] Resolver children abandoned at their deadline, closed once they exit. */
+	/** @var TProcess[] Resolver children killed at their deadline or at {@see close()}, closed once they exit. */
 	private array $_reaping = [];
+
+	/** @var ?string The PHP CLI binary that runs a hostname lookup; null until first used, '' when none is available. */
+	private ?string $_resolverBinary = null;
+
+	/** @var bool Whether the warning about an unusable resolver binary has been logged. */
+	private bool $_resolverWarned = false;
 
 	/** @var array<string, array<string, mixed>> The local clients' presence, for snapshotting to new peers. */
 	private array $_localPresence = [];
@@ -255,6 +338,15 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	/** @var array<string, string> The last incarnation announced by each node, keyed by node id. */
 	private array $_incarnations = [];
 
+	/** @var int The generation of this node's last full presence; 0 before the first. */
+	private int $_generation = 0;
+
+	/** @var array<string, int> The newest presence generation heard from each node, keyed by node id. */
+	private array $_generations = [];
+
+	/** @var array<string, array<string, int>> The clients held for each other node, keyed by node id then client id, with the generation that last set each; 0 for a client set without one. */
+	private array $_remote = [];
+
 	/**
 	 * Binds the owning coordinator.
 	 * @param IWebSocketCluster $cluster The coordinator received envelopes are delivered to.
@@ -311,7 +403,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Leaves the mesh, closing every peer link.
+	 * Leaves the mesh: closes every peer link and in-flight dial, kills the hostname lookups still
+	 * running, and waits up to {@see RESOLVER_REAP_TIME} seconds for those children to exit.
 	 */
 	public function close(): void
 	{
@@ -326,9 +419,13 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			$pending['transport']->close();
 		}
 		foreach ($this->_resolving as $lookup) {
-			$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
+			if ($lookup['process'] !== null) {
+				$this->abandonResolver($lookup['process']);
+			}
 		}
+		$this->reapResolvers(self::RESOLVER_REAP_TIME);
 		$this->_resolving = [];
+		$this->_resolved = [];
 		$this->_peers = [];
 		$this->_pending = [];
 		$this->_seen = [];
@@ -336,6 +433,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$this->_connectedUris = [];
 		$this->_nodeSeen = [];
 		$this->_incarnations = [];
+		$this->_generations = [];
+		$this->_remote = [];
 		$this->_syncRequests = [];
 		$this->_announcePending = false;
 	}
@@ -394,8 +493,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Floods this node's announce and its local clients' presence when a peer requested them, at most
-	 * once per {@see ANNOUNCE_INTERVAL}; a request in between waits for the interval to pass.
+	 * Floods this node's full presence when a peer requested it, at most once per
+	 * {@see ANNOUNCE_INTERVAL} after the last one; a request in between waits for the interval to pass.
 	 */
 	private function reannounce(): void
 	{
@@ -403,16 +502,37 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		if (!$this->_announcePending || ($this->_lastAnnounce !== null && ($now - $this->_lastAnnounce) < self::ANNOUNCE_INTERVAL)) {
 			return;
 		}
+		$this->announcePresence();
+	}
+
+	/**
+	 * Floods this node's full presence under a new generation: an opening announce, each local
+	 * client's presence, and a closing announce, on which every node drops the clients it holds for
+	 * this node that the generation did not set.  The full presence is flooded on every link, as
+	 * each later presence change is, so every node receives the node's presence envelopes in the order
+	 * the node sent them.
+	 */
+	private function announcePresence(): void
+	{
+		$generation = (string) ++$this->_generation;
 		$this->_announcePending = false;
-		$this->_lastAnnounce = $now;
-		$announce = $this->nodeAnnounce();
-		$this->markSeen($announce->getId());
-		$this->flood($announce, null);
+		$this->_lastAnnounce = $this->getMonotonicClock()->seconds();
+		$this->originate($this->nodeAnnounce(self::PRESENCE_BEGIN));
 		foreach ($this->_localPresence as $clientId => $meta) {
-			$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, (string) $clientId, $meta);
-			$this->markSeen($envelope->getId());
-			$this->flood($envelope, null);
+			$this->originate(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), $generation, null, (string) $clientId, $meta));
 		}
+		$this->originate($this->nodeAnnounce(self::PRESENCE_END));
+	}
+
+	/**
+	 * Floods an envelope this node originates to every peer, remembering its id so a copy that returns
+	 * over another path is dropped.
+	 * @param TWebSocketEnvelope $envelope The envelope to originate.
+	 */
+	private function originate(TWebSocketEnvelope $envelope): void
+	{
+		$this->markSeen($envelope->getId());
+		$this->flood($envelope, null);
 	}
 
 	/**
@@ -449,7 +569,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$this->_lastNodeScan = $now;
 		foreach ($this->_nodeSeen as $node => $seen) {
 			if (($now - $seen) > $this->_nodeTtl) {
-				unset($this->_nodeSeen[$node], $this->_incarnations[$node]);
+				unset($this->_nodeSeen[$node], $this->_incarnations[$node], $this->_generations[$node], $this->_remote[$node]);
 				Prado::log("Mesh node {$node} was not heard from for {$this->_nodeTtl}s; declaring it down", TLogger::WARNING, static::class);
 				$this->_cluster?->dropNodePresence($node);
 				foreach ($this->_peers as $id => $peer) {
@@ -470,7 +590,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	{
 		$sources = array_merge(array_column($this->_peers, 'transport'), array_column($this->_pending, 'transport'));
 		foreach ($this->_resolving as $lookup) {
-			$stdout = $lookup['process']->getStdout();
+			$stdout = $lookup['process']?->getStdout();
 			if ($stdout !== null && is_resource($stdout->getResource())) {
 				$sources[] = $stdout;
 			}
@@ -552,16 +672,20 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Records a local client and floods its presence to the mesh.
+	 * Records a local client and floods its presence to the mesh.  The envelope is encoded before
+	 * anything changes, so metadata that cannot be encoded is refused to the caller and no link is
+	 * touched.
 	 * @param string $clientId The cluster client id.
 	 * @param array<string, mixed> $meta The presence metadata (already carries the node id).
+	 * @throws TWebSocketException When the metadata cannot be encoded, such as a non-finite float.
 	 */
 	public function putPresence(string $clientId, array $meta): void
 	{
+		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), (string) $this->_generation, null, $clientId, $meta);
+		$data = $envelope->encode();
 		$this->_localPresence[$clientId] = $meta;
-		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta);
 		$this->markSeen($envelope->getId());
-		$this->flood($envelope, null);
+		$this->floodEncoded($data, null);
 	}
 
 	/**
@@ -571,9 +695,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	public function dropPresence(string $clientId): void
 	{
 		unset($this->_localPresence[$clientId]);
-		$envelope = new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $this->nodeId(), '', null, $clientId);
-		$this->markSeen($envelope->getId());
-		$this->flood($envelope, null);
+		$this->originate(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $this->nodeId(), (string) $this->_generation, null, $clientId));
 	}
 
 	// =========================================================================
@@ -585,7 +707,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 * A known remote URI is recorded so the same peer is never linked twice.
 	 *
 	 * Authentication is mutual: this node challenges the peer with a fresh nonce and withholds its
-	 * join state — and every other cluster message — until it has verified the peer's answer.  Because
+	 * full presence — and every other cluster message — until it has verified the peer's answer.  Because
 	 * both a dialed and an accepted peer are challenged this way, and the dialer no longer trusts an
 	 * endpoint merely because it dialed it, a node a peer dials cannot harvest that node's presence or
 	 * advertised URI without proving the secret.  The answers are ordered: the dialer answers at once,
@@ -598,13 +720,13 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	public function addPeer(TWebSocketConnection $link, TSocketStream $transport, string $uri = ''): void
 	{
 		$peerId = spl_object_id($link);
-		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'verified' => true, 'nonce' => '', 'heldNonce' => '', 'authDeadline' => 0.0, 'nodeId' => '', 'limit' => $link->getMaxMessageSize()];
+		$this->_peers[$peerId] = ['link' => $link, 'transport' => $transport, 'uri' => $uri, 'aliases' => [], 'verified' => true, 'nonce' => '', 'heldNonce' => '', 'authDeadline' => 0.0, 'nodeId' => '', 'limit' => $link->getMaxMessageSize()];
 		if ($uri !== '') {
 			$this->_connectedUris[$uri] = true;
 			$this->_knownUris[$uri] = true;
 		}
 		if ($this->_secret === '') {
-			$this->sendJoinState($link);   // without a secret no network path is open ({@see open()} refuses), so a link added programmatically is trusted as-is
+			$this->linkUp($peerId);   // without a secret no network path is open ({@see open()} refuses), so a link added programmatically is trusted as-is
 			return;
 		}
 		// An inbound peer is subject to the pending-peer cap: a replayed handshake proof passes
@@ -633,33 +755,111 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Sends this node's join state to a peer: its node announce, then its local clients' presence.
-	 * The announce comes first so a peer that held a previous incarnation of this node id drops it
-	 * before applying the presence; it also carries the advertised URI, through whose re-flood the
-	 * rest of the mesh can dial back.  On a secret-gated mesh this runs only from
-	 * {@see verifyChallenge()}, once this node has verified the peer, so state is never shown to an
-	 * unproven peer — dialed or accepted.
-	 * @param TWebSocketConnection $link The peer link.
+	 * Brings a verified link into the mesh.  This node floods its full presence
+	 * ({@see announcePresence()}), which reaches the new peer and, through the other links, the nodes
+	 * the link reconnects.  It then asks the peer for the presence of the nodes it has heard and holds
+	 * no link to: a missing link can have kept their presence changes from this node.  The peer relays
+	 * the request to them.  On a secret-gated mesh this runs only from {@see verifyChallenge()}, once
+	 * this node has verified the peer, so state is never shown to an unproven peer.
+	 * @param int $peerId The peer object id of the link.
 	 */
-	private function sendJoinState(TWebSocketConnection $link): void
+	private function linkUp(int $peerId): void
 	{
-		$this->sendTo($link, $this->nodeAnnounce());
-		foreach ($this->_localPresence as $clientId => $meta) {
-			$this->sendTo($link, new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_SET, $this->nodeId(), '', null, $clientId, $meta));
+		$this->announcePresence();
+		if (!isset($this->_peers[$peerId])) {
+			return;   // the link failed while the presence was sent
+		}
+		$linked = array_flip(array_column($this->_peers, 'nodeId'));
+		$nodes = array_diff_key($this->_nodeSeen, $linked, [$this->nodeId() => true]);
+		if ($nodes === []) {
+			return;
+		}
+		$request = new TWebSocketEnvelope(TWebSocketEnvelope::NODE_SYNC, $this->nodeId(), '', null, null, ['nodes' => array_map('strval', array_keys($nodes))]);
+		$this->markSeen($request->getId());
+		$this->sendTo($this->_peers[$peerId]['link'], $request);
+	}
+
+	/**
+	 * Closes the surplus links to a node once a link to it is verified, so two nodes keep one link.
+	 * Only a link this node dialed is closed here, and the peer closes those it dialed, so a 1.1.0 peer
+	 * is never dropped for a link it will dial again.  Of the links this node dialed, the oldest
+	 * remains.  When the peer dialed one too, the link dialed by the node with the lower node id
+	 * remains.  {@see dropPeer()} keeps a closed link's URI bound to the link that remains.
+	 * @param string $node The peer's node id.
+	 */
+	private function closeSurplusLinks(string $node): void
+	{
+		$dialed = [];
+		$accepted = false;
+		foreach ($this->_peers as $id => $peer) {
+			if (!$peer['verified'] || $peer['nodeId'] !== $node) {
+				continue;
+			}
+			if ($peer['link']->getIsClient()) {
+				$dialed[] = $id;
+			} else {
+				$accepted = true;
+			}
+		}
+		if (!$accepted || strcmp($this->nodeId(), $node) < 0) {
+			array_shift($dialed);   // this node's oldest dial remains
+		}
+		foreach ($dialed as $id) {
+			$this->dropPeer($id, "another link reaches node {$node}");
 		}
 	}
 
 	/**
-	 * Builds this node's announce: a {@see TWebSocketEnvelope::NODE_UP} carrying its advertised URI
-	 * and its incarnation.
+	 * Returns the oldest verified link to a node.
+	 * @param string $node The node id.
+	 * @return ?int The link's peer object id, or null when no verified link reaches the node.
+	 */
+	private function linkTo(string $node): ?int
+	{
+		if ($node === '') {
+			return null;
+		}
+		foreach ($this->_peers as $id => $peer) {
+			if ($peer['verified'] && $peer['nodeId'] === $node) {
+				return $id;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Records a URI as reaching a linked peer, so it is not dialed while the link stands.  The first
+	 * URI is the link's own; a further one is an alias.
+	 * @param int $peerId The peer object id of the link.
+	 * @param string $uri The URI that reaches the peer's node.
+	 */
+	private function bindUri(int $peerId, string $uri): void
+	{
+		if ($this->_peers[$peerId]['uri'] === '') {
+			$this->_peers[$peerId]['uri'] = $uri;
+		} elseif ($this->_peers[$peerId]['uri'] !== $uri) {
+			$this->_peers[$peerId]['aliases'][$uri] = true;
+		}
+		$this->_connectedUris[$uri] = true;
+		$this->_knownUris[$uri] = true;
+	}
+
+	/**
+	 * Builds this node's announce: a {@see TWebSocketEnvelope::NODE_UP} carrying its advertised URI,
+	 * its incarnation, and the generation of its last full presence.
+	 * @param ?string $presence {@see PRESENCE_BEGIN} or {@see PRESENCE_END} for the announce that opens or closes a full presence; null for a heartbeat.
 	 * @return TWebSocketEnvelope The announce.
 	 */
-	private function nodeAnnounce(): TWebSocketEnvelope
+	private function nodeAnnounce(?string $presence = null): TWebSocketEnvelope
 	{
 		if ($this->_incarnation === '') {
 			$this->_incarnation = bin2hex(random_bytes(8));
 		}
-		return new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, ['uri' => $this->_advertise, 'incarnation' => $this->_incarnation]);
+		$meta = ['uri' => $this->_advertise, 'incarnation' => $this->_incarnation, 'generation' => $this->_generation];
+		if ($presence !== null) {
+			$meta['presence'] = $presence;
+		}
+		return new TWebSocketEnvelope(TWebSocketEnvelope::NODE_UP, $this->nodeId(), '', null, null, $meta);
 	}
 
 	/**
@@ -678,6 +878,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		$this->_incarnations[$node] = $incarnation;
 		if ($known !== '' && $known !== $incarnation) {
 			Prado::log("Mesh node {$node} restarted with a new incarnation; dropping its previous clients", TLogger::NOTICE, static::class);
+			unset($this->_generations[$node], $this->_remote[$node]);   // the new incarnation counts its generations from the start
 			$this->_cluster?->dropNodePresence($node);
 		}
 	}
@@ -720,7 +921,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 
 	/**
 	 * Verifies a peer's answer to this node's challenge: a correct HMAC of the nonce and the peer's
-	 * node id marks the peer trusted, releasing the withheld join state and letting its traffic flow,
+	 * node id marks the peer trusted, releasing the withheld presence and letting its traffic flow,
 	 * while a wrong or missing answer drops the peer.  An answer claiming this node's own id is
 	 * refused outright, so an answer this node produced can never verify it to itself.  Trust is
 	 * per-direction: the peer independently verifies this node before it trusts this node in turn.
@@ -743,13 +944,16 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			$this->_peers[$peerId]['authDeadline'] = 0.0;
 			$this->_peers[$peerId]['nodeId'] = $answerer;
 			$this->_peers[$peerId]['link']->setMaxMessageSize($this->_peers[$peerId]['limit']);
-			$this->_nodeSeen[$answerer] = $this->getMonotonicClock()->seconds();   // answering the challenge is proof of life, before its first heartbeat; its join state follows
+			$this->_nodeSeen[$answerer] = $this->getMonotonicClock()->seconds();   // answering the challenge is proof of life, before its first heartbeat; its full presence follows
 			$held = $this->_peers[$peerId]['heldNonce'];
 			if ($held !== '') {
 				$this->_peers[$peerId]['heldNonce'] = '';
-				$this->answerChallenge($peerId, $held);   // the accepted peer is verified: answer its challenge, ahead of the join state
+				$this->answerChallenge($peerId, $held);   // the accepted peer is verified: answer its challenge, ahead of the presence
 			}
-			$this->sendJoinState($this->_peers[$peerId]['link']);
+			$this->closeSurplusLinks($answerer);
+			if (isset($this->_peers[$peerId])) {   // not the surplus link itself
+				$this->linkUp($peerId);
+			}
 		} else {
 			$this->dropPeer($peerId, 'it failed the challenge');   // not a legitimate peer
 		}
@@ -782,9 +986,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 * Begins dialing a peer without blocking: it opens an asynchronous TCP connection and registers the
 	 * attempt, which advances through the connect, the TLS handshake for a `tls://` or `ssl://` URI,
 	 * and the WebSocket handshake before adding the link.  A blocking dial would stall the serve loop,
-	 * so discovery and reconnection stay async.  A hostname in the URI resolves synchronously.
-	 * @param string $uri The peer endpoint, e.g. 'tcp://10.0.0.2:8080' or 'tls://10.0.0.2:8443'.
+	 * so discovery and reconnection stay async.  A hostname in the URI is looked up first, in a child
+	 * process ({@see startResolver()}), and the dial starts when the lookup answers.  A URI that is
+	 * linked, being dialed or being looked up, or whose scheme is not `tcp`, `tls` or `ssl`, is ignored.
+	 * @param string $uri The peer endpoint, e.g. 'tcp://10.0.0.2:8080', 'tls://node-b.internal:8443' or 'tcp://[fe80::1%eth0]:8080'.
 	 * @throws \Prado\Exceptions\TSocketException When the connection cannot be started.
+	 * @throws TInvalidDataValueException When the URI's host is neither a hostname nor an IP address.
+	 * @throws TConfigurationException When the host needs a lookup and no {@see getResolverBinary() ResolverBinary} is available.
+	 * @throws \Prado\Exceptions\TIOException When the lookup's child process cannot be started.
 	 */
 	public function connectPeer(string $uri): void
 	{
@@ -816,7 +1025,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		// TLS handshake inside the connect, both blocking; advanceDial() drives the TLS handshake.
 		$target = 'tcp://' . (str_contains($ip, ':') ? '[' . $ip . ']' : $ip) . ':' . $address->getPort();
 		if ($secure) {
-			$context = stream_context_create(['ssl' => $this->_sslContext + ['peer_name' => $host]]);
+			$context = stream_context_create(['ssl' => $this->_sslContext + ['peer_name' => explode('%', $host, 2)[0]]]);   // the name the certificate is verified against: the URI's host, never the resolved address
 		}
 		$transport = TSocketStream::connect($target, $this->_timeout, STREAM_CLIENT_ASYNC_CONNECT | STREAM_CLIENT_CONNECT, $context);
 		$transport->setBlocking(false);
@@ -942,8 +1151,8 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		}
 		$origin = $envelope->getOriginNode();
 		if ($origin !== '' && $origin !== $this->nodeId()) {
-			if (!isset($this->_nodeSeen[$origin])) {
-				$this->_syncRequests[$origin] = true;   // a node never heard, or declared down, is heard: ask for its presence
+			if (!isset($this->_nodeSeen[$origin]) && !($type === TWebSocketEnvelope::NODE_UP && ($envelope->getMeta()['presence'] ?? null) === self::PRESENCE_BEGIN)) {
+				$this->_syncRequests[$origin] = true;   // a node never heard, or declared down, is heard: ask for its presence, unless this opens it
 			}
 			$this->_nodeSeen[$origin] = $this->getMonotonicClock()->seconds();   // any traffic (data or heartbeat) proves the origin node is alive, even a duplicate copy
 		}
@@ -958,27 +1167,98 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			return;
 		}
 		$this->markSeen($envelope->getId());
+		$meta = $envelope->getMeta();
 		if ($type === TWebSocketEnvelope::NODE_SYNC) {
-			$nodes = $envelope->getMeta()['nodes'] ?? [];
+			$nodes = $meta['nodes'] ?? [];
 			if (is_array($nodes) && in_array($this->nodeId(), $nodes, true)) {
 				$this->_announcePending = true;   // answered by reannounce(), coalesced with other requests
 			}
 			$this->flood($envelope, $fromPeerId);   // a mesh request: relayed, never routed to the coordinator
 			return;
 		}
+		$current = true;
 		if ($type === TWebSocketEnvelope::NODE_UP) {
-			$incarnation = $envelope->getMeta()['incarnation'] ?? '';
+			$incarnation = $meta['incarnation'] ?? '';
 			$this->trackIncarnation($origin, is_string($incarnation) ? $incarnation : '');   // before any presence the new incarnation sends
+			$this->trackGeneration($origin, $meta['generation'] ?? null, ($meta['presence'] ?? null) === self::PRESENCE_END);
+		} elseif ($type === TWebSocketEnvelope::PRESENCE_SET || $type === TWebSocketEnvelope::PRESENCE_DROP) {
+			$current = $this->trackPresence($envelope);
 		}
-		try {
-			$this->_cluster?->receiveEnvelope($envelope);
-		} catch (\Throwable $e) {
-			Prado::log('Mesh delivery of a ' . $envelope->getType() . ' envelope failed: ' . $e->getMessage(), TLogger::WARNING, static::class);   // one bad delivery must not stop the relay or the peer
+		if ($current) {
+			try {
+				$this->_cluster?->receiveEnvelope($envelope);
+			} catch (\Throwable $e) {
+				Prado::log('Mesh delivery of a ' . $type . ' envelope failed: ' . $e->getMessage(), TLogger::WARNING, static::class);   // one bad delivery must not stop the relay or the peer
+			}
 		}
 		$this->flood($envelope, $fromPeerId);
-		if ($envelope->getType() === TWebSocketEnvelope::NODE_UP) {
-			$this->discover($fromPeerId, $origin, (string) ($envelope->getMeta()['uri'] ?? ''));
+		if ($type === TWebSocketEnvelope::NODE_UP) {
+			$uri = $meta['uri'] ?? '';
+			$this->discover($fromPeerId, $origin, is_string($uri) ? $uri : '');   // a URI that is not a string is no URI
 		}
+	}
+
+	/**
+	 * Records the presence generation a node announces.  The announce that closes the node's full
+	 * presence of that generation completes it: the clients held for the node that no envelope of the
+	 * generation set have left it, and are dropped from the presence mirror.  The clients the
+	 * generation set stay throughout.  An announce without a generation (from a 1.1.0 node), or of an
+	 * older generation than the newest heard, changes nothing.
+	 * @param string $node The announcing node id.
+	 * @param mixed $generation The announced generation.
+	 * @param bool $complete Whether the announce closes a full presence.
+	 */
+	private function trackGeneration(string $node, mixed $generation, bool $complete): void
+	{
+		if (!is_int($generation) || $generation < 1 || $node === '' || $generation < ($this->_generations[$node] ?? 0)) {
+			return;
+		}
+		$this->_generations[$node] = $generation;
+		if (!$complete) {
+			return;
+		}
+		foreach ($this->_remote[$node] ?? [] as $clientId => $set) {
+			if ($set < $generation) {
+				unset($this->_remote[$node][$clientId]);
+				try {
+					$this->_cluster?->receiveEnvelope(new TWebSocketEnvelope(TWebSocketEnvelope::PRESENCE_DROP, $node, '', null, (string) $clientId));
+				} catch (\Throwable $e) {
+					Prado::log("Mesh could not drop the departed client {$clientId} of node {$node}: " . $e->getMessage(), TLogger::WARNING, static::class);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Records a presence change another node originated, by the generation its payload carries.  A
+	 * change of an older generation than the newest heard from the node was sent before the node's
+	 * last full presence and is not applied.  A change without a generation (from a 1.1.0 node) is
+	 * applied as it arrives.
+	 * @param TWebSocketEnvelope $envelope The presence envelope.
+	 * @return bool Whether the change is current and is delivered to the coordinator.
+	 */
+	private function trackPresence(TWebSocketEnvelope $envelope): bool
+	{
+		$node = $envelope->getOriginNode();
+		$clientId = $envelope->getClientId();
+		if ($node === '' || $clientId === null) {
+			return true;
+		}
+		$payload = $envelope->getPayload();
+		$newest = $this->_generations[$node] ?? 0;
+		$generation = ($payload !== '' && strlen($payload) < 19 && ctype_digit($payload)) ? (int) $payload : null;
+		if ($generation !== null) {
+			if ($generation < $newest) {
+				return false;
+			}
+			$this->_generations[$node] = $generation;
+		}
+		if ($envelope->getType() === TWebSocketEnvelope::PRESENCE_SET) {
+			$this->_remote[$node][$clientId] = $generation ?? $newest;
+		} else {
+			unset($this->_remote[$node][$clientId]);
+		}
+		return true;
 	}
 
 	/**
@@ -997,9 +1277,12 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		}
 		$peer = $this->_peers[$fromPeerId] ?? null;
 		if ($peer !== null && $peer['uri'] === '' && ($peer['nodeId'] === '' || $peer['nodeId'] === $origin)) {
-			$this->_peers[$fromPeerId]['uri'] = $uri;
-			$this->_connectedUris[$uri] = true;
-			$this->_knownUris[$uri] = true;
+			$this->bindUri($fromPeerId, $uri);
+			return;
+		}
+		$linked = $this->linkTo($origin);
+		if ($linked !== null) {
+			$this->bindUri($linked, $uri);   // another name of a node this node is linked to, such as the address of a seed dialed by hostname
 			return;
 		}
 		$this->learnPeer($uri);
@@ -1042,9 +1325,22 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	private function flood(TWebSocketEnvelope $envelope, ?int $exceptPeerId): void
 	{
+		$data = $this->encode($envelope);
+		if ($data !== null) {
+			$this->floodEncoded($data, $exceptPeerId);
+		}
+	}
+
+	/**
+	 * Sends an encoded envelope to every verified peer except an optional source.
+	 * @param string $data The encoded envelope.
+	 * @param ?int $exceptPeerId The peer id to skip (the source of a re-flood), or null.
+	 */
+	private function floodEncoded(string $data, ?int $exceptPeerId): void
+	{
 		foreach ($this->_peers as $id => $peer) {
 			if ($id !== $exceptPeerId && $peer['verified']) {
-				$this->sendTo($peer['link'], $envelope);
+				$this->sendEncoded($peer['link'], $data);
 			}
 		}
 	}
@@ -1056,9 +1352,38 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	private function sendTo(TWebSocketConnection $link, TWebSocketEnvelope $envelope): void
 	{
+		$data = $this->encode($envelope);
+		if ($data !== null) {
+			$this->sendEncoded($link, $data);
+		}
+	}
+
+	/**
+	 * Encodes an envelope once for all the links it goes to.  An envelope that cannot be encoded is
+	 * logged and not sent: the fault lies in the envelope, so no link is dropped for it.
+	 * @param TWebSocketEnvelope $envelope The envelope to encode.
+	 * @return ?string The encoded envelope, or null when it cannot be encoded.
+	 */
+	private function encode(TWebSocketEnvelope $envelope): ?string
+	{
+		try {
+			return $envelope->encode();
+		} catch (TWebSocketException $e) {
+			Prado::log('Mesh cannot send a ' . $envelope->getType() . ' envelope: ' . $e->getMessage(), TLogger::WARNING, static::class);
+			return null;
+		}
+	}
+
+	/**
+	 * Sends an encoded envelope over a peer link, dropping the peer when the send fails.
+	 * @param TWebSocketConnection $link The peer connection.
+	 * @param string $data The encoded envelope.
+	 */
+	private function sendEncoded(TWebSocketConnection $link, string $data): void
+	{
 		try {
 			if (!$link->getIsClosed()) {
-				$link->send($envelope->encode());
+				$link->send($data);
 			}
 		} catch (\Throwable $e) {
 			$this->dropPeer(spl_object_id($link), 'a send failed: ' . $e->getMessage());
@@ -1100,7 +1425,9 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Closes and forgets a peer link, logging why.
+	 * Closes and forgets a peer link, logging why.  Its URIs are freed to be discovered and dialed
+	 * again, unless another verified link still reaches the same node: they then stay bound, to that
+	 * link.
 	 * @param int $id The peer object id.
 	 * @param string $reason Why the peer is dropped, for the log.
 	 */
@@ -1109,17 +1436,23 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		if (!isset($this->_peers[$id])) {
 			return;
 		}
-		$uri = $this->_peers[$id]['uri'];
-		$node = $this->_peers[$id]['nodeId'];
+		$peer = $this->_peers[$id];
+		$uri = $peer['uri'];
+		$node = $peer['nodeId'];
 		Prado::log('Mesh dropped peer ' . ($node !== '' ? $node : '(unverified)') . ($uri !== '' ? " at {$uri}" : '') . ($reason !== '' ? ": {$reason}" : ''), TLogger::NOTICE, static::class);
 		try {
-			$this->_peers[$id]['link']->close();
+			$peer['link']->close();
 		} catch (\Throwable $e) {
 			// The peer is already gone; a clean Close frame cannot be sent.
 		}
 		unset($this->_peers[$id]);
-		if ($uri !== '') {
-			unset($this->_connectedUris[$uri], $this->_knownUris[$uri]);   // allow re-discovery and re-dial
+		$remaining = $peer['verified'] ? $this->linkTo($node) : null;
+		foreach (array_keys($peer['aliases'] + ($uri !== '' ? [$uri => true] : [])) as $bound) {
+			if ($remaining !== null) {
+				$this->bindUri($remaining, (string) $bound);
+			} else {
+				unset($this->_connectedUris[$bound], $this->_knownUris[$bound]);   // allow re-discovery and re-dial
+			}
 		}
 	}
 
@@ -1331,14 +1664,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	// =========================================================================
 
 	/**
-	 * Returns the address to connect to for a host: the host itself when it is an IP address, or a
-	 * cached lookup that has not expired.
+	 * Returns the address to connect to for a host: the host itself when it is an IP address, with or
+	 * without a zone, or a cached lookup that has not expired.
 	 * @param string $host The URI host, without IPv6 brackets.
 	 * @return ?string The IP address, or null when the host must be looked up.
 	 */
 	private function addressOf(string $host): ?string
 	{
-		if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+		if (filter_var($host, FILTER_VALIDATE_IP) !== false || $this->isScopedAddress($host)) {
 			return $host;
 		}
 		$cached = $this->_resolved[$host] ?? null;
@@ -1350,30 +1683,73 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Starts looking up a host for a dial, or adds the dial to the lookup in flight.  A host that is not
-	 * a valid DNS name is refused without a lookup.
+	 * Indicates whether a host is an IPv6 address with a zone, such as `fe80::1%eth0`.  The system
+	 * connects to such an address as written, so it needs no lookup.
+	 * @param string $host The URI host, without IPv6 brackets.
+	 * @return bool Whether the host is a zoned IPv6 address.
+	 */
+	private function isScopedAddress(string $host): bool
+	{
+		return preg_match(self::SCOPED_ADDRESS_PATTERN, $host, $match) === 1 && filter_var($match[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+	}
+
+	/**
+	 * Starts looking up a host for a dial, or adds the dial to the lookup of its host.  At most
+	 * {@see MAX_RESOLVERS} lookups run at once; a further host waits its turn, which {@see tick()}
+	 * gives it.  A host that is not a valid DNS name is refused without a lookup.
 	 * @param string $host The hostname.
 	 * @param string $uri The peer URI waiting on it.
-	 * @throws \Prado\Exceptions\TInvalidDataValueException When the host is not a valid hostname.
+	 * @throws TInvalidDataValueException When the host is not a valid hostname.
+	 * @throws TConfigurationException When no {@see getResolverBinary() ResolverBinary} is available.
+	 * @throws \Prado\Exceptions\TIOException When the lookup's child process cannot be started.
 	 */
 	private function resolve(string $host, string $uri): void
 	{
-		if (!preg_match('/^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/', $host)) {
+		if (preg_match(self::HOST_PATTERN, $host) !== 1) {
 			throw new TInvalidDataValueException('websocket_backplane_mesh_host_invalid', $host);
 		}
-		$this->_knownUris[$uri] = true;
 		if (!isset($this->_resolving[$host])) {
-			$process = $this->startResolver($host);
-			$this->_resolving[$host] = ['process' => $process, 'buffer' => '', 'deadline' => $this->getMonotonicClock()->seconds() + $this->_timeout, 'spawned' => \hrtime(true), 'uris' => []];
+			if ($this->getResolverBinary() === '') {
+				$this->warnResolver('Mesh cannot look up peer hostnames: PHP runs under the ' . PHP_SAPI . ' SAPI and no PHP CLI binary was found. Set ResolverBinary to a PHP CLI binary, or give the peers by IP address.');
+				throw new TConfigurationException('websocket_backplane_mesh_resolver_missing', $host);
+			}
+			if (count($this->_resolving) >= self::RESOLVE_QUEUE_CAP) {
+				unset($this->_knownUris[$uri]);   // put off: looked up when its URI is announced or re-dialed again
+				Prado::log("Mesh put off the lookup of peer host {$host}: " . self::RESOLVE_QUEUE_CAP . ' hosts are waiting for theirs', TLogger::NOTICE, static::class);
+				return;
+			}
+			$lookup = ['process' => null, 'buffer' => '', 'deadline' => 0.0, 'uris' => []];
+			if ($this->countResolvers() < self::MAX_RESOLVERS) {
+				$lookup['process'] = $this->startResolver($host);
+				$lookup['deadline'] = $this->getMonotonicClock()->seconds() + $this->_timeout;
+			}
+			$this->_resolving[$host] = $lookup;
 		}
+		$this->_knownUris[$uri] = true;
 		$this->_resolving[$host]['uris'][$uri] = true;
 	}
 
 	/**
-	 * Starts the child process that looks up a host.  It runs the PHP binary without an ini file,
-	 * passes the host as an argument (no shell), and writes the host's addresses to its stdout as a
-	 * JSON list; its stdout is non-blocking.  A subclass may run another resolver that writes the
-	 * same output.
+	 * Returns the number of lookups whose child process is running.
+	 * @return int The running lookup count, at most {@see MAX_RESOLVERS}.
+	 */
+	private function countResolvers(): int
+	{
+		$count = 0;
+		foreach ($this->_resolving as $lookup) {
+			if ($lookup['process'] !== null) {
+				$count++;
+			}
+		}
+		return $count;
+	}
+
+	/**
+	 * Starts the child process that looks up a host.  It runs the {@see getResolverBinary()
+	 * ResolverBinary} without an ini file, passes the host as an argument (no shell), and writes the
+	 * host's addresses to its stdout as a JSON list; its stdout is non-blocking.  A subclass may run
+	 * another resolver that writes the same output.  The child is killed when its lookup passes the
+	 * dial {@see getTimeout() Timeout} and at {@see close()}.
 	 * @param string $host The hostname.
 	 * @throws \Prado\Exceptions\TIOException When the process cannot be started.
 	 * @return TProcess The running resolver.
@@ -1381,7 +1757,7 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	 */
 	protected function startResolver(string $host): TProcess
 	{
-		$process = TProcess::open([PHP_BINARY, '-n', '-r', self::RESOLVER_CODE, '--', $host], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']]);
+		$process = TProcess::open([$this->getResolverBinary(), '-n', '-r', self::RESOLVER_CODE, '--', $host], [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']]);
 		$process->getStdin()?->close();
 		$process->getStderr()?->close();   // the program suppresses its warnings; nothing is read here
 		$stdout = $process->getStdout();
@@ -1392,22 +1768,51 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Reads each lookup's output.  A lookup that has written its addresses and exited is cached and
-	 * its dials are started; one past the dial {@see getTimeout() Timeout}, or that found no address,
-	 * fails its dials.  Resolver children abandoned earlier are closed once they exit.
+	 * Finds the PHP CLI binary that runs a hostname lookup when no {@see setResolverBinary()
+	 * ResolverBinary} is set: the running binary under the `cli` and `cli-server` SAPIs, else `php` in
+	 * PHP's binary directory when that is an executable file.  The binary of another SAPI, such as
+	 * php-fpm or php-cgi, cannot run the lookup program.
+	 * @return string The binary's path, or '' when none is found.
+	 * @since 1.2.0
+	 */
+	protected function findResolverBinary(): string
+	{
+		if (PHP_SAPI === 'cli' || PHP_SAPI === 'cli-server') {
+			return PHP_BINARY;
+		}
+		$binary = PHP_BINDIR . DIRECTORY_SEPARATOR . 'php' . (DIRECTORY_SEPARATOR === '\\' ? '.exe' : '');
+		return is_file($binary) && is_executable($binary) ? $binary : '';
+	}
+
+	/**
+	 * Logs, once per backplane, that hostnames cannot be looked up.
+	 * @param string $message The warning.
+	 */
+	private function warnResolver(string $message): void
+	{
+		if (!$this->_resolverWarned) {
+			$this->_resolverWarned = true;
+			Prado::log($message, TLogger::WARNING, static::class);
+		}
+	}
+
+	/**
+	 * Reads each running lookup's output.  A lookup that has written its addresses and exited is
+	 * cached and its dials are started; one past the dial {@see getTimeout() Timeout} is killed and
+	 * fails its dials, as does one that found no address.  The children killed earlier are closed once
+	 * they have exited, and the lookups waiting their turn are started as running ones finish.
 	 */
 	private function advanceResolvers(): void
 	{
-		foreach ($this->_reaping as $i => $process) {
-			if (!$process->getIsRunning()) {
-				$process->close();
-				unset($this->_reaping[$i]);
-			}
-		}
+		$this->reapResolvers();
 		foreach (array_keys($this->_resolving) as $host) {
+			$host = (string) $host;
 			$lookup = $this->_resolving[$host];
-			$stdout = $lookup['process']->getStdout();
-			$resource = $stdout?->getResource();
+			$process = $lookup['process'];
+			if ($process === null) {
+				continue;   // waiting its turn
+			}
+			$resource = $process->getStdout()?->getResource();
 			$done = !is_resource($resource);
 			if (!$done) {
 				$chunk = @fread($resource, 4096);
@@ -1419,41 +1824,81 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 			}
 			if ($done) {
 				unset($this->_resolving[$host]);
-				$this->settleResolver($host, $lookup);
+				$this->settleResolver($host, $process, $lookup['buffer'], $lookup['uris']);
 			} elseif ($this->getMonotonicClock()->seconds() > $lookup['deadline']) {
 				unset($this->_resolving[$host]);
-				$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
+				$this->abandonResolver($process);
 				$this->failLookup($host, $lookup['uris'], 'the lookup timed out');
 			}
+		}
+		$this->startQueuedResolvers();
+	}
+
+	/**
+	 * Starts the lookups waiting their turn, in the order they were asked, while fewer than
+	 * {@see MAX_RESOLVERS} run.  A lookup whose child cannot be started fails its dials.
+	 */
+	private function startQueuedResolvers(): void
+	{
+		$running = $this->countResolvers();
+		foreach ($this->_resolving as $host => $lookup) {
+			if ($running >= self::MAX_RESOLVERS) {
+				return;
+			}
+			if ($lookup['process'] !== null) {
+				continue;
+			}
+			$host = (string) $host;
+			try {
+				$this->_resolving[$host]['process'] = $this->startResolver($host);
+			} catch (\Throwable $e) {
+				unset($this->_resolving[$host]);
+				$this->failLookup($host, $lookup['uris'], 'its resolver could not be started: ' . $e->getMessage());
+				continue;
+			}
+			$this->_resolving[$host]['deadline'] = $this->getMonotonicClock()->seconds() + $this->_timeout;
+			$running++;
 		}
 	}
 
 	/**
 	 * Caches a finished lookup's first address and starts its dials, or fails them when it found none.
+	 * A resolver that wrote no address list at all did not run the lookup program, as the binary of
+	 * another SAPI does not; that is logged as a warning, once.  A dial that cannot be started is
+	 * forgotten, so a seed is re-dialed later and a gossiped peer when it is announced again.
 	 * @param string $host The hostname.
-	 * @param array{process: TProcess, buffer: string, deadline: float, spawned: int, uris: array<string, true>} $lookup The lookup.
+	 * @param TProcess $process The lookup's child process.
+	 * @param string $output What the child wrote.
+	 * @param array<string, true> $uris The dials waiting on the lookup.
 	 */
-	private function settleResolver(string $host, array $lookup): void
+	private function settleResolver(string $host, TProcess $process, string $output, array $uris): void
 	{
-		$this->abandonResolver($lookup['process'], $lookup['spawned'], $lookup['buffer'] !== '');
-		$addresses = json_decode($lookup['buffer'], true);
+		$this->abandonResolver($process);
+		$addresses = json_decode($output, true);
+		if (!is_array($addresses)) {
+			$this->warnResolver("Mesh cannot look up peer hostnames: the resolver '" . $this->getResolverBinary() . "' wrote no address list. ResolverBinary must be a PHP CLI binary.");
+			$this->failLookup($host, $uris, 'its resolver wrote no answer');
+			return;
+		}
 		$address = null;
-		foreach (is_array($addresses) ? $addresses : [] as $candidate) {
+		foreach ($addresses as $candidate) {
 			if (is_string($candidate) && filter_var($candidate, FILTER_VALIDATE_IP) !== false) {
 				$address = $candidate;
 				break;
 			}
 		}
 		if ($address === null) {
-			$this->failLookup($host, $lookup['uris'], 'it has no address');
+			$this->failLookup($host, $uris, 'it has no address');
 			return;
 		}
 		$this->_resolved[$host] = ['address' => $address, 'expires' => $this->getMonotonicClock()->seconds() + self::RESOLVE_TTL];
-		foreach (array_keys($lookup['uris']) as $uri) {
+		foreach (array_keys($uris) as $uri) {
+			$uri = (string) $uri;
 			unset($this->_knownUris[$uri]);
 			try {
 				$this->connectPeer($uri);
 			} catch (\Throwable $e) {
+				unset($this->_knownUris[$uri]);   // connectPeer() marked it known before the connect failed
 				Prado::log("Mesh peer {$uri} could not be dialed: " . $e->getMessage(), TLogger::NOTICE, static::class);
 			}
 		}
@@ -1475,16 +1920,14 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Lets go of a resolver child without waiting for it: an exited one is closed, and a running one
-	 * has its pipes closed and is closed once it exits, since closing a running process waits for it.
-	 * One known to be running its program (it has written output, or a second has passed) is sent
-	 * SIGTERM; a signal sent just after the fork can reach this process on some platforms.  The age is
-	 * real time ({@see \hrtime()}), not the injectable monotonic clock.
+	 * Lets go of a resolver child without waiting for it.  One that has exited is closed.  One still
+	 * running has its pipes closed and is killed, then closed by {@see reapResolvers()} once it has
+	 * exited, since closing a running process waits for it.  The child holds no state worth a clean
+	 * exit, and the kill signal cannot be caught: a signal with a handler, sent just after the fork,
+	 * can run this process's handler in the child and reach this process on some platforms.
 	 * @param TProcess $process The resolver.
-	 * @param int $spawned The {@see \hrtime()} it was started.
-	 * @param bool $hasOutput Whether it has written output.
 	 */
-	private function abandonResolver(TProcess $process, int $spawned, bool $hasOutput): void
+	private function abandonResolver(TProcess $process): void
 	{
 		if (!$process->getIsRunning()) {
 			$process->close();
@@ -1493,14 +1936,42 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 		foreach ($process->getPipes() as $pipe) {
 			$pipe->close();
 		}
-		if ($hasOutput || \hrtime(true) - $spawned >= 1_000_000_000) {
-			$process->terminate();
-		}
+		$process->terminate(self::SIGKILL);
 		$this->_reaping[] = $process;
 	}
 
 	/**
-	 * Returns the number of hostname lookups in flight.
+	 * Closes the killed resolver children that have exited.  With a wait, it polls until every one
+	 * has exited or the wait has passed, then closes the rest too, so none outlives {@see close()}.
+	 * The wait is real time ({@see \hrtime()}), not the injectable monotonic clock.
+	 * @param float $wait The seconds to wait for the children to exit; 0 closes only those that have.
+	 */
+	private function reapResolvers(float $wait = 0.0): void
+	{
+		$deadline = \hrtime(true) + (int) ($wait * 1_000_000_000);
+		while (true) {
+			foreach ($this->_reaping as $i => $process) {
+				if (!$process->getIsRunning()) {
+					$process->close();
+					unset($this->_reaping[$i]);
+				}
+			}
+			if ($this->_reaping === [] || \hrtime(true) >= $deadline) {
+				break;
+			}
+			usleep(1000);
+		}
+		if ($wait > 0.0) {
+			foreach ($this->_reaping as $process) {
+				$process->close();   // killed, so its exit is due
+			}
+			$this->_reaping = [];
+		}
+	}
+
+	/**
+	 * Returns the number of hostname lookups not yet answered: those running, at most
+	 * {@see MAX_RESOLVERS}, and those waiting their turn.
 	 * @return int The lookup count.
 	 * @since 1.2.0
 	 */
@@ -1657,6 +2128,34 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
+	 * Returns the PHP CLI binary that runs a hostname lookup.  When none is set it is found on first
+	 * use ({@see findResolverBinary()}).
+	 * @return string The binary's path, or '' when none is set and none is found.
+	 * @since 1.2.0
+	 */
+	public function getResolverBinary(): string
+	{
+		if ($this->_resolverBinary === null) {
+			$this->_resolverBinary = $this->findResolverBinary();
+		}
+		return $this->_resolverBinary;
+	}
+
+	/**
+	 * Sets the PHP CLI binary that runs a hostname lookup.  Set it when PHP runs under a SAPI whose
+	 * binary is not the CLI, such as php-fpm, and no `php` lies in PHP's binary directory.
+	 * @param string $value The path of a PHP CLI binary, or '' to find one.
+	 * @return static The current backplane.
+	 * @since 1.2.0
+	 */
+	public function setResolverBinary($value): static
+	{
+		$value = TPropertyValue::ensureString($value);
+		$this->_resolverBinary = $value === '' ? null : $value;
+		return $this;
+	}
+
+	/**
 	 * Returns the `ssl` stream context options used to dial a `tls://` or `ssl://` peer.
 	 * @return array<string, mixed> The options.
 	 * @since 1.2.0
@@ -1761,9 +2260,11 @@ class TMeshBackplane extends TComponent implements IWebSocketBufferedBackplane, 
 	}
 
 	/**
-	 * Sets the PCRE an announced peer URI must match to be dialed, such as `#^tls://10\.0\.#`.  Every
-	 * verified peer can announce a URI that every node then dials, so a pattern keeps a node from dialing
-	 * an address outside the cluster.  The seed {@see setPeers() Peers} are always dialed.
+	 * Sets the PCRE an announced peer URI must match to be dialed, such as
+	 * `#^tls://10\.0\.\d{1,3}\.\d{1,3}:8443$#D`.  Every verified peer can announce a URI that every node
+	 * then dials, so a pattern keeps a node from dialing an address outside the cluster.  Anchor the
+	 * pattern at both ends and match the whole host: `#^tls://10\.0\.#` also matches
+	 * `tls://10.0.evil.example:443`.  The seed {@see setPeers() Peers} are always dialed.
 	 * @param string $value The PCRE, or '' to dial any announced URI.
 	 * @throws TInvalidDataValueException When the pattern is not a valid PCRE.
 	 * @return static The current backplane.

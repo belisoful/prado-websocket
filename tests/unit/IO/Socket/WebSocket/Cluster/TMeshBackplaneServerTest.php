@@ -12,28 +12,37 @@ use Prado\IO\Stream\TBufferStream;
 
 /**
  * Mesh dials against a real {@see TWebSocketServer} serving the mesh endpoint: the dial's connect,
- * TLS handshake, and WebSocket upgrade advance without blocking either side's loop.
+ * TLS handshake, and WebSocket upgrade advance without blocking either side's loop, and the
+ * certificate of a `tls://` peer is verified against the host in its URI.
  */
 class TMeshBackplaneServerTest extends TestCase
 {
 	/** @var string[] Temporary certificate files to remove. */
 	private array $tempFiles = [];
 
+	/** @var array<int, TMeshBackplane|TWebSocketServer> What a test opened and tearDown closes, whether or not the test passed. */
+	private array $opened = [];
+
 	protected function tearDown(): void
 	{
+		foreach ($this->opened as $opened) {
+			$opened->close();
+		}
+		$this->opened = [];
 		foreach ($this->tempFiles as $file) {
 			@unlink($file);
 		}
 	}
 
 	/**
-	 * Writes a self-signed certificate and key for 127.0.0.1 to a temporary PEM file.
+	 * Writes a self-signed certificate and key for a name to a temporary PEM file.
+	 * @param string $name The name the certificate is issued to.
 	 * @return string The PEM file path.
 	 */
-	private function selfSignedCertificate(): string
+	private function selfSignedCertificate(string $name = '127.0.0.1'): string
 	{
 		$key = openssl_pkey_new(['private_key_bits' => 2048, 'private_key_type' => OPENSSL_KEYTYPE_RSA]);
-		$csr = openssl_csr_new(['commonName' => '127.0.0.1'], $key, ['digest_alg' => 'sha256']);
+		$csr = openssl_csr_new(['commonName' => $name], $key, ['digest_alg' => 'sha256']);
 		$cert = openssl_csr_sign($csr, null, $key, 1, ['digest_alg' => 'sha256'], random_int(1, PHP_INT_MAX));
 		openssl_x509_export($cert, $certPem);
 		openssl_pkey_export($key, $keyPem);
@@ -124,6 +133,71 @@ class TMeshBackplaneServerTest extends TestCase
 		self::assertSame(0, $dialer->getPeerCount(), 'No link is made to a peer whose certificate is not trusted.');
 		$dialer->close();
 		$server->close();
+	}
+
+	/**
+	 * Dials `tls://localhost` at a TLS mesh server on 127.0.0.1 that presents a certificate for a name.
+	 * @param string $name The name on the server's certificate.
+	 * @return array{0: TMeshBackplane, 1: TMeshBackplane} The dialer and the server's mesh, pumped until the dial has settled.
+	 */
+	private function dialLocalhostAgainstACertificateFor(string $name): array
+	{
+		$certificate = $this->selfSignedCertificate($name);
+		[$server, $serverMesh] = $this->meshServer('tls://127.0.0.1:0', stream_context_create(['ssl' => ['local_cert' => $certificate]]));
+		$this->opened[] = $server;
+		$this->opened[] = $dialer = new TMeshBackplane();
+		$dialer->setSecret('shh');
+		$dialer->setSslContext(['cafile' => $certificate]);   // the certificate is trusted; only the name is in question
+		new TWebSocketCluster('dialer', $dialer);
+		$dialer->connectPeer('tls://localhost:' . $server->getPort());   // resolved to 127.0.0.1 by the lookup
+		self::assertSame(1, $dialer->getResolvingCount());
+		for ($i = 0; $i < 2000 && ($dialer->getResolvingCount() > 0 || $dialer->getPendingCount() > 0 || ($dialer->getPeerCount() > 0 && $serverMesh->getPeerCount() === 0)); $i++) {
+			$dialer->tick();
+			$server->serveOnce(0, 5000);
+		}
+		return [$dialer, $serverMesh];
+	}
+
+	public function testAHostnameDialVerifiesTheCertificateAgainstTheHostname()
+	{
+		if (!extension_loaded('openssl')) {
+			self::markTestSkipped('ext-openssl is not available.');
+		}
+		[$dialer, $serverMesh] = $this->dialLocalhostAgainstACertificateFor('localhost');
+		self::assertSame(1, $dialer->getPeerCount(), 'The certificate is verified against the hostname in the URI, not the address it resolved to.');
+		self::assertSame(1, $serverMesh->getPeerCount());
+	}
+
+	public function testAHostnameDialRefusesACertificateForAnotherName()
+	{
+		if (!extension_loaded('openssl')) {
+			self::markTestSkipped('ext-openssl is not available.');
+		}
+		[$dialer, $serverMesh] = $this->dialLocalhostAgainstACertificateFor('other.example');
+		self::assertSame(0, $dialer->getPendingCount(), 'The dial fails at the TLS handshake.');
+		self::assertSame(0, $dialer->getPeerCount(), 'A trusted certificate issued to another name is refused.');
+		self::assertSame(0, $serverMesh->getPeerCount());
+	}
+
+	public function testAnAddressDialRefusesACertificateForAHostname()
+	{
+		if (!extension_loaded('openssl')) {
+			self::markTestSkipped('ext-openssl is not available.');
+		}
+		$certificate = $this->selfSignedCertificate('localhost');
+		[$server, $serverMesh] = $this->meshServer('tls://127.0.0.1:0', stream_context_create(['ssl' => ['local_cert' => $certificate]]));
+		$this->opened[] = $server;
+		$this->opened[] = $dialer = new TMeshBackplane();
+		$dialer->setSecret('shh');
+		$dialer->setSslContext(['cafile' => $certificate]);
+		new TWebSocketCluster('dialer', $dialer);
+		$dialer->connectPeer('tls://127.0.0.1:' . $server->getPort());
+		for ($i = 0; $i < 2000 && $dialer->getPendingCount() > 0; $i++) {
+			$dialer->tick();
+			$server->serveOnce(0, 5000);
+		}
+		self::assertSame(0, $dialer->getPeerCount(), 'The peer name of a dial by address is the address.');
+		self::assertSame(0, $serverMesh->getPeerCount());
 	}
 
 	public function testAnAcceptedLinkKeepsTheMeshLimitAboveTheClientLimit()

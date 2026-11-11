@@ -25,14 +25,18 @@ use Prado\TComponent;
  *  - {@see BROADCAST}: deliver Payload to every local client.
  *  - {@see DIRECT}: deliver Payload to the local client named by {@see getClientId() ClientId}.
  *  - {@see PRESENCE_SET}/{@see PRESENCE_DROP}: update the presence mirror for ClientId.
- *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI
- *    and incarnation; the coordinator itself ignores it, while the mesh backplane uses it to find peers,
- *    detect failures, and detect a restart under the same node id.
+ *  - {@see NODE_UP}: a mesh-only discovery and liveness heartbeat carrying the sender's advertised URI,
+ *    its incarnation, and the generation of its last full presence; the coordinator itself ignores it,
+ *    while the mesh backplane uses it to find peers, detect failures, and detect a restart under the
+ *    same node id.  With `presence` set to `begin` or `end` it opens or closes the sender's full
+ *    presence: the receiver of the closing one drops the sender's clients that the generation did not
+ *    set.  A mesh presence envelope carries its node's generation as its payload.
  *  - {@see NODE_DOWN}: drop every presence entry of the node named by the `node` metadata (the origin
  *    node when absent).  A backplane sends it when it reaps a dead node, and a node sends it about
  *    itself before re-announcing its clients, so every node replaces that node's presence.
- *  - {@see NODE_SYNC}: a mesh-only request that the nodes named by the `nodes` metadata re-announce
- *    their presence, sent by a node that hears from a node whose presence it does not hold.
+ *  - {@see NODE_SYNC}: a mesh-only request that the nodes named by the `nodes` metadata flood their
+ *    full presence, sent by a node that hears from a node whose presence it does not hold, and over a
+ *    newly verified link for the nodes behind it.
  *  - {@see AUTH_CHALLENGE}/{@see AUTH_RESPONSE}: a mesh-only peer authentication handshake (a nonce and its
  *    signed answer) consumed by the backplane itself, never routed to the coordinator.
  *
