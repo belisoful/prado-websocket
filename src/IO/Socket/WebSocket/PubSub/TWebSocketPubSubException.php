@@ -22,7 +22,7 @@ use Prado\IO\Socket\WebSocket\TWebSocketException;
  * reply code:
  *
  * ```php
- * throw (new TWebSocketPubSubException('websocket_pubsub_forbidden', 'call chat.history'))
+ * throw (new TWebSocketPubSubException('websocket_pubsub_forbidden', 'call', 'chat.history'))
  *     ->setReplyCode(TWebSocketPubSubException::FORBIDDEN);
  * ```
  *

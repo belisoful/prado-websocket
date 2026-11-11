@@ -30,10 +30,11 @@ use Prado\Util\Log\TLogger;
  * ({@see getClientScriptPath()}).
  *
  * Each message is one JSON object with a string `type`.  A request carrying an `id` (a string of
- * 1 to {@see MAX_ID_LENGTH} bytes, or an integer) receives exactly one `ack` or `error` with that
- * id; a request without one is answered only when it fails.  A frame that cannot be decoded is
- * answered with the `id` a bounded scan of its top-level members finds, so the client's request
- * settles.
+ * 1 to {@see MAX_ID_LENGTH} bytes, or an integer in the signed 64-bit range) receives exactly one
+ * `ack` or `error` with that id; a request without one is answered only when it fails.  A frame
+ * that cannot be decoded is answered with the `id` a bounded scan of its top-level members finds,
+ * so the client's request settles.  Any other `id`, a number outside the 64-bit integer range
+ * included, is refused with `bad_request` and is not echoed.
  *
  * | Client → server | Fields | Effect |
  * |---|---|---|
@@ -46,7 +47,7 @@ use Prado\Util\Log\TLogger;
  *
  * | Server → client | Fields | When |
  * |---|---|---|
- * | `welcome` | `clientId`, `heartbeat`, `maxFrame` | After the connection opens; `maxFrame` is {@see getMaxFrameSize() MaxFrameSize}. |
+ * | `welcome` | `clientId`, `heartbeat`, `maxFrame` | After the `onOpen` handlers admit the connection; `maxFrame` is {@see getMaxFrameSize() MaxFrameSize}. |
  * | `ack` | `id`, `data`? | A request with an `id` succeeded. |
  * | `error` | `id`?, `code`, `message` | A request failed; `code` is a {@see TWebSocketPubSubException} reply code. |
  * | `message` | `data`, `channel`?, `from`? | A channel publish (with `channel`), or a direct send or broadcast (without). |
@@ -72,28 +73,48 @@ use Prado\Util\Log\TLogger;
  * A publish reaches every subscriber of the channel, the publisher included.  Delivery is
  * at-most-once: a client that is reconnecting misses what is published meanwhile.
  *
- * A request is decoded to PHP arrays: a JSON object and a list both arrive as an array, and an
- * integer outside the 64-bit range arrives as its decimal string.  A publish or send relays the
- * `data` the client sent as its original JSON text, so `{}`, an object with numeric keys, and a
- * large integer reach the receivers unchanged; Data an event handler replaced is encoded from the
- * PHP value.
+ * A request is decoded as json_decode() does into PHP arrays: a JSON object and a list both arrive
+ * as an array, and an integer outside the 64-bit range arrives as a float.
+ *
+ * A publish or send relays the `data` the event handlers saw, in canonical JSON
+ * ({@see encodeRelay()}):
+ *  - insignificant whitespace is dropped and string escapes are normalized;
+ *  - of members with one name, the last is kept, at the place of the first;
+ *  - a number is written as PHP encodes the value the handlers saw (`1.50` → `1.5`, `1e2` → `100.0`);
+ *  - an object stays an object and a list stays a list (`{}`, an object with numeric keys), and
+ *    members keep their order;
+ *  - an integer outside the 64-bit range keeps its digits;
+ *  - Data an event handler replaced is encoded from the PHP value.
+ *
+ * A handler that allows the Data it inspected allows what is relayed: the canonical text holds no
+ * padding and no shadowed member, and a number in it is a number in the Data.  The Data shows an
+ * object and a list alike as an array (`{"0":"a"}` and `["a"]`).  A handler to which the form
+ * matters reads the text that is relayed,
+ * {@see TWebSocketPubSubEventParameter::getDataJson() DataJson}.
  *
  * The {@see onOpen} event is raised before the `welcome` frame, so a handler that authenticates
  * the client can close it (4401 or 4403 stop the browser client from reconnecting) or subscribe it
- * to its own channels with {@see subscribe()}.  {@see onOpen} and {@see onClose} are raised only
- * for connections that negotiated the subprotocol.  The base `onMessage` event is not raised;
- * application requests arrive through {@see onCall}.
+ * to its own channels with {@see subscribe()}.  The client is admitted when the `onOpen` handlers
+ * have returned and the connection is still open: the `welcome` is the first frame it receives,
+ * and a request that arrives earlier, while a handler waits on the event loop, is ignored.
+ * {@see onOpen} and {@see onClose} are raised only for connections that negotiated the
+ * subprotocol.  The base `onMessage` event is not raised; application requests arrive through
+ * {@see onCall}.
  *
  * {@see \Prado\IO\Socket\WebSocket\TWebSocketModule} hands the handler its cluster
  * ({@see IWebSocketClusterAware}) and re-raises the request events as its own.  A handler with no
  * cluster set creates a single-node cluster on a {@see TNullBackplane} and registers its
  * connections there.
  *
+ * An event attribute in the application configuration takes a callable, so it names a static
+ * method (`App\Chat::authorizeSubscribe($sender, $param)`).  Rules that keep state belong in a
+ * subclass named as the module's `HandlerClass`, which attaches its own methods in its constructor.
+ *
  * ```xml
  * <module id="websockets" class="Prado\IO\Socket\WebSocket\TWebSocketModule" Port="8080"
  *     Subprotocols="prado.pubsub.v1" IdleTimeout="60"
  *     HandlerClass="Prado\IO\Socket\WebSocket\PubSub\TWebSocketPubSubHandler"
- *     OnSubscribe="Application.Chat.authorizeSubscribe" />
+ *     OnSubscribe="App\Chat::authorizeSubscribe" />
  * ```
  *
  * ```php
@@ -117,7 +138,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	public const SUBPROTOCOL = 'prado.pubsub.v1';
 
 	/** The pattern a client-supplied channel name must match. */
-	public const CHANNEL_PATTERN = '/^[A-Za-z0-9_.:\/-]{1,128}$/';
+	public const CHANNEL_PATTERN = '/^[A-Za-z0-9_.:\/-]{1,128}\z/';
 
 	/** The maximum length in bytes of a string request id. */
 	public const MAX_ID_LENGTH = 64;
@@ -136,6 +157,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 
 	/** The json_encode flags of every outgoing frame. */
 	private const JSON_FLAGS = JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+
+	/** The json_encode flags of a relayed value: a float keeps its fraction, so it stays a float. */
+	private const RELAY_FLAGS = self::JSON_FLAGS | JSON_PRESERVE_ZERO_FRACTION;
 
 	/** The JSON whitespace characters. */
 	private const JSON_WHITESPACE = " \t\n\r";
@@ -158,7 +182,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	/** @var int The request frame size limit in bytes; 0 leaves only the server's MaxMessageSize. */
 	private int $_maxFrameSize = self::DEFAULT_MAX_FRAME_SIZE;
 
-	/** @var array<int, array{id: string, channels: array<string, true>, registered: bool}> The open pub/sub clients, keyed by connection object id. */
+	/** @var array<int, array{id: string, channels: array<string, true>, registered: bool, admitted: bool}> The pub/sub clients, keyed by connection object id; `admitted` once the `onOpen` handlers have returned. */
 	private array $_clients = [];
 
 	// =========================================================================
@@ -166,8 +190,13 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	// =========================================================================
 
 	/**
-	 * Admits a connection that negotiated {@see SUBPROTOCOL}, raises the `onOpen` event, and sends
-	 * the `welcome` frame.  A connection without the subprotocol is closed with 1002.
+	 * Raises the `onOpen` event for a connection that negotiated {@see SUBPROTOCOL}, then admits it
+	 * and sends the `welcome` frame.  A connection without the subprotocol is closed with 1002.
+	 *
+	 * The client has its id and takes {@see subscribe()} while the event runs, and is admitted
+	 * afterwards: a handler may wait on the event loop (an asynchronous lookup) before it refuses the
+	 * client, and {@see onMessage()} serves nothing until then.  A connection that a handler closed,
+	 * or that closed while a handler waited, is not admitted and gets no `welcome`.
 	 * @param TWebSocketConnection $connection The connection.
 	 */
 	public function onOpen(TWebSocketConnection $connection): void
@@ -182,15 +211,21 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		if ($registered) {
 			$clientId = $cluster->register($connection);
 		}
-		$this->_clients[spl_object_id($connection)] = ['id' => $clientId, 'channels' => [], 'registered' => $registered];
+		$key = spl_object_id($connection);
+		$this->_clients[$key] = ['id' => $clientId, 'channels' => [], 'registered' => $registered, 'admitted' => false];
 		parent::onOpen($connection);
+		if (!isset($this->_clients[$key]) || $connection->getIsClosing() || $connection->getIsClosed()) {
+			return;   // refused by a handler, or gone while one waited
+		}
+		$this->_clients[$key]['admitted'] = true;
 		$this->reply($connection, ['type' => 'welcome', 'clientId' => $clientId, 'heartbeat' => $this->getHeartbeat(), 'maxFrame' => $this->getMaxFrameSize()]);
 	}
 
 	/**
 	 * Decodes and dispatches one request frame, replying `ack` or `error`.  A Binary message closes
-	 * the connection with 1003.  A message on a connection that was not admitted, or that this side
-	 * has closed (an `onOpen` handler refusing the client), is ignored.  A failure while the request
+	 * the connection with 1003.  A message on a connection that is not admitted (its `onOpen`
+	 * handlers have not returned, or it lacks the subprotocol), or that this side has closed (an
+	 * `onOpen` handler refusing the client), is ignored.  A failure while the request
 	 * runs, a {@see TWebSocketException} from another connection included, is logged and answered
 	 * `internal`; only a failure to write this connection's own reply is rethrown.
 	 * @param TWebSocketConnection $connection The connection.
@@ -200,10 +235,11 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	 */
 	public function onMessage(TWebSocketConnection $connection, string $message, int $opcode): void
 	{
-		$clientId = $this->getClientId($connection);
-		if ($clientId === null || $connection->getIsCloseInitiator()) {
+		$state = $this->_clients[spl_object_id($connection)] ?? null;
+		if ($state === null || !$state['admitted'] || $connection->getIsCloseInitiator()) {
 			return;   // not admitted, or refused: a connection this side closed runs no further request
 		}
+		$clientId = $state['id'];
 		if ($opcode !== TWebSocketOpcode::Text) {
 			$connection->close(TWebSocketCloseCode::UnsupportedData, self::SUBPROTOCOL . ' is text-only');
 			return;
@@ -217,7 +253,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 				throw (new TWebSocketPubSubException('websocket_pubsub_frame_too_large', strlen($message), $limit))
 					->setReplyCode(TWebSocketPubSubException::LIMIT);
 			}
-			$frame = json_decode($message, true, self::MAX_JSON_DEPTH, JSON_BIGINT_AS_STRING);
+			$frame = json_decode($message, true, self::MAX_JSON_DEPTH);
 			if (!is_array($frame)) {
 				$id = $this->scanRequestId($message);
 				throw new TWebSocketPubSubException('websocket_pubsub_frame_malformed', self::MAX_ID_LENGTH);
@@ -256,8 +292,8 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Forgets an admitted connection, unregistering it when this handler registered it, and raises
-	 * the `onClose` event.
+	 * Forgets a pub/sub connection, unregistering it when this handler registered it, and raises
+	 * the `onClose` event.  A connection its `onOpen` handlers refused is forgotten the same way.
 	 * @param TWebSocketConnection $connection The connection.
 	 */
 	public function onClose(TWebSocketConnection $connection): void
@@ -312,8 +348,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 
 	/**
 	 * Raised for a client call.  A handler answers it with
-	 * {@see TWebSocketPubSubEventParameter::setResult()}, or refuses it by throwing a
-	 * {@see TWebSocketPubSubException}.
+	 * {@see TWebSocketPubSubEventParameter::setResult()}.  A handler refuses it with
+	 * {@see TWebSocketPubSubEventParameter::setAllowed()} (`forbidden`), or by throwing a
+	 * {@see TWebSocketPubSubException} that carries its own reply code and message.
 	 * @param TWebSocketConnection $connection The requesting connection (the event sender).
 	 * @param TWebSocketPubSubEventParameter $param The request: ClientId, Method, Data (the params).
 	 */
@@ -327,7 +364,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	// =========================================================================
 
 	/**
-	 * Returns the cluster client id of an admitted connection.
+	 * Returns the cluster client id of a pub/sub connection, from its `onOpen` event to its close.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @return ?string The client id, or null when the connection is not an open pub/sub client.
 	 */
@@ -337,7 +374,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Returns the channels an admitted connection is subscribed to.
+	 * Returns the channels a pub/sub connection is subscribed to.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @return string[] The channels, in subscription order.
 	 */
@@ -347,7 +384,8 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Subscribes an admitted connection to a channel, without authorization or limit checks.
+	 * Subscribes a pub/sub connection to a channel, without authorization or limit checks.  An
+	 * `onOpen` handler subscribes the client it is admitting.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @param string $channel The channel name.
 	 * @return bool Whether the connection is an open pub/sub client.
@@ -364,7 +402,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Unsubscribes an admitted connection from a channel.
+	 * Unsubscribes a pub/sub connection from a channel.
 	 * @param TWebSocketConnection $connection The connection.
 	 * @param string $channel The channel name.
 	 * @return bool Whether the connection is an open pub/sub client.
@@ -515,8 +553,9 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	}
 
 	/**
-	 * Handles `publish`: raises {@see onPublish} and publishes the resulting Data
-	 * ({@see encodeRelay()}).
+	 * Handles `publish`: raises {@see onPublish}, with the canonical text of the `data` as the
+	 * parameter's DataJson, and publishes the resulting Data ({@see encodeRelay()}).  The text is
+	 * written when it is first read, so a request that is denied unread costs no more than its decoding.
 	 * @param TWebSocketConnection $connection The requesting connection.
 	 * @param string $clientId The requesting client id.
 	 * @param array<mixed> $frame The decoded frame.
@@ -527,7 +566,8 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	protected function requestPublish(TWebSocketConnection $connection, string $clientId, array $frame, string $message = ''): mixed
 	{
 		$channel = $this->ensureChannel($frame);
-		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientPublish()))->setChannel($channel);
+		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientPublish()))
+			->setChannel($channel)->setDataJson(static fn () => self::canonicalData($message));
 		$this->onPublish($connection, $param);
 		$this->assertAllowed($param, 'publish', $channel);
 		$this->getCluster()->publish($channel, $this->encodeRelay($param, $frame['data'] ?? null, $message, $channel, $clientId));
@@ -549,7 +589,8 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 		if (!is_string($to) || $to === '') {
 			throw new TWebSocketPubSubException('websocket_pubsub_field_required', 'to', 'send');
 		}
-		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientSend()))->setTo($to);
+		$param = (new TWebSocketPubSubEventParameter($clientId, $frame['data'] ?? null, $this->getAllowClientSend()))
+			->setTo($to)->setDataJson(static fn () => self::canonicalData($message));
 		$this->onSend($connection, $param);
 		$this->assertAllowed($param, 'send', $to);
 		if (!$this->getCluster()->sendToClient($to, $this->encodeRelay($param, $frame['data'] ?? null, $message, null, $clientId))) {
@@ -586,26 +627,108 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 
 	/**
 	 * Encodes the `message` frame that relays a client publish or send.  Data no event handler
-	 * replaced is relayed as the JSON text of the request's `data` member, so `{}`, an object with
-	 * numeric keys, and an integer outside the 64-bit range reach the receivers as sent; replaced
-	 * Data is encoded with {@see encodeMessage()}.
-	 * @param TWebSocketPubSubEventParameter $param The request parameter.
+	 * replaced is relayed in canonical JSON, written from the request's `data` member
+	 * ({@see canonicalJson()}): the value the handlers saw, in the form the client sent.  `{}`, an
+	 * object with numeric keys, and an integer outside the 64-bit range reach the receivers as
+	 * sent; whitespace, a shadowed duplicate member, and another spelling of a string or number do
+	 * not.  Replaced Data is encoded with {@see encodeMessage()}.  Data set to a value identical
+	 * to the one decoded counts as not replaced.
+	 * @param TWebSocketPubSubEventParameter $param The request parameter; its DataJson, when set,
+	 *   is the canonical text.
 	 * @param mixed $data The request's decoded `data`.
-	 * @param string $message The request frame's JSON text; empty to encode the Data.
+	 * @param string $message The request frame's JSON text; empty, without a DataJson, to encode the Data.
 	 * @param ?string $channel The channel, or null for a direct send.
 	 * @param string $from The sending client id.
 	 * @throws \JsonException When replaced Data cannot be encoded.
 	 * @return string The JSON frame.
-	 * @since 1.2.0
 	 */
 	protected function encodeRelay(TWebSocketPubSubEventParameter $param, mixed $data, string $message, ?string $channel, string $from): string
 	{
 		// Compared by value: ParameterChanged resets when TWebSocketModule re-raises the event with the same parameter.
-		$json = $message !== '' && $param->getData() === $data ? self::findMember($message, 'data') : null;
+		$json = $param->getData() === $data ? ($param->getDataJson() ?? self::canonicalData($message)) : null;
 		if ($json === null) {
 			return self::encodeMessage($param->getData(), $channel, $from);
 		}
 		return substr(self::encodeMessage(null, $channel, $from), 0, -5) . $json . '}';   // replaces the trailing `null}`
+	}
+
+	/**
+	 * Returns the canonical text ({@see canonicalJson()}) of the `data` member of a request frame.
+	 * @param string $message The request frame's JSON text, which json_decode() accepted.
+	 * @throws \JsonException When a string or number of the member cannot be encoded.
+	 * @return ?string The canonical text, or null when the text is empty or has no `data` member.
+	 */
+	private static function canonicalData(string $message): ?string
+	{
+		$json = $message === '' ? null : self::findMember($message, 'data');
+		if ($json === null) {
+			return null;
+		}
+		$offset = 0;
+		return self::canonicalJson($json, $offset);
+	}
+
+	/**
+	 * Returns the canonical text of one value of JSON that json_decode() accepted, written without
+	 * decoding it into PHP arrays, so an object and a list keep their form.  The text decodes to
+	 * the value json_decode() returns for the original.
+	 *
+	 * | Text | Canonical text |
+	 * |---|---|
+	 * | whitespace between tokens | dropped |
+	 * | a string | as json_encode() writes it: `"\u0041"` → `"A"` |
+	 * | members with one name | the last value, at the place of the first |
+	 * | an integer in the 64-bit range | its decimal digits: `-0` → `0` |
+	 * | an integer outside it | as sent |
+	 * | any other number | as json_encode() writes the float: `1.50` → `1.5`, `1e2` → `100.0` |
+	 * @param string $json The JSON text.
+	 * @param int $i The offset of the value, moved past it.
+	 * @throws \JsonException When a string or number of the text cannot be encoded.
+	 * @return string The canonical text.
+	 */
+	private static function canonicalJson(string $json, int &$i): string
+	{
+		$i += strspn($json, self::JSON_WHITESPACE, $i);
+		$first = $json[$i] ?? '';
+		if ($first === '"') {
+			$end = self::skipString($json, $i) ?? strlen($json);
+			$text = substr($json, $i, $end - $i);
+			$i = $end;
+			// Printable ASCII without an escape is already as json_encode() writes it.
+			return preg_match('/[\\\\\x80-\xff]/', $text) ? json_encode(json_decode($text), self::RELAY_FLAGS) : $text;
+		}
+		if ($first !== '{' && $first !== '[') {
+			$end = $i + strcspn($json, self::JSON_WHITESPACE . ',]}', $i);
+			$text = substr($json, $i, $end - $i);
+			$i = $end;
+			if (strlen($text) < 19 && ctype_digit($text)) {
+				return $text;   // a non-negative integer in range
+			}
+			$value = json_decode($text);
+			// An integer json_decode() could not hold arrives as a float: its digits are the canonical text.
+			return is_float($value) && strspn($text, '-0123456789') === strlen($text) ? $text : json_encode($value, self::RELAY_FLAGS);
+		}
+		$close = $first === '{' ? '}' : ']';
+		$items = [];
+		for ($i++; ; $i++) {
+			$i += strspn($json, self::JSON_WHITESPACE, $i);
+			if (($json[$i] ?? $close) === $close) {
+				break;
+			}
+			if ($first === '[') {
+				$items[] = self::canonicalJson($json, $i);
+			} else {
+				$name = self::canonicalJson($json, $i);
+				$i += strspn($json, self::JSON_WHITESPACE, $i) + 1;   // the colon
+				$items[$name] = $name . ':' . self::canonicalJson($json, $i);
+			}
+			$i += strspn($json, self::JSON_WHITESPACE, $i);
+			if (($json[$i] ?? $close) === $close) {
+				break;
+			}
+		}
+		$i++;
+		return $first . implode(',', $items) . $close;
 	}
 
 	/**
@@ -642,6 +765,7 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	 * Returns whether a request id is absent or well formed.
 	 * @param mixed $id The `id` field.
 	 * @return bool Whether the id is null, an integer, or a string of 1 to {@see MAX_ID_LENGTH} bytes.
+	 *   A number outside the 64-bit integer range decodes to a float, which is not an id.
 	 */
 	protected function isValidId(mixed $id): bool
 	{
@@ -654,13 +778,12 @@ class TWebSocketPubSubHandler extends TWebSocketHandler implements IWebSocketClu
 	 * bytes, or {@see DEFAULT_MAX_FRAME_SIZE} when that is 0.
 	 * @param string $message The frame's text.
 	 * @return null|int|string The well-formed id, or null when none is found.
-	 * @since 1.2.0
 	 */
 	protected function scanRequestId(string $message): null|int|string
 	{
 		$limit = $this->getMaxFrameSize() ?: self::DEFAULT_MAX_FRAME_SIZE;
 		$json = self::findMember(strlen($message) > $limit ? substr($message, 0, $limit) : $message, 'id');
-		$id = $json === null ? null : json_decode($json, false, 1, JSON_BIGINT_AS_STRING);
+		$id = $json === null ? null : json_decode($json, false, 1);
 		return (is_int($id) || is_string($id)) && $this->isValidId($id) ? $id : null;
 	}
 

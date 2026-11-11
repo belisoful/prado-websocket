@@ -22,12 +22,18 @@ use Prado\TPropertyValue;
  * | Event | Fields set | Handler sets |
  * |---|---|---|
  * | `onSubscribe` | ClientId, Channel | Allowed |
- * | `onPublish` | ClientId, Channel, Data | Allowed, Data |
- * | `onSend` | ClientId, To, Data | Allowed, Data |
- * | `onCall` | ClientId, Method, Data (the params) | Result |
+ * | `onPublish` | ClientId, Channel, Data, DataJson | Allowed, Data |
+ * | `onSend` | ClientId, To, Data, DataJson | Allowed, Data |
+ * | `onCall` | ClientId, Method, Data (the params) | Result, Allowed |
  *
  * Setting {@see setResult() Result} marks the call {@see getHandled() Handled}; a call no handler
- * answers is replied to with `not_found`.
+ * answers is replied to with `not_found`.  A request a handler leaves with
+ * {@see setAllowed() Allowed} false is replied to with `forbidden`: a subscribe, a publish, a send,
+ * or a call, even one another handler answered.
+ *
+ * Data is the payload as json_decode() gives it: a JSON object and a list are both arrays.
+ * {@see getDataJson() DataJson} is the canonical JSON text of the published or sent data, which
+ * is what the receivers get unless a handler replaces the Data.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 1.2.0
@@ -45,6 +51,9 @@ class TWebSocketPubSubEventParameter extends TEventParameter
 
 	/** @var ?string The method name of a call request. */
 	private ?string $_method = null;
+
+	/** @var null|\Closure|string The canonical JSON text of the data of a publish or send request, or the function that writes it. */
+	private null|\Closure|string $_dataJson = null;
 
 	/** @var bool Whether the request may proceed. */
 	private bool $_allowed;
@@ -146,12 +155,40 @@ class TWebSocketPubSubEventParameter extends TEventParameter
 	}
 
 	/**
-	 * Sets the request payload, replacing what is published or sent.
+	 * Sets the request payload, replacing what is published or sent.  The replacement is encoded
+	 * from the PHP value; a value identical to the payload replaces nothing.
 	 * @param mixed $value The payload.
 	 */
 	public function setData(mixed $value): void
 	{
 		$this->setParameter($value);
+	}
+
+	/**
+	 * Returns the canonical JSON text of the data a client published or sent: the text relayed to
+	 * the receivers while the Data is not replaced.  It keeps what the decoded Data does not show:
+	 * an object and a list are distinct (`{}` and `[]`), and an integer outside the 64-bit range
+	 * has its digits.  It holds no insignificant whitespace and no shadowed duplicate member.
+	 * @return ?string The JSON text, or null for other requests and for a request without data.
+	 */
+	public function getDataJson(): ?string
+	{
+		if ($this->_dataJson instanceof \Closure) {
+			$this->_dataJson = ($this->_dataJson)();
+		}
+		return $this->_dataJson;
+	}
+
+	/**
+	 * Sets the canonical JSON text of the data; {@see TWebSocketPubSubHandler} sets it before it
+	 * raises the event.  A function is called once, when the text is first read.
+	 * @param null|(\Closure(): ?string)|string $value The JSON text, or a function that returns it.
+	 * @return static The current parameter.
+	 */
+	public function setDataJson(null|\Closure|string $value): static
+	{
+		$this->_dataJson = $value;
+		return $this;
 	}
 
 	/**
