@@ -24,7 +24,8 @@ use Prado\Exceptions\TIOException;
  *
  * A failure in {@see TWebSocketConnection::feedMessages()} carries the
  * {@see getDecodedMessages() messages} the same read completed before the malformed frame, so a
- * caller delivers them before it fails the connection.
+ * caller delivers them before it fails the connection.  The connection that threw is
+ * {@see TWebSocketConnection::getIsFailed() failed} from then on and parses no further input.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  */

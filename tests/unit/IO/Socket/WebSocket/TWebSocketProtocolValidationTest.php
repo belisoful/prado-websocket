@@ -220,6 +220,29 @@ class TWebSocketProtocolValidationTest extends TestCase
 		$b->close();
 	}
 
+	public function testDisablingMaskValidationRelaxesOnlyTheReceiveCheck()
+	{
+		// The setting an HTTP/2 stream uses: RFC 8441 keeps the RFC 6455 framing, so a masked client frame still decodes.
+		[$server, $a, $b] = $this->server();
+		self::assertTrue($server->getValidateMasking(), 'The mask rule is enforced by default.');
+		$server->setValidateMasking(false);
+		self::assertFalse($server->getValidateMasking());
+		$wire = $this->masked(TWebSocketFrame::text('masked')) . TWebSocketFrameCodec::encode(TWebSocketFrame::text('plain'));
+		self::assertSame(['masked', 'plain'], $server->feed($wire), 'A frame in either mask state is accepted and unmasked as its header says.');
+		$server->send('reply');
+		self::assertSame(0, ord($a->read(64)[1]) & 0x80, 'The server side still sends unmasked frames.');
+
+		$client = new TWebSocketConnection($a, true);
+		$client->setValidateMasking(false);
+		$client->send('request');
+		$sent = $b->read(64);
+		self::assertSame(0x80, ord($sent[1]) & 0x80, 'The client side still masks what it sends.');
+		self::assertSame(['request'], $server->feed($sent));
+		self::assertSame(['masked'], $client->feed($this->masked(TWebSocketFrame::text('masked'))), 'A client with the check disabled accepts a masked frame.');
+		$a->close();
+		$b->close();
+	}
+
 	public function testDataSendIsSuppressedAfterClose()
 	{
 		[$a, $b] = TSocketStream::pair();

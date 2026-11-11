@@ -5,6 +5,7 @@ namespace Prado\Test\Unit\IO\Socket\WebSocket;
 use PHPUnit\Framework\TestCase;
 use Prado\IO\Socket\TSocketStream;
 use Prado\IO\Socket\WebSocket\IWebSocketExtension;
+use Prado\IO\Socket\WebSocket\TWebSocketCloseCode;
 use Prado\IO\Socket\WebSocket\TWebSocketConnection;
 use Prado\IO\Socket\WebSocket\TWebSocketException;
 use Prado\IO\Socket\WebSocket\TWebSocketFrame;
@@ -68,6 +69,34 @@ class ReverseExtension implements IWebSocketExtension
 	public function decodeMessage(string $payload, int $rsv): string
 	{
 		return ($rsv & IWebSocketExtension::RSV2) !== 0 ? strrev($payload) : $payload;
+	}
+}
+
+/** An extension that repeats a marked message's payload on receive, as decompression expands one. */
+class ExpandingExtension implements IWebSocketExtension
+{
+	public function __construct(private int $factor)
+	{
+	}
+
+	public function getName(): string
+	{
+		return 'x-expand';
+	}
+
+	public function getReservedRsv(): int
+	{
+		return IWebSocketExtension::RSV1;
+	}
+
+	public function encodeMessage(string $payload): array
+	{
+		return [$payload, 0];
+	}
+
+	public function decodeMessage(string $payload, int $rsv): string
+	{
+		return ($rsv & IWebSocketExtension::RSV1) !== 0 ? str_repeat($payload, $this->factor) : $payload;
 	}
 }
 
@@ -162,26 +191,72 @@ class TWebSocketExtensionTest extends TestCase
 	{
 		[$a, $b] = TSocketStream::pair();
 		$conn = new TWebSocketConnection($a, false);
-		$this->expectException(TWebSocketException::class);
 		try {
 			$conn->setExtensions([new ScrambleExtension(0xAA, IWebSocketExtension::RSV1), new ScrambleExtension(0x55, IWebSocketExtension::RSV1)]);
+			self::fail('Two extensions may not reserve the same RSV bit.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_rsv_conflict', $e->getErrorCode());
 		} finally {
 			$a->close();
 			$b->close();
 		}
+		self::assertSame([], $conn->getExtensions(), 'A refused list is not applied.');
 	}
 
 	public function testSetExtensionsRejectsNonExtension()
 	{
 		[$a, $b] = TSocketStream::pair();
 		$conn = new TWebSocketConnection($a, false);
-		$this->expectException(TWebSocketException::class);
 		try {
 			$conn->setExtensions([new \stdClass()]);
+			self::fail('An entry that is not an extension is refused.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_extension_invalid', $e->getErrorCode());
 		} finally {
 			$a->close();
 			$b->close();
 		}
+		self::assertSame([], $conn->getExtensions(), 'A refused list is not applied.');
+	}
+
+	public function testAMessageAnExtensionExpandsPastTheLimitIsRefused()
+	{
+		// The frame is under MaxMessageSize on the wire; only the extension's output passes it.
+		[$a, $b] = TSocketStream::pair();
+		$server = new TWebSocketConnection($b, false);
+		$server->setExtensions([new ExpandingExtension(50)]);
+		$server->setMaxMessageSize(1000);
+		$atLimit = $server->feedMessages($this->masked(new TWebSocketFrame(TWebSocketOpcode::Binary, str_repeat('a', 20), true, true)));
+		self::assertSame(1000, strlen($atLimit[0]->getPayload()), 'A message that expands to the limit exactly is delivered.');
+		self::assertSame(str_repeat('b', 30), $server->feed($this->masked(TWebSocketFrame::binary(str_repeat('b', 30))))[0], 'A message the extension leaves alone is measured as it arrived.');
+		try {
+			$server->feedMessages($this->masked(new TWebSocketFrame(TWebSocketOpcode::Binary, str_repeat('a', 21), true, true)));
+			self::fail('A 21-byte message that expands to 1050 bytes passes the 1000-byte limit.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_message_too_big', $e->getErrorCode());
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode(), 'The expanded size fails the connection with 1009.');
+		}
+		self::assertTrue($server->getIsFailed());
+
+		$blocking = new TWebSocketConnection($b, false);
+		$blocking->setExtensions([new ExpandingExtension(50)]);
+		$blocking->setMaxMessageSize(1000);
+		$a->write($this->masked(new TWebSocketFrame(TWebSocketOpcode::Text, str_repeat('a', 21), true, true)));
+		try {
+			$blocking->receive();
+			self::fail('receive() applies the limit to the expanded message too.');
+		} catch (TWebSocketException $e) {
+			self::assertSame('websocket_message_too_big', $e->getErrorCode());
+			self::assertSame(TWebSocketCloseCode::MessageTooBig, $e->getCloseCode());
+		}
+
+		$unlimited = new TWebSocketConnection($b, false);
+		$unlimited->setExtensions([new ExpandingExtension(50)]);
+		$unlimited->setMaxMessageSize(0);
+		$expanded = $unlimited->feedMessages($this->masked(new TWebSocketFrame(TWebSocketOpcode::Binary, str_repeat('a', 21), true, true)));
+		self::assertSame(1050, strlen($expanded[0]->getPayload()), 'A limit of 0 bounds nothing.');
+		$a->close();
+		$b->close();
 	}
 
 	public function testGetExtensionsReturnsConfiguredList()

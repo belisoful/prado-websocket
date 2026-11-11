@@ -96,7 +96,10 @@ class TWebSocketFrame extends TComponent
 		return new self(TWebSocketOpcode::Pong, $data);
 	}
 
-	/** @var int The longest Close reason, in bytes: the 125-byte control payload less the 2-byte code. */
+	/**
+	 * @var int The longest Close reason, in bytes: the 125-byte control payload less the 2-byte code.
+	 * @since 1.2.0
+	 */
 	public const MAX_CLOSE_REASON_LENGTH = 123;
 
 	/**

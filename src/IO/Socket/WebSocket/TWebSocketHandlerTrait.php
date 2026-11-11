@@ -27,20 +27,53 @@ use Prado\Util\Log\TLogger;
  * {@see TWebSocketMessage::getIsText()}/{@see TWebSocketMessage::getIsBinary()}.  The message
  * stringifies to its payload, so a handler that only needs the bytes uses it as a string.
  *
+ * {@see getCloseTimeout() CloseTimeout} bounds the wait for the peer's Close once the application
+ * has closed a connection, so a peer that keeps sending cannot hold {@see handleConnection()}.
+ *
  * @author Brad Anderson <belisoful@icloud.com>
  */
 trait TWebSocketHandlerTrait
 {
+	/** @var float The seconds {@see handleConnection()} waits for the peer's Close after this side closed, or 0 for no bound. */
+	private float $_closeTimeout = 5.0;
+
+	/**
+	 * Returns the close timeout of {@see handleConnection()}.
+	 * @return float The timeout in seconds, or 0 when the loop waits for the peer's Close without bound.
+	 * @since 1.2.0
+	 */
+	public function getCloseTimeout(): float
+	{
+		return $this->_closeTimeout;
+	}
+
+	/**
+	 * Sets the seconds {@see handleConnection()} waits for the peer's Close after this side closed
+	 * the connection.  The wait ends at the timeout whatever the peer sends meanwhile.  Default 5;
+	 * 0 disables the bound.
+	 * @param float|int|string $value The close timeout in seconds.
+	 * @since 1.2.0
+	 */
+	public function setCloseTimeout($value): void
+	{
+		$this->_closeTimeout = max(0, (float) $value);
+	}
+
 	/**
 	 * Drives the message loop for a connection: opens, dispatches each message, and closes.
 	 * A protocol error raises {@see onError} and closes with the error's close code.
 	 *
 	 * The loop reads a blocking stream.  A read that reaches the stream's read timeout (for an
-	 * accepted socket, `default_socket_timeout`) with no message keeps the connection alive:
-	 *  - an open connection is pinged; a second timeout with no Pong and no message since closes it
-	 *    with {@see TWebSocketCloseCode::GoingAway}, since the peer is gone.
-	 *  - a connection that is closing stops waiting for the peer's Close.
-	 * On a non-blocking stream the loop ends when no frame is available.
+	 * accepted socket, `default_socket_timeout`) with no message keeps the connection alive: the
+	 * peer is pinged, and a second timeout with no Pong and no message since closes the connection
+	 * with {@see TWebSocketCloseCode::GoingAway}, since the peer is gone.  On a non-blocking stream
+	 * the loop ends when no frame is available.
+	 *
+	 * Once the application closes the connection (in `onOpen`, in `onMessage`, or from a connection
+	 * event), the loop dispatches nothing more.  It reads and discards what the peer sends until the
+	 * peer's Close arrives, the stream ends, or {@see getCloseTimeout() CloseTimeout} passes
+	 * ({@see TWebSocketConnection::drainClose()}), on a blocking and a non-blocking stream alike.
+	 * A malformed frame in that phase ends the wait and raises no {@see onError}.
 	 * @param TWebSocketConnection $connection The handshaken connection.
 	 */
 	public function handleConnection(TWebSocketConnection $connection): void
@@ -53,10 +86,18 @@ trait TWebSocketHandlerTrait
 		$connection->attachEventHandler('onPong', $answered);
 		try {
 			while (!$connection->getIsClosed()) {
+				if ($connection->getIsClosing()) {
+					// Closing and not closed: this side sent the first Close.  Wait for the peer's within the close timeout, dispatching nothing.
+					$connection->drainClose(TWebSocketCloseCode::Normal, '', $this->_closeTimeout > 0 ? $this->_closeTimeout : null);
+					break;
+				}
 				$message = $connection->receiveMessage();
 				if ($message === null) {
-					if (!$connection->getReadTimedOut() || $connection->getIsClosing()) {
-						break;   // the stream ended, the peer closed, no frame is available, or the peer's Close is overdue
+					if ($connection->getIsCloseInitiator()) {
+						continue;   // closed from a connection event during the read: the close timeout bounds the rest
+					}
+					if (!$connection->getReadTimedOut()) {
+						break;   // the stream ended, the peer closed, or no frame is available
 					}
 					if ($pinged) {
 						$connection->close(TWebSocketCloseCode::GoingAway);   // the peer answered neither the Ping nor anything else
@@ -68,7 +109,7 @@ trait TWebSocketHandlerTrait
 				}
 				$pinged = false;
 				if ($connection->getIsCloseInitiator()) {
-					continue;   // this side closed the connection: read on for the peer's Close, dispatching nothing
+					continue;   // closed from a connection event during the read: the message is not dispatched
 				}
 				$this->onMessage($connection, $message->getPayload(), $message->getOpcode());
 			}
