@@ -460,6 +460,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 		try {
 			$this->_session->receive($bytes);
 			$this->feedDeferred();
+			$this->endHalfClosedStreams();
 		} finally {
 			$this->_receiving = false;
 		}
@@ -495,6 +496,7 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 				$this->_receiving = true;
 				try {
 					$this->feedDeferred();
+					$this->endHalfClosedStreams();
 				} finally {
 					$this->_receiving = false;
 				}
@@ -514,6 +516,23 @@ class THttp2WebSocketProtocol extends TComponent implements IWebSocketProtocol
 			$bytes = $this->_deferred;
 			$this->_deferred = '';
 			$this->_session->receive($bytes);
+		}
+	}
+
+	/**
+	 * Ends the WebSocket of each stream whose peer ended its side (END_STREAM) without sending a
+	 * Close frame.  Nothing more can arrive on such a stream, and HTTP/2 raises no event for it, so
+	 * without this the connection would stay registered, and counted, until the transport ended.
+	 * It is the HTTP/2 form of a peer that drops its TCP connection: the stream is ended and the
+	 * handler and service closes are raised, with no Close frame read.
+	 */
+	private function endHalfClosedStreams(): void
+	{
+		foreach ($this->_connections as $streamId => $connection) {
+			$stream = $this->_session->getStream($streamId);
+			if ($stream !== null && $stream->isRemoteClosed() && $stream->getIncomingLength() === 0) {
+				$this->closeStream($stream);
+			}
 		}
 	}
 

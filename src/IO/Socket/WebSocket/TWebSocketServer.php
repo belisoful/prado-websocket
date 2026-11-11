@@ -179,7 +179,9 @@ class TWebSocketServer extends TSocketServer
 	 *   is ended at, and `discard` once the connection has failed and its input is no longer parsed.
 	 *   An HTTP/1.1 session is `dispatching` while the handler runs its messages, and `held` while
 	 *   its input waits for that dispatch.  An HTTP/2 session carries the close deadlines of its
-	 *   closing streams in `streamClosing`.
+	 *   closing streams in `streamClosing` (a stream the server has finished with, and waits to
+	 *   reset, is keyed by its negated stream id), and a `deadline` whenever it carries no WebSocket
+	 *   stream.
 	 */
 	private array $_sessions = [];
 
@@ -413,8 +415,9 @@ class TWebSocketServer extends TSocketServer
 	 * live transport (a client session, a pending handshake, an app-held link, and a connection an
 	 * {@see IWebSocketEndpoint} took over) plus every WebSocket stream multiplexed on an HTTP/2
 	 * transport.  A further connection is accepted, answered with a 503, and closed; a further HTTP/2
-	 * stream is refused with 503, and each HTTP/2 session advertises the limit as
-	 * SETTINGS_MAX_CONCURRENT_STREAMS.  Admission
+	 * stream is refused with 503.  An HTTP/2 session advertises one less than the limit, and at
+	 * least 1, as SETTINGS_MAX_CONCURRENT_STREAMS, since its transport counts toward the load; with
+	 * no limit it advertises 100.  Admission
 	 * control at the edge (a proxy, or the OS `ulimit`) is still recommended for load shedding.
 	 * @param int|string $value The maximum, or 0 for unlimited.
 	 */
@@ -1328,7 +1331,9 @@ class TWebSocketServer extends TSocketServer
 		$now = $this->getMonotonicClock()->seconds();
 		foreach ($this->_sessions as $id => $session) {
 			if (isset($session['deadline']) && $now >= $session['deadline']) {
-				$this->log('Handshake deadline passed; the pending connection is dropped.', TLogger::NOTICE);
+				$this->log(isset($session['protocol'])
+					? 'Handshake deadline passed; the HTTP/2 connection carries no WebSocket stream and is dropped.'
+					: 'Handshake deadline passed; the pending connection is dropped.', TLogger::NOTICE);
 				if (isset($session['protocol'])) {
 					$this->endHttp2Session($session['transport']);   // an HTTP/2 session that opened no WebSocket stream in time
 				} else {

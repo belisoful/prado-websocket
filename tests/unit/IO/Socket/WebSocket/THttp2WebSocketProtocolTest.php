@@ -826,6 +826,34 @@ class THttp2WebSocketProtocolTest extends TestCase
 		$client->close();
 	}
 
+	public function testAClientThatEndsItsStreamWithoutACloseFrameIsClosed()
+	{
+		$handler = new TWebSocketHandler();
+		$closes = 0;
+		$handler->attachEventHandler('onClose', function () use (&$closes) {
+			$closes++;
+		});
+		$protocol = new THttp2WebSocketProtocol($handler);
+		$statuses = $closed = [];
+		$client = $this->client($protocol, [], $statuses, $closed);
+		$kept = $client->request($this->connectHeaders());
+		$ended = $client->request($this->connectHeaders());
+		$this->exchange($protocol, $client);
+		self::assertCount(2, $protocol->getConnections());
+
+		$ended->markLocalClosed();   // END_STREAM with no WebSocket Close: the HTTP/2 form of a dropped connection
+		$this->exchange($protocol, $client);
+		self::assertSame(1, $closes, 'The handler hears of the stream the client ended.');
+		self::assertCount(1, $protocol->getConnections(), 'Its connection is no longer registered or counted.');
+		self::assertNull($protocol->getSession()->getStream($ended->getStreamId()), 'The server ends its side, so the stream leaves the session.');
+		self::assertSame([$ended->getStreamId()], $closed, 'The client sees it close.');
+		self::assertNotNull($protocol->getSession()->getStream($kept->getStreamId()), 'The other stream carries on.');
+		self::assertSame([], $protocol->getEndingStreams());
+
+		$protocol->shutdown();
+		$client->close();
+	}
+
 	public function testAClientThatEndsItsStreamWithItsCloseGetsNoReset()
 	{
 		$protocol = new THttp2WebSocketProtocol(new TWebSocketHandler());
